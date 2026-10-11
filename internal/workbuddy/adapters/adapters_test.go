@@ -326,8 +326,15 @@ func TestResponsesOutputIdentityOrderAndIncompleteStatus(t *testing.T) {
 	}
 	c := NewResponsesStreamConverter("m")
 	c.FeedLine(`data: {"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
-	if _, known := c.GetNonstreamResponse()["usage"].(map[string]any)["output_tokens_details"].(map[string]any)["reasoning_tokens"]; known {
-		t.Fatal("unknown reasoning tokens invented")
+	if _, known := c.GetNonstreamResponse()["usage"].(map[string]any)["output_tokens_details"]; known {
+		t.Fatal("unknown reasoning usage must omit the optional object for Codex compatibility")
+	}
+	if strings.Contains(c.Finish(), `"output_tokens_details"`) {
+		t.Fatal("stream completion contains an invalid empty reasoning usage object")
+	}
+	c.FeedLine(`data: {"usage":{"completion_tokens_details":{"reasoning_tokens":0}}}`)
+	if c.GetNonstreamResponse()["usage"].(map[string]any)["output_tokens_details"].(map[string]any)["reasoning_tokens"] != 0 {
+		t.Fatal("explicit upstream zero reasoning tokens must be retained")
 	}
 }
 
