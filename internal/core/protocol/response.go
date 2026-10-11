@@ -64,6 +64,7 @@ func decodeBridgeResponse(protocol Protocol, input map[string]any) (bridgeRespon
 		if err != nil {
 			return response, err
 		}
+		response.Text += jsonutil.StringAt(message, "refusal")
 		for _, raw := range jsonutil.SliceAt(message, "tool_calls") {
 			call, _ := raw.(map[string]any)
 			function := jsonutil.MapAt(call, "function")
@@ -378,7 +379,7 @@ func canonicalChatStop(stop string) string {
 		return "length"
 	case "content_filter":
 		return "content_filter"
-	case "error", "network_error", "server_error":
+	case "error", "failed", "failure", "network_error", "server_error":
 		return "error"
 	default:
 		return "stop"
@@ -393,7 +394,7 @@ func canonicalAnthropicStop(stop string) string {
 		return "length"
 	case "stop_sequence", "pause_turn", "refusal":
 		return stop
-	case "error", "network_error", "server_error":
+	case "error", "failed", "failure", "network_error", "server_error":
 		return "error"
 	default:
 		return "stop"

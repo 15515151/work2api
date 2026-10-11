@@ -210,7 +210,13 @@ func (c *AnthropicStreamConverter) processChunk(chunk map[string]any) string {
 					"delta": map[string]any{"type": "thinking_delta", "thinking": reasoning},
 				}))
 			}
-			if content, ok := delta["content"].(string); ok && content != "" {
+			// Messages has no refusal content block; retain the upstream refusal
+			// explanation as text instead of silently completing an empty reply.
+			content, _ := delta["content"].(string)
+			if refusal, ok := delta["refusal"].(string); ok {
+				content += refusal
+			}
+			if content != "" {
 				c.textContent.WriteString(content)
 				if !c.textBlockOpen {
 					if c.thinkingBlockOpen {

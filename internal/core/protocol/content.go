@@ -32,6 +32,8 @@ func decodeOpenAIBlocksChecked(value any) ([]bridgeBlock, error) {
 				return nil, errors.New("OpenAI content block must be an object")
 			}
 			switch jsonutil.StringAt(part, "type") {
+			case "refusal":
+				blocks = append(blocks, bridgeBlock{Kind: "text", Text: jsonutil.StringAt(part, "refusal")})
 			case "text", "input_text", "output_text":
 				blocks = append(blocks, bridgeBlock{Kind: "text", Text: jsonutil.StringAt(part, "text")})
 			case "image_url":

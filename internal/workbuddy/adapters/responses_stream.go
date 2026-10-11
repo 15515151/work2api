@@ -18,10 +18,13 @@ type ResponsesStreamConverter struct {
 	model     string
 	createdAt int64
 
-	nonstream          bool
-	emittedCreated     bool
-	emittedMsgItem     bool
-	emittedContentPart bool
+	nonstream                                               bool
+	emittedCreated                                          bool
+	emittedMsgItem                                          bool
+	emittedContentPart                                      bool
+	emittedRefusalPart                                      bool
+	nextContentIndex, textContentIndex, refusalContentIndex int
+	refusal                                                 strings.Builder
 
 	content   strings.Builder
 	toolCalls map[int]*respToolCall
@@ -118,12 +121,16 @@ func (c *ResponsesStreamConverter) FinishEvents(send func(map[string]any) error)
 	}
 	if c.emittedContentPart {
 		emit("response.output_text.done", map[string]any{
-			"item_id": c.msgID, "output_index": c.messageIdx, "content_index": 0, "text": c.content.String(),
+			"item_id": c.msgID, "output_index": c.messageIdx, "content_index": c.textContentIndex, "text": c.content.String(),
 		})
 		emit("response.content_part.done", map[string]any{
-			"item_id": c.msgID, "output_index": c.messageIdx, "content_index": 0,
+			"item_id": c.msgID, "output_index": c.messageIdx, "content_index": c.textContentIndex,
 			"part": map[string]any{"type": "output_text", "text": c.content.String(), "annotations": []any{}},
 		})
+	}
+	if c.emittedRefusalPart {
+		emit("response.refusal.done", map[string]any{"item_id": c.msgID, "output_index": c.messageIdx, "content_index": c.refusalContentIndex, "refusal": c.refusal.String()})
+		emit("response.content_part.done", map[string]any{"item_id": c.msgID, "output_index": c.messageIdx, "content_index": c.refusalContentIndex, "part": map[string]any{"type": "refusal", "refusal": c.refusal.String()}})
 	}
 	if c.emittedMsgItem {
 		emit("response.output_item.done", map[string]any{
@@ -216,16 +223,34 @@ func (c *ResponsesStreamConverter) processChunk(chunk map[string]any) string {
 					c.emittedMsgItem = true
 				}
 				if !c.emittedContentPart {
+					c.textContentIndex = c.nextContentIndex
+					c.nextContentIndex++
 					events.WriteString(c.evt("response.content_part.added", map[string]any{
-						"item_id": c.msgID, "output_index": c.messageIdx, "content_index": 0,
+						"item_id": c.msgID, "output_index": c.messageIdx, "content_index": c.textContentIndex,
 						"part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}},
 					}))
 					c.emittedContentPart = true
 				}
 				c.content.WriteString(content)
 				events.WriteString(c.evt("response.output_text.delta", map[string]any{
-					"item_id": c.msgID, "output_index": c.messageIdx, "content_index": 0, "delta": content,
+					"item_id": c.msgID, "output_index": c.messageIdx, "content_index": c.textContentIndex, "delta": content,
 				}))
+			}
+			if refusal, ok := delta["refusal"].(string); ok && refusal != "" {
+				if !c.emittedMsgItem {
+					c.messageIdx = len(c.items)
+					c.items = append(c.items, responseOutputItem{kind: "message"})
+					events.WriteString(c.evt("response.output_item.added", map[string]any{"output_index": c.messageIdx, "item": c.msgItem("in_progress", true)}))
+					c.emittedMsgItem = true
+				}
+				if !c.emittedRefusalPart {
+					c.refusalContentIndex = c.nextContentIndex
+					c.nextContentIndex++
+					events.WriteString(c.evt("response.content_part.added", map[string]any{"item_id": c.msgID, "output_index": c.messageIdx, "content_index": c.refusalContentIndex, "part": map[string]any{"type": "refusal", "refusal": ""}}))
+					c.emittedRefusalPart = true
+				}
+				c.refusal.WriteString(refusal)
+				events.WriteString(c.evt("response.refusal.delta", map[string]any{"item_id": c.msgID, "output_index": c.messageIdx, "content_index": c.refusalContentIndex, "delta": refusal}))
 			}
 			tcs, _ := delta["tool_calls"].([]any)
 			for _, t := range tcs {
@@ -300,11 +325,17 @@ func (c *ResponsesStreamConverter) reasoningItem(status string, empty bool) map[
 }
 
 func (c *ResponsesStreamConverter) msgItem(status string, empty bool) map[string]any {
-	var content []any
+	content := []any{}
 	if !empty {
-		content = []any{map[string]any{"type": "output_text", "text": c.content.String(), "annotations": []any{}}}
-	} else {
-		content = []any{}
+		if c.emittedContentPart {
+			content = append(content, map[string]any{"type": "output_text", "text": c.content.String(), "annotations": []any{}})
+		}
+		if c.emittedRefusalPart {
+			content = append(content, map[string]any{"type": "refusal", "refusal": c.refusal.String()})
+		}
+		if len(content) == 2 && c.refusalContentIndex < c.textContentIndex {
+			content[0], content[1] = content[1], content[0]
+		}
 	}
 	return map[string]any{
 		"type":    "message",
@@ -416,7 +447,9 @@ func (c *ResponsesStreamConverter) ToolsSummaryLimited(limit int) string {
 }
 
 // TextContent returns the accumulated assistant text (for usage logging).
-func (c *ResponsesStreamConverter) TextContent() string { return c.content.String() }
+func (c *ResponsesStreamConverter) TextContent() string {
+	return c.content.String() + c.refusal.String()
+}
 
 // Reasoning returns the accumulated thinking text (for usage logging).
 func (c *ResponsesStreamConverter) Reasoning() string { return c.reasoning.String() }

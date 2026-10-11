@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,6 +20,7 @@ import (
 	"work2api/internal/core/provider"
 	"work2api/internal/store"
 	"work2api/internal/streamwatch"
+	"work2api/internal/workbuddy/adapters"
 	"work2api/internal/workbuddy/models"
 	"work2api/internal/workbuddy/pool"
 	"work2api/internal/workbuddy/upstream"
@@ -1109,6 +1111,67 @@ func TestAdmissionSnapshotExplainsWaitWithoutSelectingAccounts(t *testing.T) {
 type registryProbe struct {
 	name, prefix string
 	closed       int
+}
+
+type customProtocolProbe struct {
+	registryProbe
+	t *testing.T
+}
+
+func (*customProtocolProbe) Ready() bool { return true }
+func (p *customProtocolProbe) Serve(_ context.Context, req provider.ServeRequest) (provider.UsageReport, error) {
+	tools := req.Payload["tools"].([]any)
+	if req.Protocol != provider.ProtocolResponses || tools[0].(map[string]any)["type"] != "function" {
+		p.t.Fatal("custom tool not adapted at dispatch", req)
+	}
+	args := `{"input":"*** Begin Patch\n*** End Patch"}`
+	conv := adapters.NewResponsesStreamConverter("model")
+	stream, _ := req.Payload["stream"].(bool)
+	if !stream {
+		conv.SetNonstream()
+	}
+	chunk := `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"apply_patch","arguments":` + strconv.Quote(args) + `}}]}}]}`
+	events := conv.FeedLine(chunk) + conv.FeedLine(`data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`)
+	if stream {
+		req.Writer.Header().Set("Content-Type", "text/event-stream")
+		if _, err := io.WriteString(req.Writer, events+conv.Finish()); err != nil {
+			return provider.UsageReport{}, err
+		}
+		req.Writer.(http.Flusher).Flush()
+	} else {
+		writeJSON(req.Writer, 200, conv.GetNonstreamResponse())
+	}
+	return provider.UsageReport{Status: "ok"}, nil
+}
+
+func TestResponsesCustomToolsAtGatewayBoundary(t *testing.T) {
+	o, _ := newDNSFailoverOrch(t, &failingUpstream{})
+	probe := &customProtocolProbe{registryProbe: registryProbe{name: "custom", prefix: "custom/"}, t: t}
+	if err := o.runtimes.Register(probe); err != nil {
+		t.Fatal(err)
+	}
+	s := NewServer(o)
+	appID, err := o.db.CreateApp("custom-caller", o.hashKey("custom-fixture-key"), "", "", "", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stream := range []bool{false, true} {
+		body := fmt.Sprintf(`{"model":"custom/model","stream":%t,"input":"make a patch","tools":[{"type":"custom","name":"apply_patch"}]}`, stream)
+		r := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(body))
+		r.Header.Set("Authorization", "Bearer custom-fixture-key")
+		r = r.WithContext(context.WithValue(r.Context(), principalContextKey{}, &Principal{AppID: appID, AppName: "custom-caller"}))
+		w := httptest.NewRecorder()
+		s.handleResponses(w, r)
+		if w.Code != 200 || !strings.Contains(w.Body.String(), `"type":"custom_tool_call"`) || !strings.Contains(w.Body.String(), `"call_id":"call_1"`) {
+			t.Fatal("custom output lost at gateway", w.Code, w.Body.String())
+		}
+		if stream && (!strings.Contains(w.Body.String(), `"type":"response.completed"`) || strings.Contains(w.Body.String(), `"type":"response.function_call_arguments.delta"`)) {
+			t.Fatal("custom stream not restored", w.Body.String())
+		}
+		if state := s.modelsAdmission.snapshot(); state["running"] != 0 || state["queued"] != 0 || state["buffer_reserved_bytes"] != int64(0) {
+			t.Fatal("custom request leaked resources", state)
+		}
+	}
 }
 
 func (r *registryProbe) Name() string                                 { return r.name }

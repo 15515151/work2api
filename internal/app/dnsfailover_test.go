@@ -247,6 +247,7 @@ func (f *channelRetryUpstream) StreamUpstream(_ context.Context, _ map[string]st
 
 func TestChannelIdentityCompatibilityPreservesCapabilitiesAndBounds(t *testing.T) {
 	const banner = "You are Claude Code, Anthropic's official CLI for Claude."
+	const codexBanner = "You are a coding agent running in the Codex CLI, a terminal-based coding assistant. Codex CLI is an open source project led by OpenAI."
 	const tail = "\n### Available skills\nfind-skills: skill://find-skills/SKILL.md\nAvailable agent types for the Agent tool:\nreviewer: read CLAUDE.md\n## MCP Server Instructions\nUse MCP tools only with permission."
 	const denial = `{"code":11128,"msg":"Illegal API invocation from an unapproved channel"}`
 	for _, tc := range []struct {
@@ -257,6 +258,13 @@ func TestChannelIdentityCompatibilityPreservesCapabilitiesAndBounds(t *testing.T
 		wantCompat                        bool
 	}{
 		{name: "domestic", profile: "cn-cli", prompt: banner + tail, errorBody: denial, wantCalls: 2, wantCompat: true},
+		{name: "codex domestic", profile: "cn-cli", prompt: codexBanner + tail, errorBody: denial, wantCalls: 2, wantCompat: true},
+		{name: "codex disabled", profile: "cn-cli", prompt: codexBanner + tail, errorBody: denial, disabled: true, wantCalls: 2},
+		{name: "codex international", profile: "intl-cli", prompt: codexBanner + tail, errorBody: denial, wantCalls: 2},
+		{name: "codex content policy", profile: "cn-cli", prompt: codexBanner + tail, errorBody: `{"code":11128,"msg":"blocked by security policy"}`, wantCalls: 1},
+		{name: "codex partial output", profile: "cn-cli", prompt: codexBanner + tail, errorBody: denial, partial: true, wantCalls: 1},
+		{name: "codex persistent denial", profile: "cn-cli", prompt: codexBanner + tail, errorBody: denial, always: true, wantCalls: 5, wantCompat: true},
+		{name: "codex revoked during retry", profile: "cn-cli", prompt: codexBanner + tail, errorBody: denial, revoke: true, wantCalls: 1},
 		{name: "disabled", profile: "cn-cli", prompt: banner + tail, errorBody: denial, disabled: true, wantCalls: 2},
 		{name: "international", profile: "intl-cli", prompt: banner + tail, errorBody: denial, wantCalls: 2},
 		{name: "unknown banner", profile: "cn-cli", prompt: "You are Claude Code." + tail, errorBody: denial, wantCalls: 2},
@@ -311,7 +319,7 @@ func TestChannelIdentityCompatibilityPreservesCapabilitiesAndBounds(t *testing.T
 			if client.calls != tc.wantCalls {
 				t.Fatalf("calls=%d, want %d, error=%v", client.calls, tc.wantCalls, err)
 			}
-			if tc.name == "domestic" && (err != nil || served.UID != first.UID || o.modelCooldownUntil(first.UID, "test-model") > nowSec() || o.sessions.Lookup("sticky") != first.UID) {
+			if (tc.name == "domestic" || tc.name == "codex domestic") && (err != nil || served.UID != first.UID || o.modelCooldownUntil(first.UID, "test-model") > nowSec() || o.sessions.Lookup("sticky") != first.UID) {
 				t.Fatal("successful banner compatibility penalized/rotated account", err)
 			}
 			for i, attempt := range client.bodies {
@@ -376,6 +384,37 @@ func TestChannelIdentityBannerMatchingIsExactAndNonMutating(t *testing.T) {
 	}
 	if _, ok := channelIdentityCompatBody(map[string]any{"messages": []any{map[string]any{"role": "user", "content": banner}}}); ok {
 		t.Fatal("user role rewritten")
+	}
+	const codex = "You are a coding agent running in the Codex CLI, a terminal-based coding assistant. Codex CLI is an open source project led by OpenAI."
+	const suffix = " You are expected to be precise, safe, and helpful.\r\n<skills_instructions>Keep every skill description.</skills_instructions>\n<permissions instructions>Ask before destructive commands.</permissions instructions>"
+	for _, intro := range []string{codex, "You are a CODING AGENT running in the Codex CLI. Codex CLI is an open source project led by OpenAI.", strings.ReplaceAll(codex, ". Codex", ".\r\nCodex")} {
+		body := map[string]any{"messages": []any{
+			map[string]any{"role": "system", "content": []any{map[string]any{"type": "text", "text": intro + suffix, "cache_control": map[string]any{"type": "ephemeral"}}}},
+			map[string]any{"role": "user", "content": codex},
+			map[string]any{"role": "tool", "content": codex, "tool_call_id": "call-test"},
+		}}
+		before, _ := json.Marshal(body)
+		result, matched := channelIdentityCompatBody(body)
+		if !matched {
+			t.Fatal("known Codex intro not recognized", intro)
+		}
+		messages := result["messages"].([]any)
+		block := messages[0].(map[string]any)["content"].([]any)[0].(map[string]any)
+		if block["text"] != "You are a coding assistant."+suffix || block["cache_control"] == nil || messages[1].(map[string]any)["content"] != codex || messages[2].(map[string]any)["content"] != codex {
+			t.Fatal("Codex compatibility changed instructions or other roles")
+		}
+		after, _ := json.Marshal(body)
+		if string(before) != string(after) {
+			t.Fatal("Codex compatibility mutated original request")
+		}
+		if _, changed := channelIdentityCompatBody(result); changed {
+			t.Fatal("Codex compatibility is not idempotent")
+		}
+	}
+	for _, prompt := range []string{"Quote: " + codex, "You are Codex, a coding agent.", strings.Replace(codex, "open source", "proprietary", 1), codex + "example", "You are a coding agent running in the Codex CLI. Follow project instructions."} {
+		if _, matched := channelIdentityCompatBody(map[string]any{"messages": []any{map[string]any{"role": "system", "content": prompt}}}); matched {
+			t.Fatal("unknown or quoted Codex template rewritten", prompt)
+		}
 	}
 }
 

@@ -4,8 +4,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"regexp"
 	"strings"
 )
+
+// CPA f32111a records a single-variable replay of this Codex CLI intro
+// triggering channel rejection. Match only its known opening forms; never
+// replace an embedded quotation, arbitrary client names, or runtime metadata.
+var codexCLIIntro = regexp.MustCompile(`(?i)^you are a coding agent running in the codex cli(?:, a terminal-based coding assistant)?\.[ \t\r\n]+codex cli is an open source project led by openai\.`)
 
 func CompatibilityName(level int) string {
 	switch level {
@@ -25,6 +31,12 @@ func ClearCompatibility(info *SessionState) {
 
 // Recognize fixed client declarations, never arbitrary mentions in instructions.
 func CompatibleIdentity(text string) (string, bool) {
+	if match := codexCLIIntro.FindStringIndex(text); match != nil {
+		tail := text[match[1]:]
+		if tail == "" || strings.ContainsRune(" \t\r\n", rune(tail[0])) {
+			return "You are a coding assistant." + tail, true
+		}
+	}
 	for _, banner := range []string{
 		"You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK.",
 		"You are Claude Code, Anthropic's official CLI for Claude.",

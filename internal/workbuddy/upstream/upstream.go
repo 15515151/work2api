@@ -349,7 +349,7 @@ func scanEventLine(data []byte, atEOF bool) (int, []byte, error) {
 // CollectStream aggregates a standard OpenAI SSE stream into a single
 // chat.completion object. producer drives the stream via a LineFunc.
 func CollectStream(fallbackModel string, produce func(yield LineFunc) error) (map[string]any, error) {
-	var contentParts, reasoningParts strings.Builder
+	var contentParts, reasoningParts, refusalParts strings.Builder
 	toolCalls := map[int]map[string]any{}
 	var order []int
 	model := ""
@@ -397,6 +397,9 @@ func CollectStream(fallbackModel string, produce func(yield LineFunc) error) (ma
 			if s, ok := delta["reasoning_content"].(string); ok {
 				reasoningParts.WriteString(s)
 			}
+			if s, ok := delta["refusal"].(string); ok {
+				refusalParts.WriteString(s)
+			}
 			tcs, _ := delta["tool_calls"].([]any)
 			for _, t := range tcs {
 				tc, ok := t.(map[string]any)
@@ -439,6 +442,9 @@ func CollectStream(fallbackModel string, produce func(yield LineFunc) error) (ma
 	}
 
 	message := map[string]any{"role": "assistant", "content": contentParts.String()}
+	if refusalParts.Len() > 0 {
+		message["refusal"] = refusalParts.String()
+	}
 	if reasoningParts.Len() > 0 {
 		message["reasoning_content"] = reasoningParts.String()
 	}

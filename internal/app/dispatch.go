@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"time"
 
+	"work2api/internal/core/protocol"
 	"work2api/internal/core/provider"
 	"work2api/internal/store"
 	"work2api/internal/streamwatch"
@@ -40,6 +41,15 @@ func (s *Server) dispatchRuntimeTo(w http.ResponseWriter, r *http.Request, proto
 	// Hand the runtime the alias-resolved, still-namespaced id; the runtime
 	// strips its own prefix before talking to its upstream.
 	payload["model"] = resolved
+	var customNames map[string]bool
+	if proto == provider.ProtocolResponses {
+		var err error
+		payload, customNames, err = protocol.PrepareCustomTools(payload)
+		if err != nil {
+			writeAPIErr(w, errBody(400, err.Error(), "invalid_request_error"))
+			return true
+		}
+	}
 	t0 := time.Now()
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
@@ -52,6 +62,11 @@ func (s *Server) dispatchRuntimeTo(w http.ResponseWriter, r *http.Request, proto
 	var output http.ResponseWriter = writer
 	if _, ok := w.(http.Flusher); ok {
 		output = &flushCancelWriter{writer}
+	}
+	var customWriter *protocol.CustomToolWriter
+	if len(customNames) > 0 {
+		customWriter = protocol.NewCustomToolWriter(output, customNames, 4*int(s.o.cfg.MaxResponseBytes))
+		output = customWriter
 	}
 	request := provider.ServeRequest{
 		Caller:   call.Caller,
@@ -67,6 +82,12 @@ func (s *Server) dispatchRuntimeTo(w http.ResponseWriter, r *http.Request, proto
 		defer func() { finish(report) }()
 	}
 	report, err := rt.Serve(ctx, request)
+	if customWriter != nil {
+		if finishErr := customWriter.Finish(); finishErr != nil && err == nil {
+			err = finishErr
+			writer.Header().Del("Content-Length")
+		}
+	}
 	if err != nil {
 		if report.Status != "incomplete" {
 			report.Status = "error"

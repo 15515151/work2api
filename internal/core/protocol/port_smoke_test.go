@@ -3,6 +3,7 @@ package protocol
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http/httptest"
 	"reflect"
 	"strings"
@@ -10,6 +11,158 @@ import (
 
 	"work2api/internal/jsonutil"
 )
+
+func TestCustomToolsRoundTrip(t *testing.T) {
+	patch := "*** Begin Patch\n*** Add File: hello.txt\n+你好\\world\n*** End Patch"
+	body := map[string]any{
+		"tools":       []any{map[string]any{"type": "custom", "name": "apply_patch", "format": map[string]any{"type": "grammar", "syntax": "lark", "definition": "start: PATCH"}}, map[string]any{"type": "function", "name": "shell", "parameters": map[string]any{"type": "object"}}},
+		"tool_choice": map[string]any{"type": "custom", "name": "apply_patch"},
+		"input":       []any{map[string]any{"type": "custom_tool_call", "id": "ctc_1", "call_id": "call_1", "name": "apply_patch", "input": patch}, map[string]any{"type": "custom_tool_call_output", "call_id": "call_1", "output": "success"}},
+	}
+	before, _ := json.Marshal(body)
+	prepared, names, err := PrepareCustomTools(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, _ := json.Marshal(body)
+	if !bytes.Equal(before, after) {
+		t.Fatal("custom preparation mutated client request")
+	}
+	tool := jsonutil.SliceAt(prepared, "tools")[0].(map[string]any)
+	if tool["type"] != "function" || !strings.Contains(jsonutil.StringAt(tool, "description"), "start: PATCH") || jsonutil.StringAt(prepared, "tool_choice", "type") != "function" {
+		t.Fatal("custom tool definition/choice lost", prepared)
+	}
+	history := jsonutil.SliceAt(prepared, "input")
+	if history[0].(map[string]any)["type"] != "function_call" || history[1].(map[string]any)["type"] != "function_call_output" {
+		t.Fatal("custom history not adapted")
+	}
+	args := history[0].(map[string]any)["arguments"]
+	if input, err := customInput(args); err != nil || input != patch {
+		t.Fatal("tool input changed", input, err)
+	}
+	for _, streaming := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%t", streaming), func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			w := NewCustomToolWriter(recorder, names, 1<<20)
+			item := map[string]any{"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "apply_patch", "arguments": args, "status": "completed"}
+			response := map[string]any{"id": "resp_1", "status": "completed", "output": []any{item, map[string]any{"type": "function_call", "id": "fc_2", "call_id": "call_2", "name": "shell", "arguments": "{}"}}}
+			if streaming {
+				w.Header().Set("Content-Type", "text/event-stream")
+				events := []map[string]any{
+					{"type": "response.created", "response": map[string]any{"id": "resp_1"}},
+					{"type": "response.output_item.added", "output_index": 0, "item": map[string]any{"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "apply_patch", "arguments": ""}},
+					{"type": "response.function_call_arguments.delta", "item_id": "fc_1", "output_index": 0, "delta": args},
+					{"type": "response.function_call_arguments.done", "item_id": "fc_1", "output_index": 0, "arguments": args},
+					{"type": "response.output_item.done", "output_index": 0, "item": item},
+					{"type": "response.completed", "response": response},
+				}
+				for _, event := range events {
+					data, _ := json.Marshal(event)
+					frame := append(append([]byte("event: ignored\r\ndata: "), data...), '\r', '\n', '\r', '\n')
+					for _, b := range frame {
+						if _, err := w.Write([]byte{b}); err != nil {
+							t.Fatal(err)
+						}
+					}
+					w.Flush()
+				}
+			} else {
+				w.Header().Set("Content-Type", "application/json")
+				data, _ := json.Marshal(response)
+				w.Header().Set("Content-Length", "99999")
+				if _, err := w.Write(data); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := w.Finish(); err != nil {
+				t.Fatal(err)
+			}
+			if recorder.Header().Get("Content-Length") != "" {
+				t.Fatal("stale content length")
+			}
+			if streaming {
+				seq := 0
+				deltas := 0
+				if err := readSSE(strings.NewReader(recorder.Body.String()), func(_ string, data string) error {
+					var event map[string]any
+					if err := json.Unmarshal([]byte(data), &event); err != nil {
+						return err
+					}
+					if jsonutil.IntAt(event, "sequence_number") != seq {
+						t.Fatal("sequence changed", event)
+					}
+					seq++
+					if event["type"] == "response.custom_tool_call_input.delta" {
+						deltas++
+						if event["delta"] != patch {
+							t.Fatal("custom text changed")
+						}
+					}
+					if event["type"] == "response.completed" {
+						response = jsonutil.MapAt(event, "response")
+					}
+					if strings.HasPrefix(jsonutil.StringAt(event, "type"), "response.function_call_arguments") {
+						t.Fatal("wrapper arguments leaked")
+					}
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+				if deltas != 1 {
+					t.Fatal("custom input duplicated or lost", deltas)
+				}
+			} else {
+				if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+					t.Fatal(err)
+				}
+			}
+			output := jsonutil.SliceAt(response, "output")
+			if jsonutil.StringAt(output[0].(map[string]any), "input") != patch || output[0].(map[string]any)["type"] != "custom_tool_call" || output[1].(map[string]any)["type"] != "function_call" {
+				t.Fatal("restored output incorrect", response)
+			}
+		})
+	}
+}
+
+func TestCustomToolsRejectMalformedInput(t *testing.T) {
+	for _, args := range []string{`{"input":7}`, `{"input":"patch","extra":1}`, `{"input":`} {
+		recorder := httptest.NewRecorder()
+		w := NewCustomToolWriter(recorder, map[string]bool{"apply_patch": true}, 1<<20)
+		w.Header().Set("Content-Type", "text/event-stream")
+		for _, event := range []map[string]any{
+			{"type": "response.output_item.added", "item": map[string]any{"type": "function_call", "id": "fc_1", "name": "apply_patch"}},
+			{"type": "response.function_call_arguments.done", "item_id": "fc_1", "arguments": args},
+		} {
+			data, _ := json.Marshal(event)
+			_, _ = w.Write(append(append([]byte("data: "), data...), '\n', '\n'))
+		}
+		if w.Finish() == nil || !strings.Contains(recorder.Body.String(), `"type":"response.failed"`) || strings.Contains(recorder.Body.String(), `"type":"response.custom_tool_call_input.done"`) {
+			t.Fatal("invalid input became executable", recorder.Body.String())
+		}
+	}
+}
+
+func TestRefusalSurvivesCrossProtocolConversion(t *testing.T) {
+	for _, from := range []Protocol{Chat, Responses} {
+		var body []byte
+		var stream string
+		if from == Chat {
+			body = []byte(`{"choices":[{"message":{"role":"assistant","content":null,"refusal":"Cannot comply."},"finish_reason":"stop"}]}`)
+			stream = "data: {\"choices\":[{\"delta\":{\"refusal\":\"Cannot comply.\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+		} else {
+			body = []byte(`{"id":"resp_1","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"refusal","refusal":"Cannot comply."}]}]}`)
+			stream = "data: {\"type\":\"response.refusal.delta\",\"delta\":\"Cannot comply.\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\"}}\n\n"
+		}
+		converted, err := ConvertResponse(from, Anthropic, body)
+		if err != nil || !bytes.Contains(converted, []byte("Cannot comply.")) {
+			t.Fatal("refusal response lost", string(converted), err)
+		}
+		recorder := httptest.NewRecorder()
+		if err := transcodeStream(recorder, strings.NewReader(stream), from, Anthropic, "m"); err != nil || !strings.Contains(recorder.Body.String(), "Cannot comply.") {
+			t.Fatal("refusal stream lost", recorder.Body.String(), err)
+		}
+	}
+}
 
 // TestConvertRequestChatToAnthropic verifies the ported conversion layer wires
 // up: an OpenAI Chat request should transcode into an Anthropic Messages body

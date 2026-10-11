@@ -254,6 +254,10 @@ func responsesContentWithImages(content any) (any, error) {
 				continue
 			}
 			switch block["type"] {
+			case "refusal":
+				t, _ := block["refusal"].(string)
+				parts = append(parts, map[string]any{"type": "text", "text": t})
+				textOnly.WriteString(t)
 			case "input_text", "text", "output_text":
 				t, _ := block["text"].(string)
 				parts = append(parts, map[string]any{"type": "text", "text": t})

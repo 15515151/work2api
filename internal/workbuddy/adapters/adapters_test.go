@@ -7,7 +7,63 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"work2api/internal/workbuddy/upstream"
 )
+
+func TestUpstreamRefusalSurvivesAdapters(t *testing.T) {
+	for _, first := range []bool{true, false} {
+		responses := NewResponsesStreamConverter("m")
+		messages := NewAnthropicStreamConverter("m")
+		lines := []string{chatChunk(map[string]any{"refusal": "不能执行该请求。"}), chatChunk(map[string]any{"content": "说明"})}
+		if !first {
+			lines[0], lines[1] = lines[1], lines[0]
+		}
+		var events strings.Builder
+		for _, line := range lines {
+			events.WriteString(responses.FeedLine(line))
+			messages.FeedLine(line)
+		}
+		events.WriteString(responses.Finish())
+		if !strings.Contains(events.String(), `"type":"response.refusal.delta"`) || !strings.Contains(events.String(), `"type":"response.refusal.done"`) {
+			t.Fatal("refusal lifecycle lost", events.String())
+		}
+		output := responses.GetNonstreamResponse()["output"].([]any)[0].(map[string]any)["content"].([]any)
+		idx := 1
+		if first {
+			idx = 0
+		}
+		if output[idx].(map[string]any)["type"] != "refusal" || output[idx].(map[string]any)["refusal"] != "不能执行该请求。" {
+			t.Fatal("refusal block/order lost", output)
+		}
+		if !strings.Contains(messages.GetNonstreamResponse()["content"].([]any)[0].(map[string]any)["text"].(string), "不能执行该请求。") {
+			t.Fatal("Messages refusal explanation lost")
+		}
+	}
+	collected, err := upstream.CollectStream("m", func(yield upstream.LineFunc) error {
+		if err := yield(chatChunk(map[string]any{"refusal": "denied"})); err != nil {
+			return err
+		}
+		return yield(`data: {"choices":[{"delta":{},"finish_reason":"stop"}]}`)
+	})
+	if err != nil || collected["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)["refusal"] != "denied" {
+		t.Fatal("Chat nonstream refusal lost", collected, err)
+	}
+}
+
+func TestUpstreamErrorFinishIsNotSuccess(t *testing.T) {
+	for _, reason := range []string{"error", "failed", "failure", "network_error", "server_error"} {
+		_, err := upstream.CollectStream("m", func(yield upstream.LineFunc) error {
+			if err := yield(chatChunk(map[string]any{"content": "partial"})); err != nil {
+				return err
+			}
+			return yield(`data: {"choices":[{"delta":{},"finish_reason":"` + reason + `"}]}`)
+		})
+		if err == nil {
+			t.Fatal("upstream failure reported as success", reason)
+		}
+	}
+}
 
 func TestAnthropicClientCapabilitiesSurviveConversion(t *testing.T) {
 	system := "You are Claude Code.\n<skills_instructions>\n### Available skills\nfind-skills: discover skills at skill://find-skills/SKILL.md\n</skills_instructions>\nAvailable agent types for the Agent tool:\nreviewer: review CLAUDE.md\n## MCP Server Instructions\nUse mcp__docs__search precisely."

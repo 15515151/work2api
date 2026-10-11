@@ -70,6 +70,11 @@ func (s *completionState) observe(chunk map[string]any) error {
 			return invalidStream("上游结束原因格式无效")
 		}
 	}
+	switch strings.ToLower(strings.TrimSpace(finish)) {
+	case "error", "failed", "failure", "network_error", "server_error":
+		raw, _ := json.Marshal(map[string]any{"error": map[string]any{"message": "上游模型以失败状态结束回复", "type": "upstream_error"}})
+		return &UpstreamError{StatusCode: 502, Raw: raw}
+	}
 	if s.finish != "" {
 		if (finish != "" && finish != s.finish) || HasOutput(chunk) {
 			return invalidStream("上游在回复结束后继续发送内容")

@@ -77,6 +77,9 @@ func (parser *bridgeStreamParser) parseChatEvent(eventName string, value map[str
 		if text := jsonutil.StringAt(delta, "content"); text != "" {
 			events = append(events, bridgeStreamEvent{Kind: "text", Text: text})
 		}
+		if refusal := jsonutil.StringAt(delta, "refusal"); refusal != "" {
+			events = append(events, bridgeStreamEvent{Kind: "text", Text: refusal})
+		}
 		for _, rawCall := range jsonutil.SliceAt(delta, "tool_calls") {
 			call, _ := rawCall.(map[string]any)
 			key := fmt.Sprint(jsonutil.FirstAny(call["index"], jsonutil.StringAt(call, "id")))
@@ -207,6 +210,8 @@ func (parser *bridgeStreamParser) parseResponses(eventName string, value map[str
 		return []bridgeStreamEvent{{Kind: "start", ResponseID: jsonutil.StringAt(response, "id"), Model: jsonutil.StringAt(response, "model")}}
 	case "response.output_text.delta":
 		return []bridgeStreamEvent{{Kind: "text", Text: jsonutil.StringAt(value, "delta")}}
+	case "response.refusal.delta":
+		return []bridgeStreamEvent{{Kind: "text", Text: jsonutil.StringAt(value, "delta")}}
 	case "response.reasoning_summary_text.delta":
 		key := responseToolKey(value, nil)
 		parser.responseReasoning[key] = true
@@ -325,7 +330,7 @@ func streamErrorType(value map[string]any) string {
 
 func isStreamErrorFinish(stop string) bool {
 	switch strings.ToLower(strings.TrimSpace(stop)) {
-	case "error", "network_error", "server_error":
+	case "error", "failed", "failure", "network_error", "server_error":
 		return true
 	default:
 		return false
