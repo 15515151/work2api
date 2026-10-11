@@ -464,6 +464,8 @@ const addOpen = ref(false)
 const addProvider = ref('')
 const addMethod = ref<'upload' | 'oauth' | 'token'>('oauth')
 const oauthOptions = ref<OAuthOption[]>([])
+const oauthOptionsLoading = ref(false)
+const oauthOptionsFailed = ref(false)
 const oauthChoice = ref<Record<string, string>>({})
 const oauthUrl = ref('')
 const oauthLoginID = ref('')
@@ -487,10 +489,13 @@ async function importLocal() {
   }
 }
 	async function submitOAuthCallback() {
-		if (callbackBusy.value || !oauthCallback.value.trim() || !oauthLoginID.value) return
+		if (callbackBusy.value || !oauthPolling.value || !oauthCallback.value.trim() || !oauthLoginID.value) return
+		const generation = pollGeneration
+		const provider = addProvider.value
+		const loginID = oauthLoginID.value
 		callbackBusy.value=true
-		try {await api.providerOAuthComplete(addProvider.value,oauthLoginID.value,oauthCallback.value.trim());oauthCallback.value='';toast.success('回调已提交，正在验证账号')}
-		catch(e:any){toast.error(e?.response?.data?.error?.message || '回调提交失败')}
+		try {await api.providerOAuthComplete(provider,loginID,oauthCallback.value.trim());if(generation!==pollGeneration)return;oauthCallback.value='';toast.success('回调已提交，正在验证账号')}
+		catch(e:any){if(generation===pollGeneration)toast.error(e?.response?.data?.error?.message || '回调提交失败')}
 		finally{callbackBusy.value=false}
 	}
 const oauthPolling = ref(false)
@@ -519,14 +524,30 @@ async function onAddProviderChange() {
   const generation = pollGeneration
   const name = addProvider.value
   oauthUrl.value = ''
+  oauthLoginID.value = ''
+  oauthManual.value = false
+  oauthCallback.value = ''
+  oauthOptions.value = []
   oauthChoice.value = {}
+  oauthOptionsLoading.value = false
+  oauthOptionsFailed.value = false
   const c = caps(addProvider.value)
   addMethod.value = c.includes('oauth') ? 'oauth' : c.includes('upload') ? 'upload' : c.includes('add_account') ? 'token' : 'oauth'
   if (c.includes('oauth')) {
-    const res = await api.providerOAuthOptions(name)
-    if (generation !== pollGeneration) return
-    oauthOptions.value = res.options || []
-    for (const o of oauthOptions.value) oauthChoice.value[o.key] = o.default || o.values[0]?.value || ''
+    oauthOptionsLoading.value = true
+    try {
+      const res = await api.providerOAuthOptions(name)
+      if (generation !== pollGeneration) return
+      oauthOptions.value = res.options || []
+      for (const o of oauthOptions.value) oauthChoice.value[o.key] = o.default || o.values[0]?.value || ''
+    } catch (e: any) {
+      if (generation === pollGeneration) {
+        oauthOptionsFailed.value = true
+        oauthMessage.value = e?.response?.data?.error?.message || '登录选项加载失败，请重新选择渠道'
+      }
+    } finally {
+      if (generation === pollGeneration) oauthOptionsLoading.value = false
+    }
   }
 }
 
@@ -540,7 +561,12 @@ function stopPoll() {
 }
 
 async function beginOAuth() {
+  if (oauthOptionsLoading.value || oauthOptionsFailed.value) return
   stopPoll()
+  oauthUrl.value = ''
+  oauthLoginID.value = ''
+  oauthManual.value = false
+  oauthCallback.value = ''
   const generation = pollGeneration
   const controller = new AbortController()
   pollController = controller
@@ -584,8 +610,11 @@ async function beginOAuth() {
       if (generation === pollGeneration) pollTimer = setTimeout(tick, Math.min(delay, Math.max(0, deadline-Date.now())))
     }
     pollTimer = setTimeout(tick, 2500)
-  } catch {
-    if (generation === pollGeneration) stopPoll()
+  } catch (e: any) {
+    if (generation === pollGeneration) {
+      stopPoll()
+      oauthMessage.value = e?.response?.data?.error?.message || '发起授权失败，请重试'
+    }
   }
 }
 
@@ -878,6 +907,8 @@ async function saveConfig() {
 
       <!-- 扫码登录 -->
       <template v-if="addMethod === 'oauth' && caps(addProvider).includes('oauth')">
+        <p v-if="addProvider === 'trae'" class="mb-3 text-small text-muted">通过隧道管理时，授权后的本机回调可能无法连接。开始授权后，本窗口会显示回调输入框，请保留此窗口。</p>
+        <WSpinner v-if="oauthOptionsLoading" label="加载登录选项" />
         <div v-for="o in oauthOptions" :key="o.key" class="mb-3">
           <label class="mb-1.5 block text-small text-muted">{{ o.label }}</label>
           <WSelect v-model="oauthChoice[o.key]" :options="o.values" :disabled="patSaving" />
@@ -923,6 +954,7 @@ async function saveConfig() {
           v-if="addMethod === 'oauth' && caps(addProvider).includes('oauth')"
           variant="primary"
           :loading="oauthPolling"
+          :disabled="oauthOptionsLoading || oauthOptionsFailed"
           @click="beginOAuth"
         >
           {{ oauthPolling ? '等待授权…' : '开始扫码登录' }}
@@ -931,7 +963,7 @@ async function saveConfig() {
           v-if="addMethod === 'token'"
           variant="primary"
           :loading="patSaving"
-          :disabled="!patToken.trim()"
+          :disabled="oauthOptionsLoading || oauthOptionsFailed || !patToken.trim()"
           @click="onAddByToken"
         >
           {{ patSaving ? '验证中…' : '验证并添加' }}
