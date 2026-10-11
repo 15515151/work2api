@@ -129,9 +129,12 @@ var readableLabel = wbruntime.ReadableLabel
 func (s *Server) adminOverview(w http.ResponseWriter, r *http.Request) {
 	accounts := s.accountsForDisplay()
 	labels := []map[string]any{}
+	budgetData := map[string]provider.AdminData{}
 	for _, rt := range s.o.runtimes.Runtimes() {
 		if ar, ok := rt.(provider.AdminRuntime); ok {
-			for _, a := range ar.AdminData(r.Context()).Accounts {
+			data := ar.AdminData(r.Context())
+			budgetData[rt.Name()] = data
+			for _, a := range data.Accounts {
 				uid := str2(a["uid"])
 				if uid == "" {
 					uid = str2(a["id"])
@@ -157,7 +160,7 @@ func (s *Server) adminOverview(w http.ResponseWriter, r *http.Request) {
 		"alerts":             s.creditAlerts(accounts),
 		"usage":              decorateByAccount(summary, accounts),
 		"recent":             s.recentLight(),
-		"prediction":         s.creditPrediction(accounts),
+		"prediction":         s.creditPrediction(budgetData, float64(time.Now().Unix())),
 		"model_count":        len(s.o.runtimeModels(r.Context())),
 		"model_source":       "providers",
 	})
@@ -178,61 +181,6 @@ func accountString(a map[string]any, key string) string {
 		return s
 	}
 	return ""
-}
-
-// creditPrediction estimates how many tokens the remaining credits can buy,
-// weighting each model's tokens-per-credit by its share of historical usage
-// (per-model rates differ hugely, so a global average would be badly skewed).
-func (s *Server) creditPrediction(accounts []map[string]any) map[string]any {
-	var remaining float64
-	for _, a := range accounts {
-		remaining += accountFloat(a, "credits_remaining")
-	}
-	stats, totalCredits, totalTokens := s.o.db.UsageCreditStats()
-	pm := []map[string]any{}
-	var blended float64
-	haveBlended := false
-	for _, m := range stats {
-		credits, _ := m["credits"].(float64)
-		tokens, _ := m["tokens"].(float64)
-		if credits < 0.05 { // too little history for a trustworthy ratio
-			continue
-		}
-		tpc := tokens / credits
-		weight := 0.0
-		if totalTokens > 0 {
-			weight = tokens / totalTokens
-		}
-		var predicted float64
-		if remaining > 0 {
-			predicted = round1(remaining * tpc)
-		}
-		pm = append(pm, map[string]any{
-			"model": m["model"], "credits": round2(credits), "tokens": int64(tokens),
-			"tokens_per_credit": round1(tpc), "weight": round4(weight),
-			"predicted_tokens": int64(predicted),
-		})
-		blended += weight * tpc
-		haveBlended = true
-	}
-	out := map[string]any{
-		"remaining_credits": round2(remaining),
-		"credits_used":      round2(totalCredits),
-		"tokens_used":       int64(totalTokens),
-		"models":            pm,
-	}
-	if haveBlended {
-		out["tokens_per_credit"] = round1(blended)
-		if remaining > 0 {
-			out["predicted_tokens"] = int64(round1(remaining * blended))
-		} else {
-			out["predicted_tokens"] = nil
-		}
-	} else {
-		out["tokens_per_credit"] = nil
-		out["predicted_tokens"] = nil
-	}
-	return out
 }
 
 // creditAlerts reports the current low-balance / near-expiry state for display

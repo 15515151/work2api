@@ -132,6 +132,23 @@ func (r *Runtime) AdminData(ctx context.Context) provider.AdminData {
 		models = append(models, row)
 	}
 	d.Models = models
+	for _, row := range accts {
+		region, _ := row["region"].(string)
+		plan, _ := row["plan"].(string)
+		label, _ := row["label"].(string)
+		domain := region + "/" + plan
+		if plan == "" {
+			// Unknown plans cannot establish compatible billing for peers.
+			domain += "/" + fmt.Sprint(row["id"])
+		}
+		budget := provider.CreditBudget(row, domain, label+" · "+region, "额度", float64(time.Now().Unix()))
+		for _, model := range models {
+			if id, ok := model["id"].(string); ok {
+				budget.Models = append(budget.Models, id)
+			}
+		}
+		d.Budgets = append(d.Budgets, budget)
+	}
 
 	region := ""
 	if acct, _, err := r.pickAccount(); err == nil {
@@ -278,7 +295,11 @@ func buildQuotaEntry(q *account.QuotaInfo) quotaEntry {
 	if q.UserQuota != nil {
 		e.remaining += q.UserQuota.Remaining
 		e.total += q.UserQuota.Total
-		e.packages = append(e.packages, quotaBucketPackage("订阅额度", q.UserQuota))
+		pkg := quotaBucketPackage("订阅额度", q.UserQuota)
+		if e.expiresAt > 0 {
+			pkg["expire_at"] = float64(e.expiresAt)
+		}
+		e.packages = append(e.packages, pkg)
 	}
 	if q.AddonQuota != nil {
 		e.remaining += q.AddonQuota.Remaining
@@ -291,7 +312,7 @@ func buildQuotaEntry(q *account.QuotaInfo) quotaEntry {
 	for _, p := range q.DedicatedPackages {
 		e.remaining += p.Remaining
 		e.total += p.Total
-		pkg := map[string]any{"name": p.Label, "remain": p.Remaining, "used": p.Used, "total": p.Total}
+		pkg := map[string]any{"name": p.Label, "remain": p.Remaining, "used": p.Used, "total": p.Total, "budget_restricted": true}
 		if expiry := quotaExpirySeconds(p.ExpireAt); expiry > 0 {
 			pkg["expire_at"] = float64(expiry)
 		}

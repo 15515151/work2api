@@ -74,7 +74,8 @@ body {
 
 /* 玻璃面板：低透明度叠加 + 细边 + 轻背光模糊 */
 .glass {
-  background: rgb(var(--glass-bg) / var(--glass-alpha)), rgb(var(--c-surface));
+  background-color: rgb(var(--c-surface));
+  background-image: linear-gradient(rgb(var(--glass-bg) / var(--glass-alpha)), rgb(var(--glass-bg) / var(--glass-alpha)));
   background-blend-mode: overlay;
   border: 1px solid rgb(var(--c-line) / 0.9);
 }

@@ -7,29 +7,47 @@ import (
 	"time"
 )
 
-// UsageCreditStats aggregates credits & tokens per model over rows with
-// credits > 0 (real, trustworthy consumption), used by the overview to estimate
-// "tokens per credit". Returns per-model rows plus totals.
-func (d *DB) UsageCreditStats() (models []map[string]any, totalCredits, totalTokens float64) {
+// BudgetSample contains aggregate billing evidence only, never prompt content.
+type BudgetSample struct {
+	AccountUID, Model              string
+	Recent                         bool
+	Credits, Tokens, ZeroTokens    float64
+	Calls, ZeroCalls, UnknownCalls int
+	LegacyCalls                    int
+}
+
+// UsageBudgetSamples groups the last 30 days into a 7-day window and its older
+// fallback. Successful rows with known positive tokens can calibrate cost.
+// Legacy positive-cost rows with consistent token totals provide a separately
+// marked reference estimate; explicitly unknown tokens are never promoted.
+// Reported zero consumption is kept separate from unknown consumption.
+func (d *DB) UsageBudgetSamples(now float64) ([]BudgetSample, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	models = []map[string]any{}
-	rows, err := d.db.Query("SELECT model, COALESCE(SUM(credits),0), COALESCE(SUM(total_tokens),0) FROM usage_logs WHERE credits > 0 GROUP BY model ORDER BY 2 DESC")
+	rows, err := d.db.Query(`SELECT COALESCE(account_uid,''),COALESCE(model,''),ts>=?,
+	 COALESCE(SUM(CASE WHEN credits>0 THEN credits ELSE 0 END),0),
+	 COALESCE(SUM(CASE WHEN credits>0 THEN total_tokens ELSE 0 END),0),
+	 COUNT(CASE WHEN credits>0 THEN 1 END),
+	 COALESCE(SUM(CASE WHEN credits=0 THEN total_tokens ELSE 0 END),0),
+	 COUNT(CASE WHEN credits=0 THEN 1 END),COUNT(CASE WHEN credits IS NULL THEN 1 END),
+	 COUNT(CASE WHEN tokens_known IS NULL THEN 1 END)
+	 FROM usage_logs WHERE ts>=? AND ts<=? AND status='ok' AND total_tokens>0
+	 AND (tokens_known=1 OR (tokens_known IS NULL AND credits>0
+	 AND input_tokens>=0 AND output_tokens>=0 AND total_tokens=input_tokens+output_tokens))
+	 GROUP BY account_uid,model,ts>=?`, now-7*86400, now-30*86400, now, now-7*86400)
 	if err != nil {
-		return models, 0, 0
+		return nil, err
 	}
 	defer rows.Close()
+	out := []BudgetSample{}
 	for rows.Next() {
-		var m sql.NullString
-		var c, t float64
-		if err := rows.Scan(&m, &c, &t); err != nil {
-			continue
+		var s BudgetSample
+		if err := rows.Scan(&s.AccountUID, &s.Model, &s.Recent, &s.Credits, &s.Tokens, &s.Calls, &s.ZeroTokens, &s.ZeroCalls, &s.UnknownCalls, &s.LegacyCalls); err != nil {
+			return nil, err
 		}
-		models = append(models, map[string]any{"model": m.String, "credits": c, "tokens": t})
-		totalCredits += c
-		totalTokens += t
+		out = append(out, s)
 	}
-	return models, totalCredits, totalTokens
+	return out, rows.Err()
 }
 
 // GetSettings returns settings merged over defaults. Results are memoized in

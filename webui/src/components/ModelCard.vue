@@ -47,20 +47,20 @@ const displayCredits = computed(() => {
 const finiteCost = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v) && v >= 0
 const costMetric = computed(() => {
   if (props.provider === 'qoder') return {
-    value: finiteCost(m.value.price_factor) ? `×${m.value.price_factor}` : '—',
-    label: '相对成本倍率',
-    title: '上游模型目录的相对倍率，不是货币单价；缺失时不推断为免费。',
+    value: finiteCost(m.value.price_factor) ? `×${m.value.price_factor}` : '-',
+    label: '成本系数',
+    title: '上游模型目录的相对成本系数，仅在该渠道及相应计费规则内比较，跨渠道数字不能直接比较；不是货币单价，缺失时不推断为免费。',
   }
   if (props.provider === 'opencode') return {
-    value: finiteCost(m.value.input_cost) && finiteCost(m.value.output_cost) ? `$${m.value.input_cost} / $${m.value.output_cost}` : '—',
+    value: finiteCost(m.value.input_cost) && finiteCost(m.value.output_cost) ? `$${m.value.input_cost} / $${m.value.output_cost}` : '-',
     label: '输入 / 输出价格',
     title: 'models.dev 的 Zen 参考价，单位为美元/百万 tokens；Go 订阅与实际账单以渠道为准。',
   }
   if (props.provider === 'trae') return {
-    value: '待确认', label: '积分消耗',
-    title: '未取得可验证的实际计费速度；上游权益消耗值不是已确认的成本倍率。账号权益、活动及时段可能影响计费。',
+    value: '-', label: '成本系数',
+    title: '尚未获取可确认的模型成本系数，目录权益消耗值不能作为计费倍率。',
   }
-  return { value: displayCredits.value ?? '—', label: '成本系数', title: '上游目录成本系数；活动或时段优惠以实际扣费为准。' }
+  return { value: finiteCost(displayCredits.value) ? `×${displayCredits.value}` : '-', label: '成本系数', title: '上游目录成本系数；仅在该渠道及相应计费规则内比较，跨渠道数字不能直接比较；活动或时段优惠以实际扣费为准。' }
 })
 const nativeProtocol = computed(() => ({
   chat: 'Chat', messages: 'Messages', responses: 'Responses',

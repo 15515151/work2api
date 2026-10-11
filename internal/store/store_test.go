@@ -6,6 +6,50 @@ import (
 	"testing"
 )
 
+func TestBudgetSamplesExcludeUnknownTokensErrorsAndOldHistory(t *testing.T) {
+	db, err := New(filepath.Join(t.TempDir(), "budget.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := 1700000000.0
+	known, unknown := true, false
+	paid, zero := 2.0, 0.0
+	for _, tc := range []struct {
+		age    float64
+		tokens int
+		known  *bool
+		cost   *float64
+		status string
+	}{
+		{1, 1000, &known, &paid, "ok"}, {1, 200, &known, &zero, "ok"}, {1, 300, &known, nil, "ok"},
+		{8, 3000, &known, &paid, "ok"}, {31, 9000, &known, &paid, "ok"}, {-1, 9000, &known, &paid, "ok"},
+		{1, 9000, &unknown, &paid, "ok"}, {1, 9000, &known, &paid, "error"},
+		{1, 500, nil, &paid, "ok"}, {1, 9000, nil, nil, "ok"}, {1, 9000, nil, &zero, "ok"},
+	} {
+		id, err := db.LogUsageWithID(UsageParams{Model: "m", AccountUID: "a", InputTokens: tc.tokens, TokensKnown: tc.known, Credits: tc.cost, Status: tc.status})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.db.Exec("UPDATE usage_logs SET ts=?,tokens_known=? WHERE id=?", now-tc.age*86400, tc.known, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	samples, err := db.UsageBudgetSamples(now)
+	if err != nil || len(samples) != 2 {
+		t.Fatalf("samples=%#v err=%v", samples, err)
+	}
+	for _, s := range samples {
+		if s.Recent {
+			if s.Tokens != 1500 || s.Credits != 4 || s.Calls != 2 || s.LegacyCalls != 1 || s.ZeroTokens != 200 || s.ZeroCalls != 1 || s.UnknownCalls != 1 {
+				t.Fatalf("recent=%#v", s)
+			}
+		} else if s.Tokens != 3000 || s.Credits != 2 || s.Calls != 1 {
+			t.Fatalf("fallback=%#v", s)
+		}
+	}
+}
+
 func TestOnlineSnapshotIsIndependent(t *testing.T) {
 	dir := t.TempDir()
 	db, err := New(filepath.Join(dir, "live.db"))

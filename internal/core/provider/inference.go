@@ -102,6 +102,7 @@ type CheckinHistorian interface {
 // accounts (config key tiers) and no checkin/credits. The WebUI renders columns
 // and actions from Capabilities rather than assuming one uniform shape.
 type AdminData struct {
+	Budgets      []BudgetPool // disjoint channel-owned balances for overview estimation
 	Maintenance  []MaintenanceOption
 	ConfigEditor string            // identifies an optional frontend editor extension, not a generic config schema
 	DisplayName  string            // e.g. "Qoder"

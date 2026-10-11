@@ -313,6 +313,7 @@ func TestImageCapabilityDoesNotPromoteUnknownModels(t *testing.T) {
 
 func TestCatalogUsesUpstreamMetadata(t *testing.T) {
 	response := `{"config_info_list":[{"config_name":"vision","display_config":{"display_name":"Vision","multimodal":true,"model_capability":"reasoning_model","tool_response_multimodal":true},"reasoning_effort_config":{"support_thinking":false},"context_window_tokens":{"dev":200000},"model_detail_list":[{"max_tokens":8192},{"max_tokens":4096}]},{"config_name":"text","display_config":{"display_name":"Text","multimodal":false}},{"config_name":"unknown","display_config":{"display_name":"Unknown"}}]}`
+	response = strings.Replace(response, `[{"max_tokens":8192},{"max_tokens":4096}]`, `[{"max_tokens":8192,"model_entitlement_usage_cost":1},{"max_tokens":4096,"model_entitlement_usage_cost":0},{"model_entitlement_usage_cost":{"unknown":1}}]`, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) { io.WriteString(w, response) }))
 	defer server.Close()
 	client := upstream.New()
@@ -329,6 +330,14 @@ func TestCatalogUsesUpstreamMetadata(t *testing.T) {
 	}
 	if byID["trae/vision"]["vision"] != true || byID["trae/vision"]["thinking_control"] != false || byID["trae/vision"]["max_output_tokens"] != 4096 || byID["trae/text"]["vision"] != false || byID["trae/unknown"]["vision"] != nil {
 		t.Fatalf("incorrect discovery projection: %v", byID)
+	}
+	costs, ok := byID["trae/vision"]["entitlement_usage_cost"].([]float64)
+	if !ok || len(costs) != 2 || costs[0] != 1 || costs[1] != 0 {
+		t.Fatal("catalog entitlement values lost or unknown structure invented", costs)
+	}
+	merged := mergeModelInfo(models[0], upstream.ModelInfo{EntitlementCosts: []float64{2}})
+	if len(merged.EntitlementCosts) != 3 || len(models[0].EntitlementCosts) != 2 {
+		t.Fatal("product cost metadata merge lost values or mutated original")
 	}
 	response = `{"config_info_list":[]}`
 	if models, err = client.FetchModels(&auth.Auth{Variant: "cn"}); err != nil || len(models) != 0 {
@@ -481,6 +490,32 @@ func TestQuotaRecoveryCoalescesAndPreservesOtherCooldowns(t *testing.T) {
 	a.CooldownKind, a.Cooldown = upstream.ErrSoftRate, time.Now().Add(time.Hour)
 	if err := r.refreshQuota(context.Background(), id, true); err != nil || a.Cooldown.IsZero() {
 		t.Fatal("quota refresh incorrectly cleared rate-limit cooldown")
+	}
+}
+
+func TestWarmLoadsQuotaWithoutPeriodicRefresh(t *testing.T) {
+	var reads atomic.Int32
+	r := fixtureRuntime(t, func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path != upstream.EpEntUsage {
+			http.Error(w, "catalog unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		reads.Add(1)
+		io.WriteString(w, `{"is_credits_billing":true,"user_entitlement_pack_list":[{"entitlement_base_info":{"quota":{"credits_limit":100}},"usage":{"credits_amount":25}}]}`)
+	})
+	identity := &auth.Auth{Variant: "cn", AccessToken: "fixture"}
+	a := &accountState{Auth: identity, Enabled: true, Identities: map[string]*auth.Auth{"cn": identity}}
+	r.accounts["enabled"] = a
+	r.accounts["disabled"] = &accountState{Auth: identity, Enabled: false}
+	r.Warm(context.Background())
+	if reads.Load() != 1 || a.Remaining == nil || *a.Remaining != 75 || a.QuotaAt.IsZero() || a.QuotaFailed || r.accounts["disabled"].Remaining != nil {
+		t.Fatal("startup failed to hydrate enabled account quota independently of catalog")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r.Warm(ctx)
+	if reads.Load() != 1 {
+		t.Fatal("cancelled startup queried upstream")
 	}
 }
 

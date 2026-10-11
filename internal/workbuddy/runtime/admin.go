@@ -205,6 +205,7 @@ func (r *Runtime) AdminData(ctx context.Context) provider.AdminData {
 	models := r.Catalog.ListCached()
 	r.AttachModelAccounts(models)
 	resources := []provider.ResourceSummary{}
+	budgets := []provider.BudgetPool{}
 	for _, a := range accounts {
 		alias, _ := a["alias"].(string)
 		resources = append(resources, provider.ResourceMetadata(a, "account", map[string]provider.ResourceAction{
@@ -213,8 +214,27 @@ func (r *Runtime) AdminData(ctx context.Context) provider.AdminData {
 			"enabled":  {Label: "启用", Enabled: true},
 			"priority": {Label: "优先级", Enabled: true},
 		}))
+		profile, _ := a["profile"].(string)
+		site := siterouting.ProfileSite(profile)
+		budget := provider.CreditBudget(a, profile, AccountLabel(a)+" · "+SiteLabel(site)+" · "+profile, "积分", float64(time.Now().Unix()))
+		for _, model := range models {
+			id, _ := model["id"].(string)
+			for _, supporter := range model["accounts"].([]map[string]any) {
+				if supporter["uid"] != a["uid"] {
+					continue
+				}
+				budget.Models = append(budget.Models, id)
+				if cost, ok := r.Catalog.CreditsByRegion(id)[site]; ok && cost == 0 {
+					budget.FreeModels = append(budget.FreeModels, id)
+				}
+			}
+		}
+		if len(budget.Models) == 0 && budget.Reason == "" {
+			budget.Reason = "没有已确认可调用模型"
+		}
+		budgets = append(budgets, budget)
 	}
-	return provider.AdminData{Resources: resources, DisplayName: "WorkBuddy", Ready: len(accounts) > 0, Default: true, Capabilities: []string{"accounts", "models", "checkin", "credits", "oauth", "upload"}, Accounts: accounts, Models: models, Status: map[string]any{"account_count": len(accounts), "healthy_count": healthy, "model_count": len(models), "credits_remaining": math.Round(remain*100) / 100, "credits_total": math.Round(total*100) / 100}}
+	return provider.AdminData{Budgets: budgets, Resources: resources, DisplayName: "WorkBuddy", Ready: len(accounts) > 0, Default: true, Capabilities: []string{"accounts", "models", "checkin", "credits", "oauth", "upload"}, Accounts: accounts, Models: models, Status: map[string]any{"account_count": len(accounts), "healthy_count": healthy, "model_count": len(models), "credits_remaining": math.Round(remain*100) / 100, "credits_total": math.Round(total*100) / 100}}
 }
 func SiteLabel(site string) string {
 	switch site {

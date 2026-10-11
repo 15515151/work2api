@@ -324,10 +324,11 @@ type ModelInfo struct {
 	Name                   string
 	ContextWindow          int64 // = context_window_tokens.dev（目录未给则 0）
 	MaxTokens              int64
-	Multimodal             *bool  `json:"multimodal,omitempty"`
-	Capability             string `json:"capability,omitempty"`
-	ThinkingControl        *bool  `json:"thinking_control,omitempty"`
-	ToolResponseMultimodal *bool  `json:"tool_response_multimodal,omitempty"`
+	Multimodal             *bool     `json:"multimodal,omitempty"`
+	Capability             string    `json:"capability,omitempty"`
+	ThinkingControl        *bool     `json:"thinking_control,omitempty"`
+	ToolResponseMultimodal *bool     `json:"tool_response_multimodal,omitempty"`
+	EntitlementCosts       []float64 `json:"entitlement_usage_cost,omitempty"`
 }
 
 var soloAgentOnlyDeadNames = map[string]struct{}{
@@ -379,7 +380,8 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 				SupportThinking *bool `json:"support_thinking"`
 			} `json:"reasoning_effort_config"`
 			Details []struct {
-				MaxTokens int64 `json:"max_tokens"`
+				MaxTokens       int64           `json:"max_tokens"`
+				EntitlementCost json.RawMessage `json:"model_entitlement_usage_cost"`
 			} `json:"model_detail_list"`
 		} `json:"config_info_list"`
 	}
@@ -407,7 +409,12 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 			continue
 		}
 		maxTokens := int64(0)
+		costs := []float64{}
 		for _, detail := range cfg.Details {
+			var cost *float64
+			if json.Unmarshal(detail.EntitlementCost, &cost) == nil && cost != nil && *cost >= 0 {
+				costs = append(costs, *cost)
+			}
 			if detail.MaxTokens > 0 && (maxTokens == 0 || detail.MaxTokens < maxTokens) {
 				maxTokens = detail.MaxTokens
 			}
@@ -421,6 +428,7 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 			Capability:             cfg.DisplayConfig.Capability,
 			ThinkingControl:        cfg.ReasoningEffortConfig.SupportThinking,
 			ToolResponseMultimodal: cfg.DisplayConfig.ToolResponseMultimodal,
+			EntitlementCosts:       costs,
 		})
 	}
 	return out, nil

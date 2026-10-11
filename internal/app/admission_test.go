@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,6 +26,77 @@ import (
 	"work2api/internal/workbuddy/pool"
 	"work2api/internal/workbuddy/upstream"
 )
+
+func TestBudgetPredictionSeparatesDomainsAndFreeModels(t *testing.T) {
+	balance := func(n float64) *float64 { return &n }
+	data := map[string]provider.AdminData{
+		"workbuddy": {DisplayName: "WorkBuddy", Budgets: []provider.BudgetPool{
+			{AccountID: "cn", Domain: "cn-cli", Remaining: balance(100), Models: []string{"cheap", "expensive"}},
+			{AccountID: "intl", Domain: "intl-work", Remaining: balance(10), Models: []string{"deepseek", "glm"}, FreeModels: []string{"deepseek"}},
+		}},
+		"qoder": {DisplayName: "Qoder", Budgets: []provider.BudgetPool{{AccountID: "cn", Domain: "cn", Remaining: balance(20), Models: []string{"qoder/qfmodel"}}}},
+		"trae":  {DisplayName: "Trae", Budgets: []provider.BudgetPool{{AccountID: "trae", Remaining: balance(999), Reason: "消费未知"}}},
+	}
+	samples := []store.BudgetSample{
+		{AccountUID: "cn", Model: "cheap", Recent: true, Credits: 5, Tokens: 5000, Calls: 5, LegacyCalls: 5},
+		{AccountUID: "cn", Model: "expensive", Recent: true, Credits: 50, Tokens: 5000, Calls: 5},
+		{AccountUID: "intl", Model: "glm", Recent: true, Credits: 20, Tokens: 5000, Calls: 5},
+		{AccountUID: "intl", Model: "deepseek", Recent: true, Credits: 500, Tokens: 1e9, Calls: 50, ZeroTokens: 1e8},
+		{AccountUID: "cn", Model: "qoder/qfmodel", Recent: true, Credits: 5, Tokens: 10000, Calls: 5},
+		{AccountUID: "deleted", Model: "cheap", Recent: true, Credits: 1, Tokens: 1e12, Calls: 99},
+	}
+	out := estimateBudgets(data, samples)
+	if out["predicted_tokens"] != int64(60681) || out["estimated_pools"] != 3 {
+		t.Fatalf("prediction=%#v", out)
+	}
+	for _, channel := range out["providers"].([]map[string]any) {
+		if channel["provider"] == "workbuddy" && !reflect.DeepEqual(channel["free_models"], []string{"deepseek"}) {
+			t.Fatal("free capability lost")
+		}
+		if channel["provider"] == "workbuddy" && channel["pools"].([]map[string]any)[0]["legacy_samples"] != 5 {
+			t.Fatal("legacy reference marker lost")
+		}
+	}
+}
+
+func TestBudgetPredictionFallbackAndUnknownBalances(t *testing.T) {
+	remaining := 10.0
+	pool := provider.BudgetPool{AccountID: "old", Domain: "same", Unit: "credits", Remaining: &remaining, Models: []string{"m"}}
+	newPool := pool
+	newPool.AccountID = "new"
+	d := map[string]provider.AdminData{"workbuddy": {Budgets: []provider.BudgetPool{pool, newPool}}}
+	samples := []store.BudgetSample{{AccountUID: "old", Model: "m", Recent: true, Credits: 1, Tokens: 1000, Calls: 1}, {AccountUID: "old", Model: "m", Credits: 4, Tokens: 4000, Calls: 4}}
+	out := estimateBudgets(d, samples)
+	pools := out["providers"].([]map[string]any)[0]["pools"].([]map[string]any)
+	if out["predicted_tokens"] != int64(20000) || pools[0]["window_days"] != 30 || pools[1]["scope"] != "billing_domain" {
+		t.Fatalf("fallback=%#v", out)
+	}
+	newPool.Domain = "different"
+	d["workbuddy"] = provider.AdminData{Budgets: []provider.BudgetPool{pool, newPool}}
+	if estimateBudgets(d, samples)["estimated_pools"] != 1 {
+		t.Fatal("cross-domain calibration")
+	}
+	pool.Remaining = nil
+	d["workbuddy"] = provider.AdminData{Budgets: []provider.BudgetPool{pool}}
+	if estimateBudgets(d, samples)["predicted_tokens"] != nil {
+		t.Fatal("unknown balance became zero")
+	}
+	pool.Remaining = &remaining
+	pool.FreeModels = []string{"m"}
+	d["workbuddy"] = provider.AdminData{Budgets: []provider.BudgetPool{pool}}
+	if estimateBudgets(d, samples)["predicted_tokens"] != nil {
+		t.Fatal("free traffic amplified balance")
+	}
+	row := map[string]any{"uid": "a", "credits_remaining": 100.0, "credits_expire_at": 99.0, "healthy": false, "cooldown_until": 200.0, "credit_packages": []map[string]any{{"remain": 20.0, "expire_at": 99.0}, {"remain": 30.0, "budget_restricted": true}}}
+	budget := provider.CreditBudget(row, "domain", "label", "credits", 100)
+	if !budget.Deferred || budget.Reason != "" || budget.Remaining == nil || *budget.Remaining != 50 || budget.Excluded != 50 {
+		t.Fatalf("budget=%#v", budget)
+	}
+	row["enabled"] = false
+	if provider.CreditBudget(row, "domain", "label", "credits", 100).Reason == "" {
+		t.Fatal("disabled account budget included")
+	}
+}
 
 func awaitQueue(t *testing.T, a *modelAdmission, n int) {
 	t.Helper()

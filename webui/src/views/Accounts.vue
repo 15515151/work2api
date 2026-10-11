@@ -159,8 +159,17 @@ const filtered = computed(() =>
 function kindLabel(r: Record<string, any>) { return r.resource?.kind === 'anonymous' ? '匿名入口' : r.resource?.kind === 'key_tier' ? '密钥层级' : r.resource?.source === 'local' ? '桌面账号' : '账号' }
 function expiryOf(r: Record<string, any>) {
   const dates = pkgsOf(r).filter(p => p.remain != null && p.remain > 0 && p.expire_at).map(p => p.expire_at!)
-  if (r.raw.credits_expire_at > 0) dates.push(r.raw.credits_expire_at)
+  if (!pkgsOf(r).length && r.raw.credits_expire_at > 0 && r.raw.credits_remaining !== 0) dates.push(r.raw.credits_expire_at)
   return dates.length ? Math.min(...dates) : undefined
+}
+function expiryNotice(r: Record<string, any>) {
+  const expiry = expiryOf(r)
+  if (!expiry) return null
+  const days = (expiry * 1000 - Date.now()) / 86400_000
+  if (days <= 0) return { tone: 'text-fault', text: '已到期' }
+  if (days <= 1) return { tone: 'text-fault', text: '不足 1 天到期' }
+  if (days <= 7) return { tone: 'text-warn', text: `${Math.ceil(days)} 天内到期` }
+  return null
 }
 
 const summary = computed(() => {
@@ -831,7 +840,10 @@ async function saveConfig() {
                 @mouseleave="closePkgs"
                 @blur="closePkgs"
               >
-                <span class="text-muted">{{ expiryOf(row) ? dt(expiryOf(row), 'YYYY-MM-DD') : '查看资源包' }}</span>
+                <span class="inline-flex flex-col items-start gap-0.5" :class="expiryNotice(row)?.tone || 'text-muted'">
+                  <span>{{ expiryOf(row) ? dt(expiryOf(row), 'YYYY-MM-DD') : '查看资源包' }}</span>
+                  <span v-if="expiryNotice(row)" class="text-micro font-medium">{{ expiryNotice(row)?.text }}</span>
+                </span>
                 <WIcon v-if="pkgsOf(row).length" name="clock" :size="13" class="text-faint" />
               </button>
             </template>

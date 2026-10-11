@@ -3,7 +3,7 @@ import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { api } from '@/api/client'
 import type { Overview, ProviderSummary } from '@/types'
-import { int, abbr, credits as fmtCredits, dt } from '@/lib/format'
+import { int, abbr, dt } from '@/lib/format'
 import { providerMeta } from '@/lib/providers'
 import { buildLabelMap } from '@/utils/accountLabel'
 import WPage from '@/components/ui/WPage.vue'
@@ -13,6 +13,7 @@ import WLed from '@/components/ui/WLed.vue'
 import WTable, { type Column } from '@/components/ui/WTable.vue'
 import WSpinner from '@/components/ui/WSpinner.vue'
 import TrendChart from '@/components/TrendChart.vue'
+import BudgetDetails from '@/components/BudgetDetails.vue'
 
 const router = useRouter()
 const ov = ref<Overview | null>(null)
@@ -152,14 +153,13 @@ onUnmounted(() => timer && clearInterval(timer))
             </span>
           </div>
           <div class="mt-4">
-            <div class="text-micro uppercase tracking-wide text-faint">预计可服务 Tokens（按当前额度与用量结构估算）</div>
+            <div class="text-micro uppercase tracking-wide text-faint">预计可服务 Tokens</div>
             <div class="mono mt-1 text-4xl font-semibold leading-none text-brand">
               {{ pred?.predicted_tokens != null ? abbr(pred.predicted_tokens, 2) : '—' }}
             </div>
             <div class="mt-2 flex flex-wrap gap-x-6 gap-y-1 text-small text-muted">
-              <span>剩余额度 <span class="mono text-ink">{{ fmtCredits(pred?.remaining_credits) }}</span></span>
-              <span v-if="pred?.tokens_per_credit != null">每额度产出 <span class="mono text-ink">{{ abbr(pred.tokens_per_credit) }}</span> tok</span>
-              <span>已消耗 <span class="mono text-ink">{{ abbr(pred?.tokens_used) }}</span> tok</span>
+              <span>已知付费余额估算 · 覆盖 {{ pred?.estimated_pools ?? 0 }}/{{ pred?.total_pools ?? 0 }} 个账号计费池</span>
+              <BudgetDetails :prediction="pred" />
             </div>
           </div>
         </WCard>

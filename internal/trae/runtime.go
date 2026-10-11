@@ -584,7 +584,7 @@ func (r *Runtime) AdminData(context.Context) provider.AdminData {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	data := provider.AdminData{DisplayName: "Trae", Capabilities: []string{"accounts", "models", "credits", "checkin", "add_account", "oauth", "local_import"}, Accounts: []map[string]any{}, Resources: []provider.ResourceSummary{}, Notes: "添加国内 IDE 或 Work/SOLO 账号；产品身份保留，模型调用自动选择符合条件的账号。"}
-	data.Maintenance = []provider.MaintenanceOption{{Key: "trae_auto_quota", Label: "自动刷新 Trae 额度", Description: "每 30 分钟刷新一次，未知额度保持未知"}, {Key: "trae_auto_checkin", Label: "自动 Trae 签到", Description: "仅使用已授权设备身份，不轮换设备"}}
+	data.Maintenance = []provider.MaintenanceOption{{Key: "trae_auto_quota", Label: "自动刷新 Trae 额度", Description: "启动自动读取一次；开启后每 30 分钟刷新，未知额度保持未知"}, {Key: "trae_auto_checkin", Label: "自动 Trae 签到", Description: "仅使用已授权设备身份，不轮换设备"}}
 	for id, a := range r.accounts {
 		label := a.Alias
 		if label == "" {
@@ -613,6 +613,11 @@ func (r *Runtime) AdminData(context.Context) provider.AdminData {
 		}
 		row["products"] = products
 		data.Accounts = append(data.Accounts, row)
+		budget := provider.CreditBudget(row, "credits", label, "积分", float64(time.Now().Unix()))
+		if budget.Reason == "" {
+			budget.Reason = "缺少逐次调用消费依据"
+		}
+		data.Budgets = append(data.Budgets, budget)
 		actions := map[string]provider.ResourceAction{"rename": {Label: "别名", Enabled: true}, "enabled": {Label: "启用", Enabled: true}, "priority": {Label: "优先级", Enabled: true}, "delete": {Label: "删除", Enabled: true, Confirmation: "删除网关导入的账号凭据？"}}
 		data.Resources = append(data.Resources, provider.ResourceMetadata(row, "account", actions))
 		data.Ready = data.Ready || a.Enabled
@@ -638,7 +643,27 @@ func (r *Runtime) AdminData(context.Context) provider.AdminData {
 	return data
 }
 
-func (r *Runtime) Warm(ctx context.Context) { _ = r.RefreshModels(ctx) }
+func (r *Runtime) Warm(ctx context.Context) {
+	// Balances are memory-only. Hydrate once on startup independently of the
+	// optional periodic refresh, without querying disabled accounts.
+	r.mu.Lock()
+	ids := []string{}
+	for id, a := range r.accounts {
+		if a.Enabled {
+			ids = append(ids, id)
+		}
+	}
+	r.mu.Unlock()
+	for _, id := range ids {
+		if ctx.Err() != nil {
+			return
+		}
+		probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		_ = r.refreshQuota(probeCtx, id, false)
+		cancel()
+	}
+	_ = r.RefreshModels(ctx)
+}
 func (r *Runtime) Maintain(ctx context.Context, settings map[string]string, now time.Time) {
 	r.mu.Lock()
 	due := now.Sub(r.lastMaintenance) >= 30*time.Minute

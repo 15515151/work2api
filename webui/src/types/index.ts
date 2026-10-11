@@ -264,18 +264,36 @@ export interface Overview {
   usage: UsageSummary
   recent: UsageRecord[]
   prediction?: {
-    remaining_credits: number
-    tokens_per_credit: number | null
     predicted_tokens: number | null
-    credits_used: number
-    tokens_used: number
-    models: {
-      model: string
-      credits: number
-      tokens: number
-      tokens_per_credit: number
-      weight: number
-      predicted_tokens: number
+    estimated_pools: number
+    total_pools: number
+    error?: string
+    providers: {
+      provider: string
+      label: string
+      predicted_tokens: number | null
+      estimated_pools: number
+      free_models: string[]
+      reason?: string
+      pools: {
+        label: string
+        remaining: number | null
+        unit: string
+        predicted_tokens: number | null
+        tokens_per_unit?: number
+        status: string
+        reason: string
+        stale: boolean
+        deferred: boolean
+        excluded_credits: number
+        window_days: number
+        samples: number
+        legacy_samples: number
+        scope: string
+        free_tokens_observed: number
+        zero_cost_unconfirmed_tokens: number
+        unknown_cost_calls: number
+      }[]
     }[]
   }
 }
