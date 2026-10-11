@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"time"
 
@@ -33,7 +34,7 @@ func (s *Server) dispatchRuntimeTo(w http.ResponseWriter, r *http.Request, proto
 	}
 	portal, eligible := rt.(provider.PortalProvider)
 	if principal.UserID > 0 && (!eligible || !portal.SupportsPortal()) {
-		writeAPIErr(w, errBody(403, "当前共享服务仅支持 WorkBuddy 模型", "model_not_allowed"))
+		writeAPIErr(w, errBody(403, "该渠道尚未开放用户调用", "model_not_allowed"))
 		return true
 	}
 	// Hand the runtime the alias-resolved, still-namespaced id; the runtime
@@ -67,9 +68,17 @@ func (s *Server) dispatchRuntimeTo(w http.ResponseWriter, r *http.Request, proto
 	}
 	report, err := rt.Serve(ctx, request)
 	if err != nil {
-		report.Status, report.Error = "error", err.Error()
+		if report.Status != "incomplete" {
+			report.Status = "error"
+		}
+		report.Error = err.Error()
 		if !writer.committed && r.Context().Err() == nil {
-			writeAPIErr(writer, errBody(502, "供应商未完成请求，请检查渠道配置后重试", "upstream_error"))
+			var apiErr *provider.APIError
+			if errors.As(err, &apiErr) {
+				writeAPIErr(writer, apiErr)
+			} else {
+				writeAPIErr(writer, errBody(502, "供应商未完成请求，请检查渠道配置后重试", "upstream_error"))
+			}
 		}
 	}
 	if !report.Recorded {
@@ -148,8 +157,12 @@ func (o *Orchestrator) runtimeModels(ctx context.Context) []map[string]any {
 			}
 			if m.Context > 0 {
 				item["context_window"] = m.Context
+				item["context_length"] = m.Context
 			}
 			for k, v := range m.Extra {
+				if k == "account_uids" {
+					continue
+				}
 				item[k] = v
 			}
 			out = append(out, item)

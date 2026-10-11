@@ -1,6 +1,13 @@
 package provider
 
-import "math"
+import (
+	"context"
+	"math"
+)
+
+type LocalAccountImporter interface {
+	ImportLocalAccounts(context.Context) (map[string]any, error)
+}
 
 // ResourceSummary is a credential-free management projection. Channels retain
 // their detailed rows and dispatch policies; actions describe this resource,
@@ -19,6 +26,7 @@ type ResourceSummary struct {
 // Missing values mean unknown. Balances belong to their own channel and must
 // not be added across upstreams with different billing rules.
 type ResourceQuota struct {
+	Unit          string   `json:"unit,omitempty"`
 	Remaining     *float64 `json:"remaining"`
 	Total         *float64 `json:"total"`
 	ExpiresAt     *float64 `json:"expires_at"`
@@ -113,5 +121,5 @@ func ResourceMetadata(row map[string]any, kind string, actions map[string]Resour
 		status = "unhealthy"
 	}
 	return ResourceSummary{ID: id, Kind: kind, Label: label, Source: str("source"), Region: region, Status: status, Actions: actions,
-		Quota: ResourceQuota{Remaining: resourceNumber(row["credits_remaining"]), Total: resourceNumber(row["credits_total"]), ExpiresAt: resourceNumber(row["credits_expire_at"]), Stale: row["quota_stale"] == true, RefreshFailed: row["quota_refresh_failed"] == true}}
+		Quota: ResourceQuota{Unit: str("quota_unit"), Remaining: resourceNumber(row["credits_remaining"]), Total: resourceNumber(row["credits_total"]), ExpiresAt: resourceNumber(row["credits_expire_at"]), Stale: row["quota_stale"] == true, RefreshFailed: row["quota_refresh_failed"] == true}}
 }

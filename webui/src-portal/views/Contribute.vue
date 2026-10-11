@@ -22,21 +22,30 @@ let retries = 0
 let timer: ReturnType<typeof setTimeout> | null = null
 let disposed = false
 const cancelling = ref(false)
+	const channel=ref('workbuddy')
+	const workbuddySite=ref<'cn' | 'intl' | 'intl-codebuddy'>('cn')
+	const product=ref('cn')
+	const taskChannel=ref('workbuddy')
+	const callbackURL=ref('')
+	const callbackBusy=ref(false)
+	function cancelTask(id:string){return taskChannel.value==='trae'?api.traeCancel(id):api.contributionCancel(id)}
+	async function completeCallback(){if(callbackBusy.value)return;callbackBusy.value=true;try{await api.traeComplete(taskId.value,callbackURL.value.trim());callbackURL.value='';toast.success('回调已提交')}catch(e:any){toast.error(e.message)}finally{callbackBusy.value=false}}
 
 async function load() {
   loading.value = true
   try { list.value = (await api.contributions()).contributions } catch (e: any) { toast.error(e?.message || '加载贡献失败') } finally { loading.value = false }
 }
 onMounted(() => { load() })
-onUnmounted(() => { disposed = true; stopPoll(); if (taskId.value) void api.contributionCancel(taskId.value).catch(() => {}) })
+onUnmounted(() => { disposed = true; stopPoll(); if (taskId.value) void cancelTask(taskId.value).catch(() => {}) })
 
 async function begin() {
   if (begining.value || taskId.value || cancelling.value) return
   begining.value = true
   pollStatus.value = ''
   try {
-    const res = await api.contributionBegin('workbuddy', accepted.value)
-    if (disposed) { void api.contributionCancel(res.task_id).catch(() => {}); return }
+    taskChannel.value=channel.value
+    const res = channel.value==='trae' ? await api.traeBegin(product.value,accepted.value) : await api.contributionBegin(workbuddySite.value, accepted.value)
+    if (disposed) { void cancelTask(res.task_id).catch(() => {}); return }
     authUrl.value = res.auth_url
     taskId.value = res.task_id
     expiresAt = res.expires_at * 1000
@@ -52,9 +61,9 @@ async function begin() {
 async function poll() {
   const id = taskId.value
   if (!id || disposed || cancelling.value) return
-  if (Date.now() >= expiresAt) { void api.contributionCancel(id).catch(() => {}); taskId.value = authUrl.value = ''; toast.error('登录会话已过期，请重新发起'); return }
+  if (Date.now() >= expiresAt) { void cancelTask(id).catch(() => {}); taskId.value = authUrl.value = ''; toast.error('登录会话已过期，请重新发起'); return }
   try {
-    const res = await api.contributionPoll(id)
+    const res = taskChannel.value==='trae' ? await api.traePoll(id) : await api.contributionPoll(id)
     if (disposed || id !== taskId.value || cancelling.value) return
     retries = 0
     pollError.value = ''
@@ -81,7 +90,7 @@ async function poll() {
       const delay = Math.max(Math.min(30000, 3000 * 2 ** Math.min(retries++, 3)), e.retryAfter * 1000)
       timer = setTimeout(poll, Math.min(delay, Math.max(0, expiresAt - Date.now())))
     } else {
-      void api.contributionCancel(id).catch(() => {})
+      void cancelTask(id).catch(() => {})
       toast.error(e?.message || '轮询失败')
       taskId.value = authUrl.value = ''
     }
@@ -93,7 +102,7 @@ async function cancelPoll() {
   if (cancelling.value || !taskId.value) return
   cancelling.value = true
   stopPoll()
-  try { await api.contributionCancel(taskId.value); taskId.value = authUrl.value = ''; pollStatus.value = '' }
+  try { await cancelTask(taskId.value); taskId.value = authUrl.value = ''; pollStatus.value = '' }
   catch (e: any) { toast.error(e?.message || '取消失败'); if (!disposed) timer = setTimeout(poll, 3000) }
   finally { cancelling.value = false }
 }
@@ -129,7 +138,12 @@ async function share(c: ContributionInfo) {
 <template>
   <div class="space-y-5">
     <div class="glass rounded-2xl p-6">
-      <h1 class="text-base font-semibold">我的 WorkBuddy 账号</h1>
+      <h1 class="text-base font-semibold">我的账号</h1>
+		<div class="mt-3 flex flex-wrap gap-2">
+        <select v-model="channel" aria-label="账号渠道" :disabled="!!taskId || begining" class="rounded-lg border border-line bg-bg p-2 text-small"><option value="workbuddy">WorkBuddy</option><option value="trae">Trae</option></select>
+        <select v-if="channel==='workbuddy'" v-model="workbuddySite" aria-label="登录站点" :disabled="!!taskId || begining" class="rounded-lg border border-line bg-bg p-2 text-small"><option value="cn">国内 CodeBuddy</option><option value="intl">国际 WorkBuddy</option><option value="intl-codebuddy">国际 CodeBuddy</option></select>
+        <select v-else v-model="product" aria-label="Trae 产品" :disabled="!!taskId || begining" class="rounded-lg border border-line bg-bg p-2 text-small"><option value="cn">国内 IDE</option><option value="solo">国内 Work/SOLO</option></select>
+      </div>
       <p class="mt-1 text-micro text-faint">
         扫码添加并共享账号后，你无需共享分组授权即可调用本人账号。其他用户只能通过获授权的共享池使用它，调用消耗该账号额度。
         你可以随时停止共享，账号会保留为仅本人使用。服务器会保存授权凭据；共享记录和凭据也会保留，用于本人调用及重新授权。
@@ -150,6 +164,7 @@ async function share(c: ContributionInfo) {
           <a :href="authUrl" target="_blank" rel="noopener" class="text-brand hover:underline">点此打开授权链接</a>。
           会话 10 分钟内有效。
         </p>
+		<div v-if="taskChannel==='trae'" class="mt-3 space-y-2"><p class="text-micro text-muted">若回调 localhost 页面无法连接，请将完整回调地址粘贴到此处，不要发送给他人。</p><textarea v-model="callbackURL" class="w-full rounded-lg border border-line bg-bg p-2 text-small" rows="2" placeholder="完整授权回调地址" /><WButton :loading="callbackBusy" :disabled="!callbackURL.trim()" @click="completeCallback">提交回调</WButton></div>
       </div>
     </div>
 

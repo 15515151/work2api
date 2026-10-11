@@ -13,7 +13,11 @@ const props = defineProps<{ model: Record<string, any>; provider: string; reserv
 const m = computed(() => props.model)
 const pm = computed(() => providerMeta(props.provider))
 const multimodal = computed(() => m.value.modality === 'multimodal' || m.value.vision || m.value.supports_image)
-const reasoning = computed(() => m.value.reasoning || {})
+const reasoning = computed(() => {
+  const value = m.value.reasoning
+  if (value && typeof value === 'object') return value
+  return { supportsReasoning: value === true || m.value.is_reasoning === true }
+})
 const ctx = computed(() => m.value.context_length ?? m.value.context)
 const maxOut = computed(() => m.value.max_output_tokens ?? m.value.max_output)
 const accounts = computed(() => (m.value.accounts || []) as any[])
@@ -39,6 +43,29 @@ const displayCredits = computed(() => {
   if (cbr && Object.keys(cbr).length) return Math.min(...Object.values(cbr))
   return m.value.credits
 })
+
+const finiteCost = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v) && v >= 0
+const costMetric = computed(() => {
+  if (props.provider === 'qoder') return {
+    value: finiteCost(m.value.price_factor) ? `×${m.value.price_factor}` : '—',
+    label: '相对成本倍率',
+    title: '上游模型目录的相对倍率，不是货币单价；缺失时不推断为免费。',
+  }
+  if (props.provider === 'opencode') return {
+    value: finiteCost(m.value.input_cost) && finiteCost(m.value.output_cost) ? `$${m.value.input_cost} / $${m.value.output_cost}` : '—',
+    label: '输入 / 输出价格',
+    title: 'models.dev 的 Zen 参考价，单位为美元/百万 tokens；Go 订阅与实际账单以渠道为准。',
+  }
+  if (props.provider === 'trae') return {
+    value: '待确认', label: '积分消耗',
+    title: '未取得可验证的实际计费速度；上游权益消耗值不是已确认的成本倍率。账号权益、活动及时段可能影响计费。',
+  }
+  return { value: displayCredits.value ?? '—', label: '成本系数', title: '上游目录成本系数；活动或时段优惠以实际扣费为准。' }
+})
+const nativeProtocol = computed(() => ({
+  chat: 'Chat', messages: 'Messages', responses: 'Responses',
+  openai: 'Chat', anthropic: 'Messages', systemone: 'SystemOne',
+} as Record<string, string>)[String(m.value.native_protocol || '').toLowerCase()])
 
 // 思考档位（对齐上游 Models.vue reasoningEfforts）：优先用 supportedEfforts，
 // 否则退回单个 defaultEffort；可关思考则补一个 off。
@@ -125,11 +152,15 @@ const pricingNotes = computed(() => {
     </div>
 
     <div class="flex min-h-[1.625rem] flex-wrap gap-1.5">
-      <WTag :tone="multimodal ? 'route' : 'muted'">{{ multimodal ? '多模态' : '文本' }}</WTag>
+      <WTag :tone="multimodal ? 'route' : 'muted'">{{ multimodal ? '多模态' : m.vision_verified === false ? '图片能力待确认' : '文本' }}</WTag>
       <WTag v-if="reasoningTag" :tone="reasoningTag.tone">{{ reasoningTag.text }}</WTag>
-      <WTag v-if="m.supportsToolCall" tone="live">工具调用</WTag>
+      <WTag v-if="m.supportsToolCall === true || m.tool_call === true" tone="live">工具调用</WTag>
+      <WTag v-if="m.tool_response_multimodal === true" tone="route" title="上游目录声明支持包含图片的工具结果">工具结果图片</WTag>
+      <WTag v-if="m.structured_output === true" tone="live" title="上游目录声明结构化输出能力；具体请求参数仍按原生协议处理">结构化输出</WTag>
+      <WTag v-if="nativeProtocol && !systemOne" tone="muted" title="网关使用的上游原生协议，不限制网关对外的协议转换">原生 {{ nativeProtocol }}</WTag>
       <WTag v-if="m.catalog_source === 'fallback'" tone="warn" title="尚未获取当前账号的可用模型目录，仅列出保守候选；实际权限以上游为准">目录待验证</WTag>
       <WTag v-else-if="m.catalog_stale" tone="warn" title="目录刷新失败，暂时保留当前账号上次成功获取的结果">目录缓存过期</WTag>
+      <WTag v-if="m.pricing_stale" tone="warn" title="参考价格缓存已过期，实际计费以上游账单为准">价格缓存过期</WTag>
       <WTag v-if="systemOne" tone="warn" title="仅 SystemOne 决策协议，不能用普通聊天/消息/Responses 接口调用">SystemOne</WTag>
     </div>
 
@@ -174,10 +205,18 @@ const pricingNotes = computed(() => {
         <div class="text-micro text-faint">最大输出</div>
       </div>
       <div>
-        <div class="mono text-small font-semibold" :class="displayCredits ? 'text-warn' : 'text-ink'">{{ displayCredits ?? '—' }}</div>
-        <div class="text-micro text-faint">成本系数</div>
+        <div class="mono break-words text-small font-semibold text-ink" :title="costMetric.title">{{ costMetric.value }}</div>
+        <div class="text-micro text-faint" :title="costMetric.title">{{ costMetric.label }}</div>
       </div>
     </div>
+
+    <div v-if="provider === 'opencode' && (finiteCost(m.input_cost) || finiteCost(m.output_cost))" class="text-micro leading-relaxed text-faint">Zen 参考价 · USD / 百万 tokens<span v-if="m.tier === 'go'">；Go 订阅额度另计</span></div>
+    <div v-if="provider === 'opencode' && (finiteCost(m.cache_read_cost) || finiteCost(m.cache_write_cost))" class="flex flex-wrap gap-x-3 gap-y-1 text-micro text-faint">
+      <span v-if="finiteCost(m.cache_read_cost)">缓存读取 ${{ m.cache_read_cost }}</span>
+      <span v-if="finiteCost(m.cache_write_cost)">缓存写入 ${{ m.cache_write_cost }}</span>
+      <span>USD / 百万 tokens</span>
+    </div>
+    <div v-if="m.max_input_tokens > 0" class="text-micro text-faint">最大输入 <span class="mono">{{ int(m.max_input_tokens) }}</span> tokens</div>
 
     <!-- 多站点成本分列：标出更便宜的站点（成本优先会用它）。同价/单站点则不显示。 -->
     <div v-if="costEntries" class="flex min-h-[1.25rem] flex-wrap items-center gap-x-3 gap-y-0.5 text-micro">

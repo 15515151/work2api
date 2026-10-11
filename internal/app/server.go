@@ -339,13 +339,38 @@ func (s *Server) adminOriginAllowed(r *http.Request, requireBrowserSignal bool) 
 	if origin := r.Header.Get("Origin"); origin != "" {
 		u, err := url.Parse(origin)
 		scheme := "http"
-		if r.TLS != nil || s.o.cfg.AdminCookieSecure {
+		if s.browserCookieSecure(r) {
 			scheme = "https"
 		}
 		return err == nil && u.Scheme == scheme && strings.EqualFold(u.Host, r.Host) && u.User == nil && u.Path == "" && u.RawQuery == "" && u.Fragment == ""
 	}
 	safe := r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodOptions
 	return !requireBrowserSignal || safe || site == "same-origin"
+}
+
+// HTTPS stays secure. Automatic deployment mode permits HTTP only when both
+// the actual peer and the requested host are loopback, including SSH tunnels.
+// Forwarded headers never establish this exception.
+func (s *Server) browserCookieSecure(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	if s.o.cfg.AdminCookieSecureAuto {
+		host := r.Host
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h
+		}
+		host = strings.TrimPrefix(strings.TrimSuffix(host, "]"), "[")
+		peer := r.RemoteAddr
+		if h, _, err := net.SplitHostPort(peer); err == nil {
+			peer = h
+		}
+		ip := net.ParseIP(peer)
+		if host != "" && isLoopbackHost(strings.ToLower(host)) && ip != nil && ip.IsLoopback() {
+			return false
+		}
+	}
+	return s.o.cfg.AdminCookieSecure
 }
 
 // hostGuard blocks DNS-rebinding: only loopback/allowed hosts unless
@@ -359,7 +384,7 @@ func (s *Server) hostGuard(next http.Handler) http.Handler {
 			}
 			if !isLoopbackHost(host) {
 				writeJSON(w, http.StatusForbidden, map[string]any{"error": map[string]any{
-					"message": "Host 不被允许（防 DNS rebinding）。局域网/公网访问请设置 ALLOW_EXTERNAL_HOST=1",
+					"message": "Host 不被允许（防 DNS rebinding）。公网 HTTPS 部署请设置 ADMIN_TOKEN；若已设置，请检查是否显式关闭了 ALLOW_EXTERNAL_HOST",
 					"type":    "forbidden"}})
 				return
 			}
@@ -447,7 +472,7 @@ func (s *Server) modelCatalog(ctx context.Context) []map[string]any {
 			if _, dup := byID[alias]; dup {
 				continue
 			}
-			if src, ok := byID[real]; ok {
+			if src, ok := byID[strings.TrimPrefix(real, "workbuddy/")]; ok {
 				item := map[string]any{}
 				for k, v := range src {
 					item[k] = v

@@ -114,7 +114,7 @@ func TestNonDNSFailuresRemainPenalized(t *testing.T) {
 }
 
 func TestMergedMetadataRetainsTierLimitsAndNativeAuthority(t *testing.T) {
-	models, err := decodeModelsDev([]byte(`{"opencode":{"models":{"same":{"cost":{"input":1,"output":2},"limit":{"context":100,"output":20}},"zen-only":{"cost":{"input":0,"output":0}}}},"opencode-go":{"id":"opencode-go","models":{"same":{"cost":{"input":0,"output":0},"limit":{"context":200,"input":160,"output":40}},"go-only":{"cost":{"input":0,"output":0},"limit":{"output":30}}}}}`))
+	models, err := decodeModelsDev([]byte(`{"opencode":{"models":{"same":{"cost":{"input":1,"output":2,"cache_read":0,"cache_write":1.25},"limit":{"context":100,"output":20}},"zen-only":{"cost":{"input":0,"output":0}}}},"opencode-go":{"id":"opencode-go","models":{"same":{"cost":{"input":0,"output":0},"limit":{"context":200,"input":160,"output":40}},"go-only":{"cost":{"input":0,"output":0},"limit":{"output":30}}}}}`))
 	if err != nil || len(models) != 3 {
 		t.Fatal(models, err)
 	}
@@ -130,6 +130,9 @@ func TestMergedMetadataRetainsTierLimitsAndNativeAuthority(t *testing.T) {
 		t.Fatal(zen, goMD)
 	}
 	price, _ := store.Price("same")
+	if price.CacheRead == nil || *price.CacheRead != 0 || price.CacheWrite == nil || *price.CacheWrite != 1.25 || models["zen-only"].CacheRead != nil {
+		t.Fatal("cache pricing must retain actual zero and missing values separately")
+	}
 	price.Limits[TierGo] = ModelLimits{}
 	if c.MetadataForTier("same", TierGo).MaxOutput != 40 {
 		t.Fatal("metadata map aliases store")

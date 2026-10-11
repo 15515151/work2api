@@ -158,7 +158,7 @@ const filtered = computed(() =>
 
 function kindLabel(r: Record<string, any>) { return r.resource?.kind === 'anonymous' ? '匿名入口' : r.resource?.kind === 'key_tier' ? '密钥层级' : r.resource?.source === 'local' ? '桌面账号' : '账号' }
 function expiryOf(r: Record<string, any>) {
-  const dates = pkgsOf(r).filter(p => p.remain > 0 && p.expire_at).map(p => p.expire_at!)
+  const dates = pkgsOf(r).filter(p => p.remain != null && p.remain > 0 && p.expire_at).map(p => p.expire_at!)
   if (r.raw.credits_expire_at > 0) dates.push(r.raw.credits_expire_at)
   return dates.length ? Math.min(...dates) : undefined
 }
@@ -202,13 +202,14 @@ function statusTextClass(r: any): string {
 }
 
 // ---------- 积分构成悬浮层（对标官方控制台"积分明细"口径） ----------
-// workbuddy 账号的 credit_packages 逐资源包展示：名称/剩余/已用/总量/到期。
+// 渠道返回的 credit_packages 逐资源包展示；未知与无限额度不伪装成零。
 // 弹层 Teleport 到 body——表格容器 overflow-x-auto 会裁剪行内绝对定位。
 interface Pkg {
   name: string
-  remain: number
-  used: number
-  total: number
+  remain: number | null
+  used: number | null
+  total: number | null
+  unlimited?: boolean
   expire_at?: number | null
   reset_time?: string
 }
@@ -239,19 +240,19 @@ function cancelClose() {
 
 // 包剩余百分比（总量未知时不给条）
 function pkgPct(p: Pkg): number | null {
-  if (!p.total || p.total <= 0) return null
+  if (!p.total || p.total <= 0 || p.remain == null) return null
   return Math.max(0, Math.min(100, (p.remain / p.total) * 100))
 }
 
 // 有余额且 7 天内到期的包：临期（与选号"临期优先烧"同窗口语义）
 function pkgExpiring(p: Pkg): boolean {
-  if (!p.expire_at || p.remain <= 0) return false
+  if (!p.expire_at || p.remain == null || p.remain <= 0) return false
   return p.expire_at * 1000 - Date.now() < 7 * 86400_000
 }
 
 function openPkgs(r: any, e: MouseEvent | FocusEvent) {
   if (!pkgsOf(r).length) return
-  cancelClose()
+  dismissPopovers()
   pkgAnchor.value = e.currentTarget as HTMLElement
   pkgOpenFor.value = pkgKey(r)
   nextTick(positionPkgs)
@@ -270,12 +271,34 @@ function positionPkgs() {
 }
 
 function closePkgs() {
-  cancelClose()
-  closeTimer = setTimeout(() => {
-    pkgOpenFor.value = null
-    pkgAnchor.value = null
-  }, 150)
+  if (!pkgOpenFor.value) return
+  scheduleClose()
 }
+
+function dismissPopovers() {
+  cancelClose()
+  pkgOpenFor.value = calOpenFor.value = null
+  pkgAnchor.value = calAnchor.value = null
+}
+
+function scheduleClose() {
+  cancelClose()
+  closeTimer = setTimeout(dismissPopovers, 150)
+}
+
+function dismissOutside(e: Event) {
+  const target = e.target as Node | null
+  if (!target || (!pkgOpenFor.value && !calOpenFor.value)) return
+  const panels: HTMLElement[] = Array.isArray(panelEl.value) ? panelEl.value : [panelEl.value]
+  if (pkgAnchor.value?.contains(target) || calAnchor.value?.contains(target) || panels.some(p => p?.contains(target))) return
+  dismissPopovers()
+}
+
+function dismissOnEscape(e: KeyboardEvent) {
+  if (e.key === 'Escape') dismissPopovers()
+}
+
+watch([providerFilter, search, statusFilter], dismissPopovers)
 
 // ---------- 签到日历 ----------
 // 悬停/点击「今日签到」列弹出 35 天打卡点阵。数据源 /admin/checkin/history，
@@ -323,7 +346,7 @@ async function fetchCalendar() {
 }
 
 function openCalendar(r: any, e: MouseEvent | FocusEvent) {
-  cancelClose()
+  dismissPopovers()
   calAnchor.value = e.currentTarget as HTMLElement
   calOpenFor.value = pkgKey(r)
   void loadCalendar()
@@ -342,11 +365,8 @@ function positionCal() {
 }
 
 function closeCalendar() {
-  cancelClose()
-  closeTimer = setTimeout(() => {
-    calOpenFor.value = null
-    calAnchor.value = null
-  }, 150)
+  if (!calOpenFor.value) return
+  scheduleClose()
 }
 
 // 35 天点阵的格子状态：''（无记录）/ ok（已签）/ future
@@ -446,6 +466,33 @@ const addMethod = ref<'upload' | 'oauth' | 'token'>('oauth')
 const oauthOptions = ref<OAuthOption[]>([])
 const oauthChoice = ref<Record<string, string>>({})
 const oauthUrl = ref('')
+const oauthLoginID = ref('')
+const oauthManual = ref(false)
+const oauthCallback = ref('')
+const callbackBusy = ref(false)
+const localImportBusy = ref(false)
+async function importLocal() {
+  if (localImportBusy.value) return
+  localImportBusy.value = true
+  try {
+    const res = await api.providerImportLocal(addProvider.value)
+    if (!res.results.length) { toast.info('服务所在电脑未检测到 Trae 登录态'); return }
+    const errors = res.results.filter(r => r.status !== 'ok')
+    toast.info(errors.length ? errors.map(r => r.message || '导入失败').join('；') : '本机账号已导入，持续刷新建议网页登录')
+    await load()
+  } catch (e: any) {
+    toast.error(e?.response?.data?.error?.message || '本机导入失败')
+  } finally {
+    localImportBusy.value = false
+  }
+}
+	async function submitOAuthCallback() {
+		if (callbackBusy.value || !oauthCallback.value.trim() || !oauthLoginID.value) return
+		callbackBusy.value=true
+		try {await api.providerOAuthComplete(addProvider.value,oauthLoginID.value,oauthCallback.value.trim());oauthCallback.value='';toast.success('回调已提交，正在验证账号')}
+		catch(e:any){toast.error(e?.response?.data?.error?.message || '回调提交失败')}
+		finally{callbackBusy.value=false}
+	}
 const oauthPolling = ref(false)
 const uploadEl = ref<HTMLInputElement | null>(null)
 let pollTimer: ReturnType<typeof setTimeout> | null = null
@@ -506,6 +553,9 @@ async function beginOAuth() {
     const res = await api.providerOAuthBegin(provider, { ...oauthChoice.value }, controller.signal)
     if (generation !== pollGeneration) return
     oauthUrl.value = res.login_url
+		oauthLoginID.value=res.login_id
+		oauthManual.value=!!res.manual_callback
+		oauthCallback.value=''
     if (res.expires_at) deadline = Math.min(deadline, res.expires_at * 1000)
     poll = () => api.providerOAuthPoll(provider, res.login_id, controller.signal)
     window.open(oauthUrl.value, '_blank', 'noopener,noreferrer')
@@ -557,7 +607,7 @@ async function onUpload(e: Event) {
 
 const patToken = ref('')
 const patSaving = ref(false)
-watch(addOpen, (open) => { if (!open) { patToken.value = ''; oauthMessage.value = ''; stopPoll() } })
+watch(addOpen, (open) => { if (!open) { patToken.value = ''; oauthCallback.value = ''; oauthMessage.value = ''; stopPoll() } })
 async function onAddByToken() {
   const token = patToken.value.trim()
   if (!token || patSaving.value) return
@@ -572,18 +622,27 @@ async function onAddByToken() {
     addOpen.value = false
     await load()
   } catch (err: any) {
-    if (generation === pollGeneration) oauthMessage.value = err?.response?.data?.error?.message || '添加失败，请检查 PAT 后重试'
+    if (generation === pollGeneration) oauthMessage.value = err?.response?.data?.error?.message || '添加失败，请检查凭据后重试'
   } finally {
     patSaving.value = false
   }
 }
 
-function refreshVisibleCalendar() { if (document.visibilityState === 'visible') void loadCalendar() }
+function refreshVisibleCalendar() {
+  if (document.visibilityState === 'visible') void loadCalendar()
+  else dismissPopovers()
+}
 onMounted(() => {
   void load()
   void loadCalendar()
   calendarTimer = setInterval(refreshVisibleCalendar, 60000)
   document.addEventListener('visibilitychange', refreshVisibleCalendar)
+  document.addEventListener('pointerdown', dismissOutside, true)
+  document.addEventListener('focusin', dismissOutside, true)
+  document.addEventListener('keydown', dismissOnEscape)
+  window.addEventListener('blur', dismissPopovers)
+  window.addEventListener('resize', dismissPopovers)
+  window.addEventListener('scroll', dismissPopovers, true)
 })
 // 组件卸载时停掉可能残留的扫码轮询/悬浮层关闭定时器，避免离开页面后仍在轮询
 onUnmounted(() => {
@@ -592,6 +651,12 @@ onUnmounted(() => {
   cancelClose()
   if (calendarTimer) clearInterval(calendarTimer)
   document.removeEventListener('visibilitychange', refreshVisibleCalendar)
+  document.removeEventListener('pointerdown', dismissOutside, true)
+  document.removeEventListener('focusin', dismissOutside, true)
+  document.removeEventListener('keydown', dismissOnEscape)
+  window.removeEventListener('blur', dismissPopovers)
+  window.removeEventListener('resize', dismissPopovers)
+  window.removeEventListener('scroll', dismissPopovers, true)
 })
 
 // ---------- 配置型供应商（opencode 密钥层级） ----------
@@ -700,6 +765,7 @@ async function saveConfig() {
           <template #cell-account="{ row }">
             <div class="w-44">
               <div class="truncate font-medium text-ink" :title="label(row)">{{ label(row) }}</div>
+              <div v-if="row.provider === 'trae'" class="mt-1 whitespace-nowrap text-micro text-faint">{{ (row.raw.products || [row.raw.product]).map((p: string) => p === 'solo' ? 'Work/SOLO' : 'IDE').join(' / ') }}</div>
               <div class="mt-1 flex items-center gap-2 whitespace-nowrap text-micro text-faint"><span class="mono truncate" :title="row.id">{{ row.id.length > 14 ? row.id.slice(0, 12) + '…' : row.id }}</span><span v-if="row.raw.source" class="shrink-0">{{ ({local:'桌面',project:'导入',native:'网关'} as Record<string,string>)[row.raw.source] || row.raw.source }}</span></div>
             </div>
           </template>
@@ -712,6 +778,7 @@ async function saveConfig() {
               <span class="text-small" :class="statusTextClass(row)">{{ statusOf(row).text }}</span>
             </span>
             <div v-if="row.raw.failure_count" class="text-micro text-faint">失败 {{ row.raw.failure_count }} 次</div>
+            <div v-if="row.raw.catalog_stale" class="text-micro text-warn" title="使用上次成功发现的模型目录；刷新成功后自动更新">模型目录待刷新</div>
           </template>
           <template #cell-credits="{ row }">
             <template v-if="row.raw.credits_remaining != null">
@@ -802,10 +869,11 @@ async function saveConfig() {
       <WSelect v-model="addProvider" :options="addProviderOptions" :disabled="patSaving" class="mb-4" @update:model-value="onAddProviderChange" />
 
       <!-- 方式切换（供应商支持多种添加方式时展示） -->
+		<div v-if="caps(addProvider).includes('local_import')" class="mb-4 space-y-2"><WButton :loading="localImportBusy" @click="importLocal">导入服务所在电脑的 Trae 登录态</WButton><p class="text-micro text-faint">只读取桌面凭据并验证副本，不修改桌面客户端。远程服务器无法读取你电脑上的登录态。</p></div>
       <div v-if="[caps(addProvider).includes('oauth'), caps(addProvider).includes('upload'), caps(addProvider).includes('add_account')].filter(Boolean).length > 1" class="mb-4 flex gap-2">
         <WButton v-if="caps(addProvider).includes('oauth')" size="sm" :disabled="patSaving" :variant="addMethod === 'oauth' ? 'primary' : 'subtle'" @click="addMethod = 'oauth'">扫码登录</WButton>
         <WButton v-if="caps(addProvider).includes('upload')" size="sm" :disabled="patSaving" :variant="addMethod === 'upload' ? 'primary' : 'subtle'" @click="addMethod = 'upload'">上传凭据</WButton>
-        <WButton v-if="caps(addProvider).includes('add_account')" size="sm" :disabled="patSaving" :variant="addMethod === 'token' ? 'primary' : 'subtle'" @click="addMethod = 'token'">PAT 添加</WButton>
+        <WButton v-if="caps(addProvider).includes('add_account')" size="sm" :disabled="patSaving" :variant="addMethod === 'token' ? 'primary' : 'subtle'" @click="addMethod = 'token'">{{ addProvider === 'trae' ? 'JSON 导入' : 'PAT 添加' }}</WButton>
       </div>
 
       <!-- 扫码登录 -->
@@ -818,6 +886,11 @@ async function saveConfig() {
           已在新标签打开授权页，请完成登录后等待自动确认。
           <a :href="oauthUrl" target="_blank" class="ml-1 text-route hover:underline">重新打开</a>
         </div>
+		<div v-if="oauthManual && oauthPolling" class="mt-3 space-y-2">
+			<p class="text-small text-muted">远程部署时回调会打开你电脑的 localhost 页面。若无法连接，请将该页面完整地址粘贴到这里；不要发送给他人。</p>
+			<WTextarea v-model="oauthCallback" :rows="2" placeholder="完整授权回调地址" />
+			<WButton :loading="callbackBusy" :disabled="!oauthCallback.trim()" @click="submitOAuthCallback">提交回调</WButton>
+		</div>
       </template>
 
       <!-- 上传凭据 -->
@@ -838,9 +911,9 @@ async function saveConfig() {
           <label class="mb-1.5 block text-small text-muted">{{ o.label }}</label>
           <WSelect v-model="oauthChoice[o.key]" :options="o.values" :disabled="patSaving" />
         </div>
-        <label class="mb-1.5 block text-small text-muted">Personal Access Token</label>
-        <WTextarea v-model="patToken" :rows="3" placeholder="在 Qoder 控制台生成的 PAT" />
-        <p class="mt-2 text-micro text-faint">PAT 会先向上游验证再落库，验证失败不保存。</p>
+        <label class="mb-1.5 block text-small text-muted">{{ addProvider === 'trae' ? 'Trae JSON 凭据' : 'Personal Access Token' }}</label>
+        <WTextarea v-model="patToken" :rows="3" :placeholder="addProvider === 'trae' ? '粘贴导出的 JSON 凭据' : '在 Qoder 控制台生成的 PAT'" />
+        <p class="mt-2 text-micro text-faint">凭据会先向上游验证再保存，验证失败不保存。</p>
       </template>
 
       <p v-if="oauthMessage" class="mt-3 text-small text-muted">{{ oauthMessage }}</p>
@@ -918,7 +991,7 @@ async function saveConfig() {
                 {{ Math.round(pkgPct(p)!) }}%
               </span>
             </div>
-            <div class="mt-1.5 h-1.5 overflow-hidden rounded-full bg-line/60">
+            <div v-if="pkgPct(p) != null" class="mt-1.5 h-1.5 overflow-hidden rounded-full bg-line/60">
               <div
                 v-if="pkgPct(p) != null"
                 class="h-full rounded-full"
@@ -928,8 +1001,8 @@ async function saveConfig() {
             </div>
             <!-- flex-wrap：一行放不下时整段折到下一行，数字串自身不折断 -->
             <div class="mt-1.5 flex flex-wrap items-baseline gap-x-3 gap-y-0.5 text-micro text-faint">
-              <span class="mono whitespace-nowrap">剩 {{ fmtCredits(p.remain) }} / {{ fmtCredits(p.total) }}</span>
-              <span class="mono whitespace-nowrap">已用 {{ fmtCredits(p.used) }}</span>
+              <span class="mono whitespace-nowrap">{{ p.unlimited ? '上游额度不限' : '剩 ' + (p.remain == null ? '未知' : fmtCredits(p.remain)) + ' / ' + (p.total == null ? '未知' : fmtCredits(p.total)) }}</span>
+              <span class="mono whitespace-nowrap">已用 {{ p.used == null ? '未知' : fmtCredits(p.used) }}</span>
               <!-- 临期包：过期时间精确到分钟并标黄，一眼看出紧迫度 -->
               <span v-if="p.expire_at" class="ml-auto mono whitespace-nowrap" :class="pkgExpiring(p) ? 'text-warn' : ''">
                 到期：{{ dt(p.expire_at, 'YYYY-MM-DD HH:mm') }}

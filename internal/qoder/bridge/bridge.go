@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"sort"
 	"strings"
@@ -99,11 +100,11 @@ type QoderModel struct {
 	// IsVL 上游 vision-language 标记（model/list 条目的 is_vl 字段）：
 	// true 表示该模型接受图片输入（多模态）。Go 版此前漏读该字段导致
 	// 整个 qoder 目录被标成纯文本。
-	IsVL            bool    `json:"is_vl,omitempty"`
-	ContextWindow   int     `json:"context_window,omitempty"`
-	MaxOutputTokens int     `json:"max_output_tokens,omitempty"`
-	MaxInputTokens  int     `json:"max_input_tokens,omitempty"`
-	PriceFactor     float64 `json:"price_factor,omitempty"`
+	IsVL            bool     `json:"is_vl,omitempty"`
+	ContextWindow   int      `json:"context_window,omitempty"`
+	MaxOutputTokens int      `json:"max_output_tokens,omitempty"`
+	MaxInputTokens  int      `json:"max_input_tokens,omitempty"`
+	PriceFactor     *float64 `json:"price_factor,omitempty"`
 }
 
 // tokenPrefix 安全截取 token 前 n 字节用于日志展示（不足 n 返回全串）。
@@ -283,7 +284,9 @@ func extractModels(rawList []interface{}) []QoderModel {
 			IsReasoning:    func() bool { v, _ := m["is_reasoning"].(bool); return v }(),
 			IsVL:           func() bool { v, _ := m["is_vl"].(bool); return v }(),
 			MaxInputTokens: int(cosy.FloatVal(m, "max_input_tokens")),
-			PriceFactor:    cosy.FloatVal(m, "price_factor"),
+		}
+		if value, ok := m["price_factor"].(float64); ok && value >= 0 && !math.IsNaN(value) && !math.IsInf(value, 0) {
+			model.PriceFactor = &value
 		}
 		if cc, ok := m["context_config"].(map[string]interface{}); ok {
 			var defaultCfg map[string]interface{}

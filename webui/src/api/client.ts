@@ -193,6 +193,7 @@ export const api = {
   providerImportAccount: (name: string, token: string, opts: Record<string, unknown>) =>
     http.post<unknown, { ok: boolean; account: Record<string, unknown> }>(
       `/admin/providers/${encodeURIComponent(name)}/accounts/import`, { token, ...opts }),
+	providerImportLocal: (name:string) => http.post<unknown,{results:{status:string;message?:string}[]}>(`/admin/providers/${encodeURIComponent(name)}/accounts/import-local`,{}),
 
   // ---------- 供应商扫码登录（OAuth）：options / begin / poll ----------
   // 登录可选项（如 qoder 的区域 cn / global），驱动弹窗里的选择项
@@ -200,7 +201,8 @@ export const api = {
     http.get<unknown, { options: OAuthOption[] }>(`/admin/providers/${encodeURIComponent(name)}/oauth/options`),
   // 发起扫码登录：返回 login_id 与可在浏览器打开的授权链接
   providerOAuthBegin: (name: string, opts: Record<string, unknown>, signal?: AbortSignal) =>
-    http.post<unknown, { login_id: string; login_url: string; expires_at?: number }>(`/admin/providers/${encodeURIComponent(name)}/oauth/begin`, opts, { signal }),
+    http.post<unknown, { login_id: string; login_url: string; expires_at?: number; manual_callback?: boolean }>(`/admin/providers/${encodeURIComponent(name)}/oauth/begin`, opts, { signal }),
+	providerOAuthComplete: (name:string,loginId:string,callbackURL:string) => http.post(`/admin/providers/${encodeURIComponent(name)}/oauth/complete`,{login_id:loginId,callback_url:callbackURL}),
   // 轮询登录状态：pending 等待授权，ready 成功（含 account），error 失败（含 message）
   providerOAuthPoll: (name: string, loginId: string, signal?: AbortSignal) =>
     http.post<unknown, { status: 'pending' | 'ready' | 'error' | 'expired'; message?: string; account?: Record<string, unknown> }>(

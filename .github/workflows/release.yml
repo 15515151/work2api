@@ -188,7 +188,7 @@ jobs:
           labels: |
             org.opencontainers.image.revision=${{ needs.prepare.outputs.source_sha }}
             org.opencontainers.image.title=work2api
-            org.opencontainers.image.description=统一 Go 网关：WorkBuddy/CodeBuddy、Qoder、OpenCode 三协议兼容 API
+            org.opencontainers.image.description=统一 Go 网关：WorkBuddy/CodeBuddy、Qoder、OpenCode、Trae 三协议兼容 API
       - name: Build and push image
         uses: docker/build-push-action@v6
         with:

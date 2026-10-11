@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,7 +27,109 @@ import (
 	"work2api/internal/statebackup"
 	"work2api/internal/store"
 	"work2api/internal/streamwatch"
+	"work2api/internal/trae"
 )
+
+func TestTraeOAuthCallbackBindsProductOwnerAndTask(t *testing.T) {
+	s, u := portalFixture(t)
+	rt, err := trae.New(t.TempDir(), s.o.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Close()
+	login, err := rt.BeginOwnedLogin(map[string]any{"product": "cn"}, u.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := login["login_id"].(string)
+	callback, _ := url.Parse(login["callback_url"].(string))
+	if callback.Path != "/authorize" {
+		t.Fatal("callback path violates the native authorization page contract")
+	}
+	callback.RawQuery = url.Values{"authCode": {"test-only-code"}}.Encode()
+	if rt.CompleteOwnedLogin(id, callback.String(), u.ID) == nil {
+		t.Fatal("callback without task nonce accepted")
+	}
+	q := url.Values{"loginTraceID": {id}, "auth_code_info": {`{"auth_code":"test-only-code"}`}}
+	callback.RawQuery = q.Encode()
+	if rt.OAuthComplete(id, callback.String()) == nil {
+		t.Fatal("admin accepted another owner's login")
+	}
+	if rt.CompleteOwnedLogin(id, callback.String(), u.ID+1) == nil {
+		t.Fatal("other user accepted login")
+	}
+	q.Set("state", "wrong-task")
+	callback.RawQuery = q.Encode()
+	if rt.CompleteOwnedLogin(id, callback.String(), u.ID) == nil {
+		t.Fatal("conflicting state accepted")
+	}
+	q.Del("state")
+	callback.RawQuery = q.Encode()
+	if err = rt.CompleteOwnedLogin(id, callback.String(), u.ID); err != nil {
+		t.Fatal("native alias callback rejected", err)
+	}
+	callback.Host = "attacker.invalid"
+	if rt.CompleteOwnedLogin(id, callback.String(), u.ID) == nil {
+		t.Fatal("different callback origin accepted")
+	}
+	if err = rt.CancelOwnedLogin(id, u.ID); err != nil {
+		t.Fatal(err)
+	}
+	if rt.CompleteOwnedLogin(id, callback.String(), u.ID) == nil {
+		t.Fatal("cancelled login accepted")
+	}
+}
+
+func TestTraeSharingRemainsProviderBound(t *testing.T) {
+	s, u := portalFixture(t)
+	other, err := portalauth.CreateUser(s.o.db, "wb-contributor", "testpassword", "user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range []struct {
+		id, provider string
+		owner        int64
+	}{{"trae-test", "trae", u.ID}, {"wb-test", "workbuddy", other}, {"wb-platform", "workbuddy", 0}} {
+		if _, err := s.o.db.UpsertProviderAccount(store.ProviderAccount{UID: entry.id, Provider: entry.provider, Auth: map[string]any{}}); err != nil {
+			t.Fatal(err)
+		}
+		if entry.owner > 0 {
+			if _, err := s.o.db.CreateContribution(entry.owner, entry.id, entry.provider, "domestic", "active"); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	g, err := s.o.db.CreateResourceGroup("Trae pool", "trae", `["trae/test"]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = s.o.db.SetGroupEnabled(g, true); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.o.db.SetDefaultPortalGroup(g, true); err != nil {
+		t.Fatal(err)
+	}
+	users, err := s.o.db.GroupUserIDs(g)
+	if err != nil || len(users) != 1 || users[0] != u.ID {
+		t.Fatal("automatic grant crossed providers", users, err)
+	}
+	if err = s.o.db.SetPlatformAccountSharing("wb-platform", "shared", []int64{g}); err == nil {
+		t.Fatal("cross-provider platform sharing accepted")
+	}
+	if err = s.o.db.AddGroupAccount(g, "wb-test"); err != nil {
+		t.Fatal(err)
+	}
+	accounts, err := s.o.db.GroupAccountUIDsWithActiveContribution(g)
+	if err != nil || len(accounts) != 1 || accounts[0] != "trae-test" {
+		t.Fatal("corrupt cross-provider membership became eligible", accounts, err)
+	}
+	for _, models := range [][]string{{"workbuddy/test"}, {"test"}} {
+		p := &Principal{AllowedModels: models}
+		if !modelAllowed(p, "workbuddy/test", "test") || !modelAllowed(p, "test", "test") || modelAllowed(p, "trae/test", "trae/test") {
+			t.Fatal("WorkBuddy prefix changed key authorization", models)
+		}
+	}
+}
 
 func TestCallMetricsKeepAttemptsAndStreamErrorsSeparate(t *testing.T) {
 	s, _ := portalFixture(t)

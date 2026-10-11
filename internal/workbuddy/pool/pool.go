@@ -6,10 +6,10 @@ package pool
 
 import (
 	"math"
-	"math/rand"
 	"strings"
 	"sync"
 	"time"
+	"work2api/internal/core/provider"
 
 	"work2api/internal/workbuddy/siterouting"
 )
@@ -178,70 +178,23 @@ func (p *Pool) Pick(allowed map[string]bool, costByUID map[string]float64, expir
 		}
 		return best
 	}
-	// 成本绝对优先：先把候选收敛到最低成本组（未知成本垫底），到期紧迫只在组内起作用。
-	if costByUID != nil {
-		candidates = cheapestGroup(candidates, costByUID)
-	}
-	// Paid models reserve international credits when the cheapest known group
-	// contains domestic accounts. Free/unknown pricing keeps existing routing.
-	var domestic []*Account
+	choices := make([]provider.Candidate, 0, len(candidates))
 	for _, a := range candidates {
-		if cost, known := costByUID[a.UID]; known && cost > 0 && !math.IsNaN(cost) && !math.IsInf(cost, 0) && (a.Profile == "cn-cli" || a.Profile == "cn-work") {
-			domestic = append(domestic, a)
+		var cost *float64
+		if value, ok := costByUID[a.UID]; ok {
+			v := value
+			cost = &v
 		}
+		choices = append(choices, provider.Candidate{ID: a.UID, Domestic: a.Profile == "cn-cli" || a.Profile == "cn-work", International: a.Profile == "intl-cli" || a.Profile == "intl-work", Cost: cost, Remaining: a.CreditsRemain, Total: a.CreditsTotal, ExpiryDays: daysToExpiry(a, now), ExpiringAmount: a.expiringWithin(now, expiryWindowDays), Priority: a.Priority, Failures: a.FailureCount, LastUsed: a.LastUsed})
 	}
-	if len(domestic) > 0 {
-		candidates = domestic
-	}
-	var urgent []*Account
+	id := provider.SelectCandidate(choices, costByUID != nil, expiryWindowDays, now)
 	for _, a := range candidates {
-		if daysToExpiry(a, now) <= expiryWindowDays {
-			urgent = append(urgent, a)
+		if a.UID == id {
+			a.LastUsed = now
+			return a
 		}
 	}
-	poolToPick := candidates
-	applyIdle := true
-	if len(urgent) > 0 {
-		// 同成本组内先烧快过期的额度（此阶段不叠加闲置补偿，避免抵消优先意图）。
-		poolToPick = urgent
-		applyIdle = false
-	}
-	// Option A：紧迫组内按「窗口内绝对到期余额」偏置，优先烧最大的一堆；用组内最大值
-	// 归一化，避免绝对量级压垮其它权重因子。非紧迫组不参与（maxExpiring 保持 0）。
-	var maxExpiring float64
-	if !applyIdle {
-		for _, a := range poolToPick {
-			if e := a.expiringWithin(now, expiryWindowDays); e > maxExpiring {
-				maxExpiring = e
-			}
-		}
-	}
-	// Free models retain the original soft regional tie-breaker.
-	domesticTie := domesticCostTie(poolToPick, costByUID)
-	var totalW float64
-	weights := make([]float64, len(poolToPick))
-	for i, a := range poolToPick {
-		w := weight(a, now, applyIdle)
-		if domesticTie && (a.Profile == "cn-cli" || a.Profile == "cn-work") {
-			w *= 1.25
-		}
-		if maxExpiring > 0 {
-			w *= 1 + expiryAmountBias*(a.expiringWithin(now, expiryWindowDays)/maxExpiring)
-		}
-		weights[i] = w
-		totalW += w
-	}
-	pick := rand.Float64() * totalW
-	acc := poolToPick[len(poolToPick)-1]
-	for i, a := range poolToPick {
-		pick -= weights[i]
-		if pick <= 0 {
-			acc = a
-			break
-		}
-	}
-	acc.LastUsed = now
-	return acc
+	return nil
 }
 
 // domesticCostTie is false for cost-blind/all-unknown selection and for

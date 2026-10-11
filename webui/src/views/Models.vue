@@ -130,7 +130,8 @@ const filtered = computed(() =>
     if (providerFilter.value && e.provider !== providerFilter.value) return false
     const isMulti = e.model.modality === 'multimodal' || e.model.vision || e.model.supports_image
     if (modalityFilter.value === 'multimodal' && !isMulti) return false
-    if (modalityFilter.value === 'text' && isMulti) return false
+    if (modalityFilter.value === 'text' && (isMulti || e.model.vision_verified === false)) return false
+    if (modalityFilter.value === 'unknown' && e.model.vision_verified !== false) return false
     const q = search.value.trim().toLowerCase()
     if (q) {
       const hay = `${e.model.id} ${e.model.name || ''}`.toLowerCase()
@@ -143,7 +144,7 @@ const filtered = computed(() =>
 const stats = computed(() => {
   const total = entries.value.length
   const multi = entries.value.filter((e) => e.model.modality === 'multimodal' || e.model.vision).length
-  const tool = entries.value.filter((e) => e.model.supportsToolCall).length
+  const tool = entries.value.filter((e) => e.model.supportsToolCall === true || e.model.tool_call === true).length
   const aa = entries.value.filter((e) => e.model.benchmark).length
   return { total, multi, tool, aa }
 })
@@ -209,7 +210,7 @@ onBeforeUnmount(() => { loadVersion++ })
         <WSelect v-model="providerFilter" :options="providerOptions" placeholder="全部供应商" class="w-40" />
         <WSelect
           v-model="modalityFilter"
-          :options="[{ value: 'text', label: '纯文本' }, { value: 'multimodal', label: '多模态' }]"
+          :options="[{ value: 'text', label: '纯文本' }, { value: 'multimodal', label: '多模态' }, { value: 'unknown', label: '能力待确认' }]"
           placeholder="全部模态"
           class="w-32"
         />

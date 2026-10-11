@@ -58,7 +58,7 @@ function provLed(p: ProviderSummary): 'live' | 'fault' | 'muted' {
   return 'live'
 }
 function provStat(p: ProviderSummary): string {
-  const s = p.status as any
+  const s = (p.status || {}) as any
   if (p.name === 'workbuddy') return `${s.healthy_count ?? 0}/${s.account_count ?? 0} 账号 · ${s.model_count ?? 0} 模型`
   if (p.name === 'qoder') return `${s.account_count ?? 0} 账号 · ${s.model_count ?? 0} 模型`
   return `${s.model_count ?? 0} 模型`
@@ -73,9 +73,8 @@ const recentCols: Column[] = [
 ]
 const recent = computed(() => (ov.value?.recent || []).slice(0, 8))
 
-// 最近调用的账号列同流量日志：uid → 显示名（含 workbuddy 别名）。
-// 概览返回的 accounts 已带 alias/nickname，直接建映射；未命中回退 uid 短码。
-const labelMap = computed(() => buildLabelMap(ov.value?.accounts || []))
+// 用各渠道的安全名称投影映射调用账号；兼容旧服务只返回 accounts。
+const labelMap = computed(() => buildLabelMap(ov.value?.display_accounts || ov.value?.accounts || []))
 const acctLabel = (uid?: string | null) => (uid ? labelMap.value[uid] || uid.slice(0, 8) : '—')
 
 onMounted(() => {
@@ -167,7 +166,7 @@ onUnmounted(() => timer && clearInterval(timer))
 
         <div class="grid grid-cols-2 gap-4">
           <WStat label="可用渠道" :value="`${providers.filter((p) => p.name === 'workbuddy' ? healthy > 0 : p.ready).length}/${providers.length}`" :tone="serving ? 'live' : 'fault'" />
-          <WStat label="模型数" :value="int(ov?.model_count)" tone="route" :sub="ov?.model_source === 'dynamic' ? '上游实时' : '内置'" />
+          <WStat label="模型数" :value="int(ov?.model_count)" tone="route" :sub="ov?.model_source === 'providers' ? '全部渠道目录' : ov?.model_source === 'dynamic' ? '上游实时' : '内置'" />
           <WStat label="今日请求" :value="int(ov?.usage?.today_requests)" tone="brand" />
           <WStat label="今日 Tokens" :value="abbr(ov?.usage?.today_tokens)" />
         </div>

@@ -9,6 +9,7 @@ export interface ProviderMeta {
 }
 
 const REGISTRY: Record<string, ProviderMeta> = {
+	trae: { name:'trae', label:'Trae', short:'TR', tone:'live', chip:'bg-live/12 text-live' },
   workbuddy: { name: 'workbuddy', label: 'WorkBuddy', short: 'WB', tone: 'brand', chip: 'bg-brand/12 text-brand' },
   qoder: { name: 'qoder', label: 'Qoder', short: 'QD', tone: 'route', chip: 'bg-route/12 text-route' },
   opencode: { name: 'opencode', label: 'OpenCode', short: 'OC', tone: 'warn', chip: 'bg-warn/12 text-warn' },

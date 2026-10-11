@@ -381,10 +381,14 @@ func (r *Runtime) refreshAccountModels(ctx context.Context, acct *account.Accoun
 			MaxOutput:  m.MaxOutputTokens,
 			Context:    ctxWin,
 			Extra: map[string]any{
-				"enable":       m.Enable,
-				"is_default":   m.IsDefault,
-				"is_reasoning": m.IsReasoning,
-				"price_factor": m.PriceFactor,
+				"enable":           m.Enable,
+				"is_default":       m.IsDefault,
+				"is_reasoning":     m.IsReasoning,
+				"price_factor":     m.PriceFactor,
+				"pricing_source":   "upstream_catalog",
+				"pricing_unit":     "relative_multiplier",
+				"pricing_known":    m.PriceFactor != nil,
+				"max_input_tokens": m.MaxInputTokens,
 				// 统一目录暴露标准模态字段：WebUI 的 ModelCard 按
 				// modality/vision/supports_image 判定多模态标签，缺省即显示"文本"。
 				"modality":       modalityOf(m.IsVL),

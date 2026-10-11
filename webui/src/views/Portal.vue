@@ -19,6 +19,7 @@ const inviteDays = ref('7')
 const publicURL = ref('')
 const savedPublicURL = ref('')
 const newGroup = ref('')
+	const newGroupProvider = ref('workbuddy')
 const disabledModels = ref<string[]>([])
 const groupModelSearch = ref('')
 const disabledModelSearch = ref('')
@@ -40,7 +41,7 @@ function accountsOf(g: PortalGroup) { return g.accounts || g.account_uids || [] 
 function grantsOf(g: PortalGroup) { return g.grants || g.user_ids || [] }
 function isPublicModel(model: string) { return model !== 'auto' && model !== 'workbuddy/auto' }
 function matchesModel(m: string, query: string) { return `${m} ${modelNames.value[m] || ''}`.toLowerCase().includes(query.trim().toLowerCase()) }
-function pickerModels(g: PortalGroup) { return [...new Set([...models.value, ...parseModels(g.allowed_models)])].filter(isPublicModel).sort().filter(m => matchesModel(m, groupModelSearch.value)) }
+function pickerModels(g: PortalGroup) { return [...new Set([...models.value, ...parseModels(g.allowed_models)])].filter(isPublicModel).filter(m => (m.startsWith('trae/') ? 'trae' : 'workbuddy') === g.provider).sort().filter(m => matchesModel(m, groupModelSearch.value)) }
 const disabledOptions = computed(() => [...new Set([...models.value, ...disabledModels.value])].sort().filter(m => matchesModel(m, disabledModelSearch.value)))
 function accountLabel(a: PortalAccount) { return a.alias?.trim() || a.nickname?.trim() || a.uid }
 function accountLabelByUID(uid: string) { const a = data.value.accounts?.find(a => a.uid === uid); return a ? accountLabel(a) : uid }
@@ -56,7 +57,7 @@ function editSharing(a: PortalAccount) {
 function username(id: number) { return data.value.users.find(u => u.id === id)?.username || `用户 ${id}` }
 const sharedAccounts = computed(() => (data.value.accounts || []).filter(a => {
   const c = data.value.contributions?.find(c => c.account_uid === a.uid)
-  return a.provider === 'workbuddy' && (c?.status === 'active' || ['shared', 'both'].includes(a.sharing_mode || ''))
+  return ['workbuddy','trae'].includes(a.provider) && (c?.status === 'active' || ['shared', 'both'].includes(a.sharing_mode || ''))
 }))
 async function load() {
   loading.value = true
@@ -64,7 +65,7 @@ async function load() {
   try {
     const [overview, catalog, settings] = await Promise.all([api.portalOverview(), api.modelCatalog(), api.getSettings()])
     data.value = { ...overview, users: overview.users || [], invites: overview.invites || [], groups: overview.groups || [] }
-    models.value = catalog.models.filter(m => (m.provider || m.owned_by) === 'workbuddy' && isPublicModel(m.id)).map(m => m.id)
+    models.value = catalog.models.filter(m => ['workbuddy','trae'].includes(m.provider || m.owned_by || '') && isPublicModel(m.id)).map(m => m.id)
     modelNames.value = Object.fromEntries(catalog.models.map(m => [m.id, m.name || m.id]))
     const disabled = settings.portal_disabled_models
     publicURL.value = savedPublicURL.value = settings.portal_public_url || ''
@@ -154,7 +155,7 @@ async function copyInvite(invite: PortalInvite, link = false) {
     <p v-if="error" class="rounded-lg border border-fault/30 p-3 text-small text-fault">{{ error }}</p>
     <section class="glass rounded-xl p-5 space-y-3">
       <h2 class="font-semibold">共享接入范围</h2>
-      <p class="text-small text-muted">WorkBuddy 已支持共享和本人调用。Qoder、OpenCode 当前只支持管理员私人调用，暂不能转入用户共享池。</p>
+      <p class="text-small text-muted">WorkBuddy、Trae 支持共享和本人调用，各池只使用对应渠道账号。Qoder、OpenCode 当前支持管理员私人调用。</p>
       <p class="text-micro text-faint">初次配置：创建一个池并选择模型 → 指定默认池和准入规则 → 在下方勾选要共享的平台账号。用户自己的账号无需池授权即可本人使用。</p>
     </section>
     <section class="glass rounded-xl p-5 space-y-3">
@@ -167,17 +168,17 @@ async function copyInvite(invite: PortalInvite, link = false) {
     <section class="glass rounded-xl p-5 space-y-3">
       <h2 class="font-semibold">账号使用范围 <span class="text-micro font-normal text-faint">{{ data.accounts?.length || 0 }} 个账号</span></h2>
       <p class="text-small text-faint">平台账号可以私人、共享或同时使用。用户上传账号始终归原用户所有，共享状态由本人决定；此处不会转移归属或重新启用停用账号。</p>
-      <p v-if="!data.accounts?.length" class="text-small text-faint">暂无 WorkBuddy 账号，请先在账号管理页添加。</p>
+      <p v-if="!data.accounts?.length" class="text-small text-faint">暂无可管理账号，请先在账号管理页添加。</p>
       <article v-for="a in data.accounts" :key="a.uid" class="border-t border-line py-2">
         <div class="flex flex-wrap items-center gap-x-3 gap-y-1 text-small">
           <strong class="min-w-0 break-all" :title="a.uid">{{ accountLabel(a) }}</strong>
           <span class="text-micro text-faint">{{ a.provider }} · {{ a.enabled ? '启用' : '停用' }} · {{ a.owner_kind === 'user' ? username(a.contribution_user_id || 0) + ' 所有' : '平台所有' }}</span>
           <span class="text-micro text-muted">{{ scopeLabel(a) }}</span>
-          <WButton v-if="a.owner_kind !== 'user' && a.provider === 'workbuddy'" size="sm" class="ml-auto" :disabled="busy" :aria-expanded="editingAccountUID === a.uid" @click="editSharing(a)">{{ editingAccountUID === a.uid ? '收起' : '修改范围' }}</WButton>
+          <WButton v-if="a.owner_kind !== 'user' && ['workbuddy','trae'].includes(a.provider)" size="sm" class="ml-auto" :disabled="busy" :aria-expanded="editingAccountUID === a.uid" @click="editSharing(a)">{{ editingAccountUID === a.uid ? '收起' : '修改范围' }}</WButton>
         </div>
-        <div v-if="editingAccountUID === a.uid && a.owner_kind !== 'user' && a.provider === 'workbuddy' && sharingDrafts[a.uid]" class="mt-3 space-y-3 rounded-lg border border-line p-3">
+        <div v-if="editingAccountUID === a.uid && a.owner_kind !== 'user' && ['workbuddy','trae'].includes(a.provider) && sharingDrafts[a.uid]" class="mt-3 space-y-3 rounded-lg border border-line p-3">
           <select v-model="sharingDrafts[a.uid].mode" :disabled="busy" class="w-full rounded-lg border border-line bg-bg p-2 text-small"><option value="private">仅管理员私人池</option><option value="shared">仅共享池</option><option value="both">私人池与共享池共用</option></select>
-          <div v-if="sharingDrafts[a.uid].mode !== 'private'" class="flex flex-wrap gap-3"><label v-for="g in data.groups" :key="g.id" class="flex items-center gap-2 text-small"><input type="checkbox" :checked="sharingDrafts[a.uid].groups.includes(g.id)" :disabled="busy" @change="togglePool(a, g.id, ($event.target as HTMLInputElement).checked)" />{{ g.name }}{{ g.enabled ? '' : '（未启用）' }}</label><span v-if="!data.groups.length" class="text-small text-warn">请先创建共享池。</span></div>
+          <div v-if="sharingDrafts[a.uid].mode !== 'private'" class="flex flex-wrap gap-3"><label v-for="g in data.groups.filter(g => g.provider === a.provider)" :key="g.id" class="flex items-center gap-2 text-small"><input type="checkbox" :checked="sharingDrafts[a.uid].groups.includes(g.id)" :disabled="busy" @change="togglePool(a, g.id, ($event.target as HTMLInputElement).checked)" />{{ g.name }}{{ g.enabled ? '' : '（未启用）' }}</label><span v-if="!data.groups.length" class="text-small text-warn">请先创建共享池。</span></div>
           <WButton size="sm" :disabled="busy" @click="saveSharing(a)">预览并保存使用范围</WButton>
         </div>
       </article>
@@ -199,7 +200,7 @@ async function copyInvite(invite: PortalInvite, link = false) {
       <h2 class="font-semibold">共享池分组</h2>
       <p class="text-small text-muted">一个分组是一套共享池权限：用哪些贡献账号、允许哪些模型、授权给哪些用户。例如「基础组」可以让指定用户通过池内账号调用两种基础模型。</p>
       <p class="text-small text-faint">默认池可以自动授权有效贡献者；自定义池用于指定账号、模型和用户。私人平台账号请先在「账号使用范围」转为共享或共用，再加入池。本人账号使用权不依赖分组。</p>
-      <div class="flex gap-2"><WInput v-model="newGroup" placeholder="WorkBuddy 分组名称" /><WButton :disabled="busy || !newGroup.trim()" @click="mutate(async () => { await api.portalWrite('groups', { name: newGroup.trim() }); newGroup = '' }, '分组已创建')">创建分组</WButton></div>
+      <div class="flex flex-wrap gap-2"><select v-model="newGroupProvider" class="rounded-lg border border-line bg-bg px-2 text-small"><option value="workbuddy">WorkBuddy</option><option value="trae">Trae</option></select><WInput v-model="newGroup" placeholder="分组名称" /><WButton :disabled="busy || !newGroup.trim()" @click="mutate(async () => { await api.portalWrite('groups', { name: newGroup.trim(), provider:newGroupProvider }); newGroup = '' }, '分组已创建')">创建分组</WButton></div>
       <p v-if="!data.groups.length" class="text-small text-faint">请先创建共享池，再勾选并保存允许的模型。模型目录不依赖池内账号；没有账号的池暂时无法提供调用。</p>
       <WInput v-else v-model="groupModelSearch" placeholder="搜索共享池模型名称或 ID，例如 deepseek" />
       <article v-for="g in data.groups" :key="g.id" class="rounded-lg border border-line p-4 space-y-3">
@@ -211,7 +212,7 @@ async function copyInvite(invite: PortalInvite, link = false) {
         <p v-if="!pickerModels(g).length" class="text-small text-faint">{{ groupModelSearch.trim() ? '没有匹配模型，请调整搜索词。' : '目录暂无可选模型，请在模型管理页刷新目录后重新加载。' }}</p>
         <WButton size="sm" :disabled="busy" @click="mutate(() => api.portalWrite(`groups/${g.id}/models`, { allowed_models: groupDrafts[g.id] || [] }), '模型范围已保存')">保存模型范围</WButton>
         <p class="text-small">共享账号</p><div v-for="uid in accountsOf(g)" :key="uid" class="flex flex-wrap items-center gap-2 text-micro"><span :title="uid">{{ accountLabelByUID(uid) }}</span><WButton size="sm" :disabled="busy" @click="mutate(() => api.portalWrite(`groups/${g.id}/accounts`, { action: 'remove', account_uid: uid }), '账号已移出')">移出</WButton></div>
-        <div class="flex gap-2"><select v-model="accountDrafts[g.id]" class="min-w-0 flex-1 rounded-lg border border-line bg-bg px-2 text-small"><option value="">选择可共享账号</option><option v-for="a in sharedAccounts.filter(a => !accountsOf(g).includes(a.uid))" :key="a.uid" :value="a.uid">{{ accountLabel(a) }}</option></select><WButton size="sm" :disabled="busy || !accountDrafts[g.id]" @click="mutate(() => api.portalWrite(`groups/${g.id}/accounts`, { action: 'add', account_uid: accountDrafts[g.id] }), '账号已加入')">加入</WButton></div>
+        <div class="flex gap-2"><select v-model="accountDrafts[g.id]" class="min-w-0 flex-1 rounded-lg border border-line bg-bg px-2 text-small"><option value="">选择可共享账号</option><option v-for="a in sharedAccounts.filter(a => a.provider === g.provider && !accountsOf(g).includes(a.uid))" :key="a.uid" :value="a.uid">{{ accountLabel(a) }}</option></select><WButton size="sm" :disabled="busy || !accountDrafts[g.id]" @click="mutate(() => api.portalWrite(`groups/${g.id}/accounts`, { action: 'add', account_uid: accountDrafts[g.id] }), '账号已加入')">加入</WButton></div>
         <p class="text-micro text-faint">当前就绪账号 {{ g.ready_accounts || 0 }} · 可用授权模型 {{ g.usable_models || 0 }} · 实际具备共享资格用户 {{ g.eligible_users || 0 }}{{ !g.enabled ? ' · 池未启用' : !g.usable_models ? ' · 请配置模型并检查账号状态或刷新目录' : '' }}</p>
         <p class="text-small">获授权用户</p><div v-for="id in grantsOf(g)" :key="id" class="flex items-center gap-2 text-small"><span>{{ username(id) }}</span><WButton size="sm" :disabled="busy" @click="mutate(() => api.portalWrite(`groups/${g.id}/grants`, { action: 'revoke', user_id: id }), '授权已撤销')">撤销授权</WButton></div>
         <div class="flex gap-2"><select v-model="userDrafts[g.id]" class="min-w-0 flex-1 rounded-lg border border-line bg-bg px-2 text-small"><option value="">选择用户</option><option v-for="u in data.users.filter(u => u.status === 'active' && !grantsOf(g).includes(u.id))" :key="u.id" :value="String(u.id)">{{ u.username }}</option></select><WButton size="sm" :disabled="busy || !userDrafts[g.id]" @click="mutate(() => api.portalWrite(`groups/${g.id}/grants`, { action: 'grant', user_id: Number(userDrafts[g.id]) }), '授权已授予')">授权</WButton></div>

@@ -19,6 +19,7 @@ import (
 	"work2api/internal/opencode"
 	"work2api/internal/qoder"
 	"work2api/internal/store"
+	"work2api/internal/trae"
 	"work2api/internal/workbuddy/credentials"
 	"work2api/internal/workbuddy/models"
 	"work2api/internal/workbuddy/pool"
@@ -125,6 +126,11 @@ func (o *Orchestrator) registerRuntimes(dataDir, logLevel string) {
 	if err := o.runtimes.Register(qoder.New(logLevel)); err != nil {
 		panic(err)
 	}
+	if tr, err := trae.New(dataDir, o.db); err != nil {
+		log.Printf("Trae 初始化失败（已跳过）: %v", err)
+	} else if err := o.runtimes.Register(tr); err != nil {
+		panic(err)
+	}
 	if oc, err := opencode.New(nil, dataDir); err != nil {
 		log.Printf("opencode 运行时初始化失败（已跳过）: %v", err)
 	} else {
@@ -218,9 +224,9 @@ func (o *Orchestrator) attachPortalScope(p *Principal) *apiError {
 	aliases := parseModelAliases(settings["model_aliases"])
 	resolve := func(m string) string {
 		if target, ok := aliases[m]; ok {
-			return target
+			return strings.TrimPrefix(target, "workbuddy/")
 		}
-		return m
+		return strings.TrimPrefix(m, "workbuddy/")
 	}
 	disabled := map[string]bool{}
 	for _, m := range parseJSONStringArray(settings["portal_disabled_models"]) {
@@ -251,8 +257,26 @@ func (o *Orchestrator) attachPortalScope(p *Principal) *apiError {
 	if err != nil {
 		return errBody(500, "资格查询失败", "server_error")
 	}
+	if rt, ok := o.runtimes.ByName("trae"); ok {
+		for _, entry := range rt.Models(context.Background()) {
+			if disabled[entry.ID] {
+				continue
+			}
+			uids, _ := entry.Extra["account_uids"].([]string)
+			for _, uid := range uids {
+				if owned[uid] {
+					if p.ModelScopes[entry.ID] == nil {
+						p.ModelScopes[entry.ID] = map[string]bool{}
+					}
+					p.ModelScopes[entry.ID][uid] = true
+					models[entry.ID] = true
+					p.OwnedModels[entry.ID] = true
+				}
+			}
+		}
+	}
 	for _, g := range grants {
-		if len(eligible) == 0 || !g.Enabled || g.Provider != "workbuddy" {
+		if len(eligible) == 0 || !g.Enabled || (g.Provider != "workbuddy" && g.Provider != "trae") {
 			continue
 		}
 		// 未配置共享模型范围的分组保持关闭（HANDOFF §2）：空串 = 未配置。
@@ -268,7 +292,7 @@ func (o *Orchestrator) attachPortalScope(p *Principal) *apiError {
 		}
 		for _, m := range parseJSONStringArray(g.AllowedModels) {
 			resolved := resolve(m)
-			if disabled[m] || disabled[resolved] || resolved == "auto" || strings.Contains(resolved, "/") {
+			if disabled[m] || disabled[resolved] || resolved == "auto" || (strings.Contains(resolved, "/") && !strings.HasPrefix(resolved, "trae/")) || (g.Provider == "trae") != strings.HasPrefix(resolved, "trae/") {
 				continue
 			}
 			models[resolved] = true
@@ -342,7 +366,7 @@ func (s *Server) portalModelAllowed(principal *Principal, model, resolved string
 	if principal == nil || principal.PortalModels == nil {
 		return false
 	}
-	if !principal.PortalModels[resolved] || resolved == "auto" || strings.Contains(resolved, "/") {
+	if !principal.PortalModels[resolved] || resolved == "auto" || (strings.Contains(resolved, "/") && !strings.HasPrefix(resolved, "trae/")) {
 		return false
 	}
 	if len(principal.AllowedModels) == 0 {
@@ -363,7 +387,7 @@ func modelAllowed(principal *Principal, model, resolved string) bool {
 		return true
 	}
 	for _, allowed := range principal.AllowedModels {
-		if allowed == model || allowed == resolved {
+		if allowed == model || strings.TrimPrefix(allowed, "workbuddy/") == resolved {
 			return true
 		}
 	}
@@ -488,9 +512,9 @@ func (o *Orchestrator) resolveModel(model string) string {
 	s, _ := o.db.GetSettings()
 	aliases := parseModelAliases(s["model_aliases"])
 	if real, ok := aliases[model]; ok {
-		return real
+		return strings.TrimPrefix(real, "workbuddy/")
 	}
-	return model
+	return strings.TrimPrefix(model, "workbuddy/")
 }
 
 func (o *Orchestrator) enhanceBody(body map[string]any) map[string]any {
@@ -519,7 +543,7 @@ func (o *Orchestrator) invocationContext(ctx context.Context) context.Context {
 					return err
 				}
 			}
-			if ref.Provider != "workbuddy" {
+			if ref.Provider != "workbuddy" && ref.Provider != "trae" {
 				return errBody(403, "当前账号渠道不支持共享调用", "permission_error")
 			}
 			if err := ctx.Err(); err != nil {

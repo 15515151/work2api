@@ -9,6 +9,90 @@ import (
 	"work2api/internal/config"
 )
 
+func TestDeploymentTokenDefaults(t *testing.T) {
+	previousRoot := config.PackageRoot
+	config.PackageRoot = t.TempDir()
+	t.Cleanup(func() { config.PackageRoot = previousRoot })
+	t.Setenv("ADMIN_TOKEN", "")
+	t.Setenv("ALLOW_EXTERNAL_HOST", "")
+	t.Setenv("ADMIN_COOKIE_SECURE", "")
+	for _, tc := range []struct {
+		name, token, external, secure  string
+		args                           []string
+		wantExternal, wantSecure, auto bool
+	}{
+		{name: "local defaults", auto: true},
+		{name: "token only", token: "test-token", wantExternal: true, wantSecure: true, auto: true},
+		{name: "flag token", args: []string{"-admin-token", "test-token"}, wantExternal: true, wantSecure: true, auto: true},
+		{name: "private host override", token: "test-token", external: "false", wantSecure: true, auto: true},
+		{name: "legacy external override", external: "1", wantExternal: true, wantSecure: true, auto: true},
+		{name: "explicit insecure LAN", token: "test-token", secure: "false", wantExternal: true},
+		{name: "explicit secure", token: "test-token", secure: "true", wantExternal: true, wantSecure: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("ADMIN_TOKEN", tc.token)
+			t.Setenv("ALLOW_EXTERNAL_HOST", tc.external)
+			t.Setenv("ADMIN_COOKIE_SECURE", tc.secure)
+			if tc.name == "local defaults" {
+				_ = os.Unsetenv("ALLOW_EXTERNAL_HOST")
+				_ = os.Unsetenv("ADMIN_COOKIE_SECURE")
+			}
+			cfg := config.Load(tc.args)
+			if cfg.AllowExternalHost != tc.wantExternal || cfg.AdminCookieSecure != tc.wantSecure || cfg.AdminCookieSecureAuto != tc.auto {
+				t.Fatalf("unexpected deployment policy: external=%t secure=%t auto=%t", cfg.AllowExternalHost, cfg.AdminCookieSecure, cfg.AdminCookieSecureAuto)
+			}
+		})
+	}
+}
+
+func TestAutomaticDeploymentOriginPolicy(t *testing.T) {
+	srv := &Server{o: &Orchestrator{cfg: &config.Config{AdminToken: "test-token", AdminCookieSecure: true, AdminCookieSecureAuto: true}}}
+	for _, tc := range []struct {
+		name, url, peer string
+		secure          bool
+	}{
+		{"local HTTP", "http://localhost:8787", "127.0.0.1:10000", false},
+		{"SSH tunnel HTTP", "http://127.0.0.1:18788", "127.0.0.1:10000", false},
+		{"IPv6 local HTTP", "http://[::1]:8787", "[::1]:10000", false},
+		{"IPv6 without port", "http://[::1]", "[::1]:10000", false},
+		{"public HTTP via proxy", "http://gateway.example.com", "127.0.0.1:10000", true},
+		{"spoofed localhost from remote", "http://localhost:8787", "192.0.2.1:10000", true},
+		{"local HTTPS", "https://localhost:8787", "127.0.0.1:10000", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodPost, tc.url+"/portal/api/auth/login", nil)
+			r.RemoteAddr = tc.peer
+			r.Header.Set("Sec-Fetch-Site", "same-origin")
+			r.Header.Set("Origin", tc.url)
+			r.Header.Set("X-Forwarded-Proto", "http")
+			r.Header.Set("X-Real-IP", "127.0.0.1")
+			if got := srv.browserCookieSecure(r); got != tc.secure {
+				t.Fatalf("cookie secure=%t, want %t", got, tc.secure)
+			}
+			w := httptest.NewRecorder()
+			srv.setPortalCookie(w, r, "test-session")
+			cookies := w.Result().Cookies()
+			if len(cookies) != 1 || cookies[0].Secure != tc.secure || !cookies[0].HttpOnly || cookies[0].SameSite != http.SameSiteLaxMode {
+				t.Fatal("portal cookie violates deployment policy")
+			}
+			wantOrigin := r.TLS != nil || !tc.secure
+			if srv.adminOriginAllowed(r, true) != wantOrigin {
+				t.Fatal("origin check disagrees with transport policy")
+			}
+			r.Header.Set("Origin", "https://attacker.example.com")
+			if srv.adminOriginAllowed(r, true) {
+				t.Fatal("foreign origin allowed")
+			}
+		})
+	}
+	srv.o.cfg.AdminCookieSecureAuto = false
+	r := httptest.NewRequest(http.MethodPost, "http://localhost:8787/", nil)
+	r.RemoteAddr = "127.0.0.1:10000"
+	if !srv.browserCookieSecure(r) {
+		t.Fatal("explicit Secure policy was bypassed")
+	}
+}
+
 func TestAgentCapacityDefaultsFollowRequestSize(t *testing.T) {
 	previousRoot := config.PackageRoot
 	config.PackageRoot = t.TempDir()

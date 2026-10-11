@@ -490,7 +490,9 @@ func (o *Runtime) OpenUpstreamScoped(ctx context.Context, acc *pool.Account, bod
 			return acc, err
 		}
 		if denied {
-			log.Printf("渠道拒绝诊断: profile=%s model=%s compatibility=%s compat_enabled=%t started=%t attempt=%d", acc.Profile, model, CompatibilityName(level), o.cfg.ChannelIdentityCompat, started, attempt+1)
+			_, identityMatch := ChannelCompatibilityBody(body, 1)
+			_, metadataMatch := ChannelCompatibilityBody(body, 2)
+			log.Printf("渠道拒绝诊断: profile=%s model=%s compatibility=%s compat_enabled=%t metadata_enabled=%t identity_match=%t metadata_match=%t started=%t attempt=%d", acc.Profile, model, CompatibilityName(level), o.cfg.ChannelIdentityCompat, o.cfg.ChannelMetadataCompat, identityMatch, metadataMatch, started, attempt+1)
 		}
 		if denied && o.cfg.ChannelIdentityCompat && compatTries < 2 && attempt+1 < maxFailoverAttempts && siterouting.ProfileSite(acc.Profile) == siterouting.Domestic {
 			maxLevel := 1

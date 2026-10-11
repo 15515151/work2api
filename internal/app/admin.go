@@ -128,6 +128,24 @@ var readableLabel = wbruntime.ReadableLabel
 
 func (s *Server) adminOverview(w http.ResponseWriter, r *http.Request) {
 	accounts := s.accountsForDisplay()
+	labels := []map[string]any{}
+	for _, rt := range s.o.runtimes.Runtimes() {
+		if ar, ok := rt.(provider.AdminRuntime); ok {
+			for _, a := range ar.AdminData(r.Context()).Accounts {
+				uid := str2(a["uid"])
+				if uid == "" {
+					uid = str2(a["id"])
+				}
+				if uid != "" {
+					nickname := str2(a["nickname"])
+					if nickname == "" {
+						nickname = str2(a["label"])
+					}
+					labels = append(labels, map[string]any{"uid": uid, "provider": rt.Name(), "alias": a["alias"], "nickname": nickname})
+				}
+			}
+		}
+	}
 	summary, _ := s.o.db.UsageSummary()
 	writeJSON(w, 200, map[string]any{
 		"admission":          s.modelsAdmission.snapshot(),
@@ -135,12 +153,13 @@ func (s *Server) adminOverview(w http.ResponseWriter, r *http.Request) {
 		"backup":             s.o.backupStatus(),
 		"request_body_bytes": s.bodies.usage(),
 		"accounts":           accounts,
+		"display_accounts":   labels,
 		"alerts":             s.creditAlerts(accounts),
 		"usage":              decorateByAccount(summary, accounts),
 		"recent":             s.recentLight(),
 		"prediction":         s.creditPrediction(accounts),
-		"model_count":        len(s.o.wb.Catalog.ListCached()),
-		"model_source":       s.o.wb.Catalog.Source(),
+		"model_count":        len(s.o.runtimeModels(r.Context())),
+		"model_source":       "providers",
 	})
 }
 

@@ -18,13 +18,33 @@ func (s *Server) mountProviderAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("GET /admin/providers/{name}/oauth/options", s.adminProviderOAuthOptions)
 	mux.HandleFunc("POST /admin/providers/{name}/oauth/begin", s.adminProviderOAuthBegin)
 	mux.HandleFunc("POST /admin/providers/{name}/oauth/poll", s.adminProviderOAuthPoll)
+	mux.HandleFunc("POST /admin/providers/{name}/oauth/complete", s.adminProviderOAuthComplete)
 	mux.HandleFunc("POST /admin/providers/{name}/accounts/{id}/activate", s.adminProviderActivate)
 	mux.HandleFunc("POST /admin/providers/{name}/accounts/{id}/rename", s.adminProviderRename)
 	mux.HandleFunc("POST /admin/providers/{name}/accounts/{id}/settings", s.adminProviderAccountSettings)
 	mux.HandleFunc("POST /admin/providers/{name}/accounts/import", s.adminProviderImportAccount)
+	mux.HandleFunc("POST /admin/providers/{name}/accounts/import-local", s.adminProviderImportLocal)
 	mux.HandleFunc("DELETE /admin/providers/{name}/accounts/{id}", s.adminProviderDeleteAccount)
 	mux.HandleFunc("GET /admin/providers/{name}/config", s.adminProviderGetConfig)
 	mux.HandleFunc("POST /admin/providers/{name}/config", s.adminProviderSaveConfig)
+}
+
+func (s *Server) adminProviderImportLocal(w http.ResponseWriter, r *http.Request) {
+	rt, ok := s.accountManager(w, r.PathValue("name"))
+	if !ok {
+		return
+	}
+	importer, ok := rt.(provider.LocalAccountImporter)
+	if !ok {
+		writeAPIErr(w, errBody(400, "该渠道不支持本机导入", "invalid_request_error"))
+		return
+	}
+	result, err := importer.ImportLocalAccounts(r.Context())
+	if err != nil {
+		writeAPIErr(w, errBody(400, "本机导入失败", "invalid_request_error"))
+		return
+	}
+	writeJSON(w, 200, result)
 }
 
 func (s *Server) adminProviderAccountSettings(w http.ResponseWriter, r *http.Request) {
@@ -269,6 +289,28 @@ func (s *Server) adminProviderOAuthPoll(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	writeJSON(w, 200, res)
+}
+
+func (s *Server) adminProviderOAuthComplete(w http.ResponseWriter, r *http.Request) {
+	rt, ok := s.accountManager(w, r.PathValue("name"))
+	if !ok {
+		return
+	}
+	callback, ok := rt.(provider.OAuthCallbackRuntime)
+	if !ok {
+		writeAPIErr(w, errBody(400, "该渠道不支持手动回调", "invalid_request_error"))
+		return
+	}
+	body, err := readJSON(r)
+	if err != nil {
+		writeAPIErr(w, errBody(400, "请求格式错误", "invalid_request_error"))
+		return
+	}
+	if err = callback.OAuthComplete(str2(body["login_id"]), str2(body["callback_url"])); err != nil {
+		writeAPIErr(w, errBody(400, err.Error(), "invalid_request_error"))
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
 // adminProviders returns a cross-provider summary for the overview cards.

@@ -3,6 +3,8 @@ package app
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -12,8 +14,11 @@ import (
 	"testing"
 	"time"
 
+	appcrypto "work2api/internal/crypto"
 	"work2api/internal/portal/portalauth"
 	"work2api/internal/store"
+	"work2api/internal/workbuddy/models"
+	"work2api/internal/workbuddy/pool"
 )
 
 func portalFixture(t *testing.T) (*Server, *store.User) {
@@ -125,6 +130,149 @@ func TestPortalBeginReservesCapacityBeforeUpstream(t *testing.T) {
 	}
 	if len(s.portalTasks) != 1 {
 		t.Fatal("reservation leaked", len(s.portalTasks))
+	}
+}
+
+func TestPortalContributionLoginSites(t *testing.T) {
+	s, u := portalFixture(t)
+	previous := portalOAuthBegin
+	t.Cleanup(func() { portalOAuthBegin = previous })
+	called := ""
+	portalOAuthBegin = func(site string) (map[string]any, error) {
+		called = site
+		return map[string]any{"state": "test-state", "authUrl": "https://example.invalid/login", "site": site}, nil
+	}
+	for _, tc := range []struct{ input, want string }{{"", "cn"}, {"cn", "cn"}, {"intl", "intl"}, {"intl-codebuddy", "intl-codebuddy"}, {" CN ", "cn"}, {"workbuddy", ""}, {"unknown", ""}} {
+		called = ""
+		s.portalTasks = map[string]*portalContributionTask{}
+		body, _ := json.Marshal(map[string]any{"site": tc.input, "accepted": true})
+		w := httptest.NewRecorder()
+		s.portalContributionBegin(w, portalRequest(u, "/portal/api/contributions/begin", string(body)))
+		if tc.want == "" {
+			if w.Code != 400 || called != "" || len(s.portalTasks) != 0 {
+				t.Fatalf("invalid site contacted upstream or reserved a task: %d %s", w.Code, w.Body.String())
+			}
+		} else if w.Code != 200 || called != tc.want || s.portalTasks["test-state"].site != tc.want {
+			t.Fatalf("site %q: %d %s, upstream=%q", tc.input, w.Code, w.Body.String(), called)
+		}
+	}
+}
+
+// Exercise the real middleware and routes with an HTTPS browser and an HTTP
+// loopback proxy, as used by Nginx and Cloudflare Tunnel. Forwarded headers
+// are not needed to establish the external scheme or session cookie policy.
+func TestPortalRoutesBehindHTTPSProxy(t *testing.T) {
+	s, _ := portalFixture(t)
+	s.o.crypto = appcrypto.NewManager(t.TempDir())
+	s.o.cfg.AdminToken = "test-admin-token"
+	s.o.cfg.AllowExternalHost = true
+	s.o.cfg.AdminCookieSecure = true
+	s.o.cfg.AdminCookieSecureAuto = true
+	s.o.cfg.PortalRegistrationMode = "open"
+	s.o.cfg.PortalKeyMaxPerUser = 5
+	h := s.Handler()
+	var cookie *http.Cookie
+	request := func(method, path, body, origin string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(method, "http://gateway.example.com"+path, strings.NewReader(body))
+		r.RemoteAddr = "127.0.0.1:12345"
+		r.Header.Set("Origin", origin)
+		r.Header.Set("Sec-Fetch-Site", "same-origin")
+		if cookie != nil {
+			r.AddCookie(cookie)
+		}
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w
+	}
+	const origin = "https://gateway.example.com"
+	w := request("POST", "/portal/api/auth/register", `{"username":"Proxy-User","password":"testpassword"}`, origin)
+	if w.Code != 200 {
+		t.Fatal(w.Code, w.Body.String())
+	}
+	cookies := w.Result().Cookies()
+	if len(cookies) != 1 || !cookies[0].Secure || !cookies[0].HttpOnly {
+		t.Fatal("missing secure session")
+	}
+	cookie = cookies[0]
+	user, err := s.o.db.GetUserByUsername("proxy-user")
+	if err != nil || user == nil {
+		t.Fatal("registered user missing", err)
+	}
+	acc := s.o.wb.Pool.Accounts()[0]
+	s.o.wb.Pool = pool.New(map[string]pool.Credential{acc.UID: catalogOffline{acc.Mgr}}, "")
+	s.o.wb.Catalog = models.NewWithCatalogClient(s.o.wb.Pool, s.o.db, &http.Client{Transport: catalogTransport{}})
+	contributionID, err := s.o.db.CreateContribution(user.ID, acc.UID, "workbuddy", "codebuddy", "active")
+	if err != nil || !s.o.wb.Catalog.RefreshAccount(context.Background(), acc.UID) {
+		t.Fatal("contribution catalog not verified", err)
+	}
+	for _, path := range []string{"/portal/api/me", "/portal/api/models", "/portal/api/keys", "/portal/api/contributions", "/portal/api/usage"} {
+		w = request("GET", path, "", origin)
+		if w.Code != 200 {
+			t.Fatal(path, w.Code, w.Body.String())
+		}
+		if (path == "/portal/api/me" || path == "/portal/api/models") && !strings.Contains(w.Body.String(), "test-model") {
+			t.Fatal("own model missing", path, w.Body.String())
+		}
+	}
+	previousBegin, previousPoll := portalOAuthBegin, portalOAuthPoll
+	t.Cleanup(func() { portalOAuthBegin, portalOAuthPoll = previousBegin, previousPoll })
+	portalOAuthBegin = func(site string) (map[string]any, error) {
+		if site != "cn" {
+			t.Fatal("incorrect login site", site)
+		}
+		return map[string]any{"state": "proxy-login-task", "authUrl": "https://example.invalid/login", "site": site}, nil
+	}
+	portalOAuthPoll = func(state, site string) (map[string]any, error) { return map[string]any{"status": "pending"}, nil }
+	for _, op := range []struct{ path, body string }{
+		{"begin", `{"site":"cn","accepted":true}`},
+		{"poll", `{"task_id":"proxy-login-task"}`},
+		{"cancel", `{"task_id":"proxy-login-task"}`},
+	} {
+		w = request("POST", "/portal/api/contributions/"+op.path, op.body, origin)
+		if w.Code != 200 {
+			t.Fatal(op.path, w.Code, w.Body.String())
+		}
+	}
+	if len(s.portalTasks) != 0 {
+		t.Fatal("cancel did not release login task")
+	}
+	w = request("POST", "/portal/api/keys", `{"name":"proxy-test"}`, "https://attacker.example.com")
+	if w.Code != 403 {
+		t.Fatal("cross-origin write accepted", w.Code)
+	}
+	w = request("POST", "/portal/api/keys", `{"name":"proxy-test"}`, origin)
+	if w.Code != 200 {
+		t.Fatal(w.Code, w.Body.String())
+	}
+	var created struct {
+		ID  int64  `json:"id"`
+		Key string `json:"key"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil || created.ID == 0 || created.Key == "" {
+		t.Fatal("invalid key response", err)
+	}
+	keyPath := fmt.Sprintf("/portal/api/keys/%d", created.ID)
+	accountPath := fmt.Sprintf("/portal/api/contributions/%d", contributionID)
+	for _, op := range []struct{ method, path, body string }{
+		{"POST", keyPath + "/toggle", `{}`},
+		{"POST", keyPath + "/models", `{"allowed_models":[]}`},
+		{"DELETE", keyPath, ""},
+		{"POST", accountPath + "/revoke", `{}`},
+		{"POST", accountPath + "/share", `{"accepted":true}`},
+		{"POST", "/portal/api/auth/logout", ""},
+	} {
+		w = request(op.method, op.path, op.body, origin)
+		if w.Code != 200 {
+			t.Fatal(op.path, w.Code, w.Body.String())
+		}
+	}
+	if w = request("GET", "/portal/api/me", "", origin); w.Code != 401 {
+		t.Fatal("logout session survived", w.Code)
+	}
+	cookie = nil
+	w = request("POST", "/portal/api/auth/login", `{"username":"PROXY-USER","password":"testpassword"}`, origin)
+	if w.Code != 200 || len(w.Result().Cookies()) != 1 {
+		t.Fatal(w.Code, w.Body.String())
 	}
 }
 

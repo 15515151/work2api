@@ -19,6 +19,7 @@ import (
 
 	"work2api/internal/portal/portalauth"
 	"work2api/internal/store"
+	"work2api/internal/trae"
 	"work2api/internal/workbuddy/credentials"
 	"work2api/internal/workbuddy/oauth"
 	wbruntime "work2api/internal/workbuddy/runtime"
@@ -62,6 +63,7 @@ func (s *Server) mountPortal(mux *http.ServeMux) {
 	mux.HandleFunc("POST /portal/api/contributions/begin", s.portalContributionBegin)
 	mux.HandleFunc("POST /portal/api/contributions/poll", s.portalContributionPoll)
 	mux.HandleFunc("POST /portal/api/contributions/cancel", s.portalContributionCancel)
+	mux.HandleFunc("POST /portal/api/providers/trae/oauth/{action}", s.portalTraeOAuth)
 	mux.HandleFunc("POST /portal/api/contributions/{id}/revoke", s.portalRevokeContribution)
 	mux.HandleFunc("POST /portal/api/contributions/{id}/share", s.portalShareContribution)
 	mux.HandleFunc("POST /portal/api/contributions/{id}/models/refresh", s.portalRefreshContributionModels)
@@ -142,7 +144,7 @@ func (s *Server) portalGuard(next http.Handler) http.Handler {
 		// 写操作（含认证接口）一律同源校验；带会话的写请求要求浏览器信号
 		// （与 adminGuard 一致），认证接口保持宽松以兼容旧客户端。
 		if r.Method != http.MethodGet && r.Method != http.MethodHead && !s.adminOriginAllowed(r, !isPortalAuthPath(path)) {
-			writeJSON(w, 403, errBody(403, "拒绝跨源请求", "forbidden").Body)
+			writeJSON(w, 403, errBody(403, "拒绝跨源请求，请管理员核对页面域名、回源 Host 与 HTTPS 配置", "forbidden").Body)
 			return
 		}
 		if isPortalAuthPath(path) {
@@ -386,7 +388,7 @@ func (s *Server) setPortalCookie(w http.ResponseWriter, r *http.Request, token s
 		Path:     "/",
 		MaxAge:   int(portalauth.SessionTTL),
 		HttpOnly: true,
-		Secure:   r.TLS != nil || s.o.cfg.AdminCookieSecure,
+		Secure:   s.browserCookieSecure(r),
 		SameSite: http.SameSiteLaxMode,
 	})
 }
@@ -394,7 +396,7 @@ func (s *Server) setPortalCookie(w http.ResponseWriter, r *http.Request, token s
 func (s *Server) clearPortalCookie(w http.ResponseWriter, r *http.Request) {
 	http.SetCookie(w, &http.Cookie{
 		Name: portalauth.UserCookieName, Value: "", Path: "/", MaxAge: -1,
-		HttpOnly: true, Secure: r.TLS != nil || s.o.cfg.AdminCookieSecure, SameSite: http.SameSiteLaxMode,
+		HttpOnly: true, Secure: s.browserCookieSecure(r), SameSite: http.SameSiteLaxMode,
 	})
 }
 
@@ -595,6 +597,19 @@ func (o *Orchestrator) portalCatalogPermissions(p *Principal) map[string]bool {
 			}
 		}
 	}
+	if o.runtimes != nil {
+		if rt, ok := o.runtimes.ByName("trae"); ok {
+			for _, entry := range rt.Models(context.Background()) {
+				ids, _ := entry.Extra["account_uids"].([]string)
+				for _, uid := range ids {
+					if p.PortalModels[entry.ID] && p.ModelScopes[entry.ID][uid] {
+						allowed[entry.ID] = true
+						break
+					}
+				}
+			}
+		}
+	}
 	return allowed
 }
 
@@ -612,13 +627,13 @@ func (s *Server) portalModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	visible := s.o.portalCatalogPermissions(p)
-	for _, model := range s.o.wb.Catalog.ListCached() {
+	for _, model := range s.o.runtimeModels(r.Context()) {
 		id := str2(model["id"])
 		if !visible[id] {
 			continue
 		}
 		item := map[string]any{"id": id, "own_account": p.OwnedModels[id], "shared_pool": p.SharedModels[id]}
-		for _, field := range []string{"name", "context_length", "max_output_tokens", "vision", "reasoning", "input_modalities", "output_modalities"} {
+		for _, field := range []string{"name", "context_length", "max_input_tokens", "max_output_tokens", "vision", "vision_verified", "reasoning", "is_reasoning", "input_modalities", "output_modalities", "supportsToolCall", "tool_call", "tool_response_multimodal", "structured_output", "native_protocol", "thinking_control", "capability_source", "pricing_source", "pricing_unit", "pricing_tier", "pricing_known", "input_cost", "output_cost", "price_factor", "catalog_stale"} {
 			if value, ok := model[field]; ok {
 				item[field] = value
 			}
@@ -719,11 +734,27 @@ func (s *Server) portalContributionBegin(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, 403, errBody(403, "门户未启用", "forbidden").Body)
 		return
 	}
-	body, _ := readJSON(r)
-	site, _ := body["site"].(string)
+	body, err := readJSON(r)
+	if err != nil {
+		writeAPIErr(w, errBody(400, "请求格式错误", "invalid_request_error"))
+		return
+	}
+	site, valid := body["site"].(string)
+	if _, present := body["site"]; present && !valid {
+		writeAPIErr(w, errBody(400, "登录站点必须为字符串", "invalid_request_error"))
+		return
+	}
 	accepted, _ := body["accepted"].(bool)
 	if !accepted {
 		writeJSON(w, 400, errBody(400, "请先阅读并同意共享范围说明", "invalid_request_error").Body)
+		return
+	}
+	site = strings.ToLower(strings.TrimSpace(site))
+	if site == "" {
+		site = "cn"
+	}
+	if _, err := oauth.SiteHost(site); err != nil {
+		writeAPIErr(w, errBody(400, "请选择有效的登录站点：cn / intl / intl-codebuddy", "invalid_request_error"))
 		return
 	}
 	now := time.Now()
@@ -1036,6 +1067,17 @@ func (s *Server) portalRevokeContribution(w http.ResponseWriter, r *http.Request
 }
 
 func (s *Server) contributionCatalogStatus(uid string) string {
+	if strings.HasPrefix(uid, "trae-") {
+		if rt, ok := s.o.runtimes.ByName("trae"); ok {
+			for _, entry := range rt.Models(context.Background()) {
+				ids, _ := entry.Extra["account_uids"].([]string)
+				if slices.Contains(ids, uid) {
+					return "ready"
+				}
+			}
+		}
+		return "pending"
+	}
 	a := s.o.wb.Pool.Get(uid)
 	if a == nil || !a.Enabled {
 		return "unavailable"
@@ -1065,7 +1107,17 @@ func (s *Server) portalRefreshContributionModels(w http.ResponseWriter, r *http.
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 		defer cancel()
-		if !s.o.wb.Catalog.RefreshAccount(ctx, c.AccountUID) {
+		verified := false
+		if c.Provider == "trae" {
+			if rt, ok := s.o.runtimes.ByName("trae"); ok {
+				if t, ok := rt.(*trae.Runtime); ok {
+					verified = t.RefreshAccount(ctx, c.AccountUID) == nil
+				}
+			}
+		} else {
+			verified = s.o.wb.Catalog.RefreshAccount(ctx, c.AccountUID)
+		}
+		if !verified {
 			w.Header().Set("Retry-After", "10")
 			writeAPIErr(w, errBody(503, "模型目录暂未验证，请稍后重试；账号已保留", "catalog_pending"))
 			return
@@ -1304,7 +1356,7 @@ func (s *Server) portalGroupViews() ([]map[string]any, error) {
 	for _, id := range parseJSONStringArray(settings["portal_disabled_models"]) {
 		disabled[id] = true
 	}
-	catalog := s.o.wb.Catalog.ListCached()
+	catalog := s.o.runtimeModels(context.Background())
 	users, err := s.o.db.ListUsers()
 	if err != nil {
 		return nil, err
@@ -1349,6 +1401,18 @@ func (s *Server) portalGroupViews() ([]map[string]any, error) {
 		}
 		ready := map[string]bool{}
 		for _, uid := range backed {
+			if g.Provider == "trae" {
+				if rt, ok := s.o.runtimes.ByName("trae"); ok {
+					if t, ok := rt.(*trae.Runtime); ok {
+						for _, a := range t.AdminData(context.Background()).Accounts {
+							if str2(a["uid"]) == uid && a["enabled"] == true && a["healthy"] == true {
+								ready[uid] = true
+							}
+						}
+					}
+				}
+				continue
+			}
 			if a := s.o.wb.Pool.Get(uid); a != nil && a.Enabled && a.CooldownUntil <= nowSec() {
 				ready[uid] = true
 			}
@@ -1560,7 +1624,15 @@ func (s *Server) adminPortalCreateGroup(w http.ResponseWriter, r *http.Request) 
 		writeJSON(w, 400, errBody(400, "分组名称需为 1–64 字符", "invalid_request_error").Body)
 		return
 	}
-	id, err := s.o.db.CreateResourceGroup(name, "workbuddy", "")
+	channel := str2(body["provider"])
+	if channel == "" {
+		channel = "workbuddy"
+	}
+	if channel != "workbuddy" && channel != "trae" {
+		writeAPIErr(w, errBody(400, "该渠道尚不支持共享", "invalid_request_error"))
+		return
+	}
+	id, err := s.o.db.CreateResourceGroup(name, channel, "")
 	if err != nil {
 		if errors.Is(err, store.ErrConflict) {
 			writeJSON(w, 409, errBody(409, "同名分组已存在", "conflict").Body)
@@ -1574,6 +1646,21 @@ func (s *Server) adminPortalCreateGroup(w http.ResponseWriter, r *http.Request) 
 
 func (s *Server) adminPortalGroupModels(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	groups, lookupErr := s.o.db.ListResourceGroups()
+	if lookupErr != nil {
+		writeAPIErr(w, errBody(503, "查询失败", "server_error"))
+		return
+	}
+	channel := ""
+	for _, g := range groups {
+		if g.ID == id {
+			channel = g.Provider
+		}
+	}
+	if channel == "" {
+		writeAPIErr(w, errBody(404, "共享池不存在", "not_found"))
+		return
+	}
 	body, _ := readJSON(r)
 	arr, valid := body["allowed_models"].([]any)
 	if !valid {
@@ -1589,8 +1676,8 @@ func (s *Server) adminPortalGroupModels(w http.ResponseWriter, r *http.Request) 
 		}
 		if m = strings.TrimSpace(m); m != "" {
 			m = s.o.resolveModel(m)
-			if m == "auto" || strings.Contains(m, "/") {
-				writeAPIErr(w, errBody(400, "共享模型需指定具体的 WorkBuddy 模型，不能使用 auto 或其他渠道", "invalid_request_error"))
+			if m == "auto" || (channel == "trae" && !strings.HasPrefix(m, "trae/")) || (channel == "workbuddy" && strings.Contains(m, "/")) {
+				writeAPIErr(w, errBody(400, "请选择该共享池渠道的具体模型", "invalid_request_error"))
 				return
 			}
 			models = append(models, m)
@@ -1633,11 +1720,30 @@ func (s *Server) adminPortalGroupAccounts(w http.ResponseWriter, r *http.Request
 	switch action {
 	case "add":
 		c, checkErr := s.o.db.ContributionByAccount(uid)
-		valid := checkErr == nil && c != nil && c.Status == "active" && c.Provider == "workbuddy"
+		valid := checkErr == nil && c != nil && c.Status == "active" && (c.Provider == "workbuddy" || c.Provider == "trae")
+		channel := ""
+		if c != nil {
+			channel = c.Provider
+		}
 		if checkErr == nil && c == nil {
 			modes, e := s.o.db.PlatformSharingModes()
 			valid = e == nil && (modes[uid] == "shared" || modes[uid] == "both")
+			if row, e := s.o.db.GetAccount(uid); e == nil && row != nil {
+				channel = str2(row["provider"])
+			} else {
+				valid = false
+			}
 		}
+		groups, e := s.o.db.ListResourceGroups()
+		matched := false
+		if e == nil {
+			for _, g := range groups {
+				if g.ID == id && g.Provider == channel {
+					matched = true
+				}
+			}
+		}
+		valid = valid && matched
 		if !valid {
 			writeAPIErr(w, errBody(400, "仅可加入有效的 WorkBuddy 共享贡献账户", "invalid_request_error"))
 			return

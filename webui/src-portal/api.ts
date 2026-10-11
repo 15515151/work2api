@@ -18,7 +18,10 @@ async function call<T>(method: string, path: string, body?: unknown): Promise<T>
     })
     const data = await res.json().catch(() => null)
     if (!res.ok) {
-      const msg = (data as any)?.error?.message || (data as any)?.message || `请求失败（${res.status}）`
+      const fallback = data === null && res.status >= 500
+        ? `服务返回非 JSON 错误（${res.status}），请管理员检查反代、隧道与服务日志`
+        : `请求失败（${res.status}）`
+      const msg = (data as any)?.error?.message || (data as any)?.message || fallback
       const rawRetry = res.headers.get('Retry-After') || ''
       const retry = /^\d+$/.test(rawRetry) ? Number(rawRetry) : Math.max(0, (Date.parse(rawRetry) - Date.now()) / 1000)
       if (res.status === 401 && !path.includes('/auth/')) window.dispatchEvent(new Event('portal-session-expired'))
@@ -47,8 +50,21 @@ export interface PortalModel {
   name?: string
   context_length?: number
   max_output_tokens?: number
-  vision?: boolean
-  reasoning?: { supportsReasoning?: boolean }
+  vision?: boolean | null
+  vision_verified?: boolean
+  reasoning?: { supportsReasoning?: boolean } | boolean
+  is_reasoning?: boolean
+  supportsToolCall?: boolean
+  tool_call?: boolean
+  tool_response_multimodal?: boolean
+  structured_output?: boolean
+  max_input_tokens?: number
+  price_factor?: number | null
+  input_cost?: number
+  output_cost?: number
+  pricing_unit?: string
+  pricing_tier?: string
+  catalog_stale?: boolean
   own_account: boolean
   shared_pool: boolean
 }
@@ -98,6 +114,10 @@ export const api = {
   contributions: () => call<{ contributions: ContributionInfo[] }>('GET', '/portal/api/contributions'),
   contributionBegin: (site: string, accepted: boolean) =>
     call<{ task_id: string; auth_url: string; site: string; expires_at: number }>('POST', '/portal/api/contributions/begin', { site, accepted }),
+	traeBegin: (product:string,accepted:boolean) => call<{task_id:string;auth_url:string;expires_at:number}>('POST','/portal/api/providers/trae/oauth/begin',{product,accepted}),
+	traePoll: (task_id:string) => call<{status:string;message?:string;account_uid_masked?:string;models_verified?:boolean}>('POST','/portal/api/providers/trae/oauth/poll',{task_id}),
+	traeComplete: (task_id:string,callback_url:string) => call('POST','/portal/api/providers/trae/oauth/complete',{task_id,callback_url}),
+	traeCancel: (task_id:string) => call('POST','/portal/api/providers/trae/oauth/cancel',{task_id}),
   contributionPoll: (task_id: string) =>
     call<{ status: 'pending' | 'ready' | 'failed' | 'expired'; message?: string; account_uid_masked?: string; models_verified?: boolean }>(
       'POST',

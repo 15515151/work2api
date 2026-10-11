@@ -145,6 +145,12 @@ type OAuthRuntime interface {
 	OAuthPoll(loginID string) (map[string]any, error)
 }
 
+// OAuthCallbackRuntime supports remote deployments where the provider redirects
+// the browser to loopback: authenticated managers submit that exact callback.
+type OAuthCallbackRuntime interface {
+	OAuthComplete(loginID, callback string) error
+}
+
 // AccountManager is an optional capability: a runtime that supports per-account
 // management actions (matching workbuddy's activate/rename/delete). Each returns
 // an error the caller surfaces; unsupported actions may return an error.

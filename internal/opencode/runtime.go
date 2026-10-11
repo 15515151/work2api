@@ -196,26 +196,44 @@ func (rt *Runtime) Models(ctx context.Context) []provider.CatalogModel {
 		return nil
 	}
 	routes, snapshot := rt.catalog.AvailableModels(rt.zenNodes.Len() > 0, rt.goNodes.Len() > 0, rt.cfg.Anonymous)
+	pricingSnapshot := rt.pricing.Snapshot()
 	out := make([]provider.CatalogModel, 0, len(routes))
 	for _, route := range routes {
 		md := rt.catalog.MetadataForTier(route.ID, route.Tier)
 		decision := rt.catalog.anonymousDecision(route.ID)
 		extra := map[string]any{
-			"catalog_source":  snapshot.CacheSource,
-			"catalog_stale":   snapshot.Stale,
-			"free":            decision.Allowed,
-			"tier":            string(route.Tier),
-			"native_protocol": string(route.Protocol),
-			"reasoning":       md.Reasoning,
-			"tool_call":       md.ToolCall,
-			"anonymous":       route.Anonymous,
-			"pricing_known":   decision.Known,
+			"catalog_source":    snapshot.CacheSource,
+			"catalog_stale":     snapshot.Stale,
+			"free":              decision.Allowed,
+			"tier":              string(route.Tier),
+			"native_protocol":   string(route.Protocol),
+			"reasoning":         md.Reasoning,
+			"tool_call":         md.ToolCall,
+			"structured_output": md.StructuredOutput,
+			"input_modalities":  md.InputModalities,
+			"output_modalities": md.OutputModalities,
+			"max_input_tokens":  md.MaxInput,
+			"pricing_source":    "models.dev",
+			"pricing_unit":      "USD_per_million_tokens",
+			"pricing_tier":      "zen",
+			"anonymous":         route.Anonymous,
+			"pricing_known":     decision.Known,
 		}
 		if decision.InputCost != nil {
 			extra["input_cost"] = *decision.InputCost
 		}
 		if decision.OutputCost != nil {
 			extra["output_cost"] = *decision.OutputCost
+		}
+		extra["pricing_updated_at"] = pricingSnapshot.UpdatedAt
+		extra["pricing_stale"] = pricingSnapshot.Stale
+		if price, exists := rt.pricing.Price(route.ID); exists && price.SourceTier == TierZen {
+			if price.CacheRead != nil {
+				extra["cache_read_cost"] = *price.CacheRead
+			}
+			if price.CacheWrite != nil {
+				extra["cache_write_cost"] = *price.CacheWrite
+			}
 		}
 		out = append(out, provider.CatalogModel{
 			ID:         runtimePrefix + route.ID,

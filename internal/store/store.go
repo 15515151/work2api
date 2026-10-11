@@ -47,6 +47,8 @@ type DB struct {
 
 // DefaultSettings mirror db.py DEFAULT_SETTINGS.
 var DefaultSettings = map[string]string{
+	"trae_auto_quota":         "0",
+	"trae_auto_checkin":       "0",
 	"checkin_hours":           "9,21",
 	"qoder_auto_checkin":      "0",
 	"qoder_auto_quota":        "0",

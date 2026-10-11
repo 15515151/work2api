@@ -106,7 +106,7 @@ const loadingModels = ref(false)
 const unrestricted = ref(true)
 const catalogModels = computed(() => {
   const byId = new Map(allModels.value.map((m) => [m.id, m]))
-  for (const id of selected.value) if (!byId.has(id)) byId.set(id, { id, name: '已保存，当前目录未发现', provider: id.startsWith('qoder/') ? 'qoder' : id.startsWith('opencode/') ? 'opencode' : 'workbuddy' })
+  for (const id of selected.value) if (!byId.has(id)) byId.set(id, { id, name: '已保存，当前目录未发现', provider: id.startsWith('qoder/') ? 'qoder' : id.startsWith('opencode/') ? 'opencode' : id.startsWith('trae/') ? 'trae' : 'workbuddy' })
   return [...byId.values()].sort((a, b) => (a.provider || 'workbuddy').localeCompare(b.provider || 'workbuddy') || a.id.localeCompare(b.id))
 })
 

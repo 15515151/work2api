@@ -286,7 +286,7 @@ func (s *Server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 		Path:     "/",
 		MaxAge:   int(sessionTTL.Seconds()),
 		HttpOnly: true,
-		Secure:   r.TLS != nil || s.o.cfg.AdminCookieSecure,
+		Secure:   s.browserCookieSecure(r),
 		SameSite: http.SameSiteLaxMode,
 	})
 	writeJSON(w, 200, map[string]any{"ok": true, "must_change_password": temporary})
@@ -300,7 +300,7 @@ func (s *Server) handleAdminLogout(w http.ResponseWriter, r *http.Request) {
 	}
 	http.SetCookie(w, &http.Cookie{
 		Name: cookieName, Value: "", Path: "/", MaxAge: -1,
-		HttpOnly: true, Secure: r.TLS != nil || s.o.cfg.AdminCookieSecure, SameSite: http.SameSiteLaxMode,
+		HttpOnly: true, Secure: s.browserCookieSecure(r), SameSite: http.SameSiteLaxMode,
 	})
 	writeJSON(w, 200, map[string]any{"ok": true})
 }

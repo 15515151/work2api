@@ -3,7 +3,7 @@
 export interface AccountInfo {
   uid: string
   /** 上游供应商：workbuddy / qoder */
-  provider?: 'workbuddy' | 'qoder'
+  provider?: 'workbuddy' | 'qoder' | 'opencode' | 'trae'
   /** Qoder 登录方式；WorkBuddy 固定为 workbuddy。 */
   auth_mode?: 'oauth' | 'pat' | 'workbuddy'
   enabled: boolean
@@ -96,7 +96,7 @@ export interface AABenchmark {
 export interface ModelInfo {
   id: string
   /** 模型所属供应商。 */
-  provider?: 'workbuddy' | 'qoder' | 'opencode'
+  provider?: 'workbuddy' | 'qoder' | 'opencode' | 'trae'
   owned_by?: string
   name?: string
   context_length?: number
@@ -249,6 +249,7 @@ export interface UsageRecord {
 }
 
 export interface Overview {
+  display_accounts?: AccountInfo[]
   call_metrics?: { recent?: { request_id: string; attempts: number; http_status: number; attempt_stages?: { number: number; header_wait_ms: number; http_status: number; headers_finished: boolean }[] }[]; requests: number; errors: number; incomplete: number; attempts: number; upstream_429: number; wait_p95_ms: number | null; queue_p95_ms: number | null; account_wait_p95_ms: number | null; execution_p95_ms: number | null; first_byte_p95_ms: number | null; total_p95_ms: number | null }
   admission?: { waiting_reasons?: Record<string, number>; memory_pressure?: boolean; buffer_reserved_bytes?: number; buffer_budget_bytes?: number; shared_running?: number; shared_capacity?: number; account_running?: Record<string,number>; account_capacity?: number; running: number; queued: number; capacity: number; queue_capacity: number; oldest_wait_ms: number; wait_limit_ms: number; rejected: Record<string,number> }
   request_body_bytes?: number

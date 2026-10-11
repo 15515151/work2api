@@ -23,6 +23,7 @@ type Config struct {
 	DBPath                 string // SQLite file path
 	AdminToken             string // admin/WebUI auth; empty => loopback-only
 	AdminCookieSecure      bool   // force Secure cookies behind a TLS-terminating proxy
+	AdminCookieSecureAuto  bool   // automatic policy permits genuine loopback HTTP access
 	TrustedProxyCIDRs      string // explicit peers permitted to supply overwritten X-Real-IP
 	MaxRequestBytes        int64
 	ModelMemoryGuard       bool
@@ -133,6 +134,8 @@ func Load(args []string) *Config {
 			explicitPort = true
 		}
 	})
+	allowExternalHost, _ := deploymentBoolEnv("ALLOW_EXTERNAL_HOST", *adminToken != "")
+	cookieSecure, cookieExplicit := deploymentBoolEnv("ADMIN_COOKIE_SECURE", *adminToken != "" || allowExternalHost)
 	memoryGuard, _ := deploymentBoolEnv("MODEL_MEMORY_GUARD", false)
 	requestLimit := int64(positiveEnvInt("MAX_REQUEST_BYTES", DefaultMaxRequestBytes))
 	responseLimit := int64(positiveEnvInt("MAX_RESPONSE_BYTES", 8<<20))
@@ -148,7 +151,8 @@ func Load(args []string) *Config {
 		DataDir:                dd,
 		DBPath:                 dbp,
 		AdminToken:             *adminToken,
-		AdminCookieSecure:      boolEnv("ADMIN_COOKIE_SECURE", boolEnv("ALLOW_EXTERNAL_HOST", false)),
+		AdminCookieSecure:      cookieSecure,
+		AdminCookieSecureAuto:  !cookieExplicit,
 		TrustedProxyCIDRs:      envOr("TRUSTED_PROXY_CIDRS", ""),
 		MaxRequestBytes:        requestLimit,
 		ModelMemoryGuard:       memoryGuard,
@@ -184,7 +188,7 @@ func Load(args []string) *Config {
 		PortalKeyMaxPerUser:         positiveEnvInt("PORTAL_KEY_MAX_PER_USER", 2),
 		PortalEnabled:               boolEnv("PORTAL_ENABLED", true),
 
-		AllowExternalHost:     boolEnv("ALLOW_EXTERNAL_HOST", false),
+		AllowExternalHost:     allowExternalHost,
 		ChannelIdentityCompat: boolEnv("CHANNEL_IDENTITY_COMPAT", true),
 		ChannelMetadataCompat: boolEnv("CHANNEL_METADATA_COMPAT", true),
 		OptimizeContext:       boolEnv("OPTIMIZE_CONTEXT", false),

@@ -249,7 +249,7 @@ onMounted(load)
       </WCard>
 
       <!-- 凭证导出 -->
-      <WCard title="凭证导出" sub="把当前全部渠道凭证（workbuddy 会话 / qoder 账号 / opencode 密钥）打包下载，用于迁移到其他项目或部署。">
+      <WCard title="凭证导出" sub="把当前全部渠道的凭证打包下载；用户归属与共享权限需通过完整备份迁移。">
         <div class="flex items-center gap-3">
           <WButton variant="subtle" :loading="exporting" @click="exportCreds"><span>导出凭证</span></WButton>
           <span class="text-small text-muted">文件包含明文密钥，请妥善保管，不要提交到仓库。</span>

@@ -30,6 +30,8 @@ type Price struct {
 	ID         string               `json:"id"`
 	Input      *float64             `json:"input_cost,omitempty"`
 	Output     *float64             `json:"output_cost,omitempty"`
+	CacheRead  *float64             `json:"cache_read_cost,omitempty"`
+	CacheWrite *float64             `json:"cache_write_cost,omitempty"`
 	SourceTier Tier                 `json:"source_tier,omitempty"`
 	Limits     map[Tier]ModelLimits `json:"limits,omitempty"`
 	Deprecated bool                 `json:"deprecated"`
@@ -342,7 +344,7 @@ func decodeModelsDev(data []byte) (map[string]Price, error) {
 			limit := jsonutil.MapAt(model, "limit")
 			price, exists := result[modelID]
 			if !exists || price.SourceTier == TierGo && tier == TierZen {
-				price = Price{ID: modelID, Input: numberPointer(cost, "input"), Output: numberPointer(cost, "output"), Deprecated: metadataDeprecated(model), SourceTier: tier, Limits: price.Limits}
+				price = Price{ID: modelID, Input: numberPointer(cost, "input"), Output: numberPointer(cost, "output"), CacheRead: numberPointer(cost, "cache_read"), CacheWrite: numberPointer(cost, "cache_write"), Deprecated: metadataDeprecated(model), SourceTier: tier, Limits: price.Limits}
 			}
 			if price.Limits == nil {
 				price.Limits = make(map[Tier]ModelLimits)

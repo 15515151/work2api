@@ -10,6 +10,13 @@ const loading = ref(false)
 const error = ref('')
 const source = ref('')
 const filtered = computed(() => models.value.filter(m => `${m.id} ${m.name || ''}`.toLowerCase().includes(query.value.trim().toLowerCase())))
+const supportsReasoning = (m: PortalModel) => m.reasoning === true || typeof m.reasoning === 'object' && m.reasoning?.supportsReasoning === true || m.is_reasoning === true
+function priceLabel(m: PortalModel): string {
+  const valid = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v) && v >= 0
+  if (m.pricing_unit === 'relative_multiplier' && valid(m.price_factor)) return `相对成本 ×${m.price_factor}`
+  if (m.pricing_unit === 'USD_per_million_tokens' && valid(m.input_cost) && valid(m.output_cost)) return `Zen参考价：输入 $${m.input_cost} / 输出 $${m.output_cost}（每百万 tokens）`
+  return ''
+}
 async function load() {
   if (loading.value) return
   loading.value = true
@@ -40,12 +47,19 @@ onMounted(load)
           <span v-if="model.own_account" class="rounded bg-live/12 px-2 py-1 text-live">本人账号</span>
           <span v-if="model.shared_pool" class="rounded bg-brand/12 px-2 py-1 text-brand">共享池授权</span>
           <span v-if="model.vision" class="rounded bg-elevated px-2 py-1 text-muted">图片输入</span>
-          <span v-if="model.reasoning?.supportsReasoning" class="rounded bg-elevated px-2 py-1 text-muted">支持思考</span>
+          <span v-else-if="model.vision_verified === false" class="rounded bg-elevated px-2 py-1 text-muted">图片能力待确认</span>
+          <span v-if="supportsReasoning(model)" class="rounded bg-elevated px-2 py-1 text-muted">支持思考</span>
+          <span v-if="model.supportsToolCall === true || model.tool_call === true" class="rounded bg-elevated px-2 py-1 text-muted">工具调用</span>
+          <span v-if="model.tool_response_multimodal === true" class="rounded bg-elevated px-2 py-1 text-muted">工具结果图片</span>
+          <span v-if="model.structured_output === true" class="rounded bg-elevated px-2 py-1 text-muted">上游支持结构化输出</span>
+          <span v-if="model.catalog_stale" class="rounded bg-warn/12 px-2 py-1 text-warn">目录缓存过期</span>
         </div>
         <div class="mt-4 flex flex-wrap gap-x-5 gap-y-1 text-micro text-muted">
           <span>上下文 {{ fmtTokens(model.context_length || null) }}</span>
           <span>最大输出 {{ fmtTokens(model.max_output_tokens || null) }}</span>
+          <span v-if="model.max_input_tokens">最大输入 {{ fmtTokens(model.max_input_tokens) }}</span>
         </div>
+        <p v-if="priceLabel(model)" class="mt-3 break-words text-micro leading-relaxed text-faint">{{ priceLabel(model) }}；实际扣费以渠道为准。</p>
       </article>
     </div>
   </div>

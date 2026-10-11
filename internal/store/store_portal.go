@@ -454,7 +454,7 @@ func (d *DB) HasActiveContribution(userID int64) (bool, error) {
 func (d *DB) OwnedAccountUIDs(userID int64) (map[string]bool, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	rows, err := d.db.Query("SELECT account_uid FROM contributions WHERE user_id=? AND provider='workbuddy' AND status IN ('active','private')", userID)
+	rows, err := d.db.Query("SELECT account_uid FROM contributions WHERE user_id=? AND provider IN ('workbuddy','trae') AND status IN ('active','private')", userID)
 	if err != nil {
 		return nil, err
 	}
@@ -776,9 +776,9 @@ func (d *DB) GrantedGroups(userID int64) ([]ResourceGroup, error) {
 	rows, err := d.db.Query(
 		`SELECT rg.id,rg.name,rg.provider,rg.allowed_models,rg.enabled,rg.created_at FROM resource_groups rg
  WHERE (EXISTS(SELECT 1 FROM user_group_grants g WHERE g.group_id=rg.id AND g.user_id=?)
- OR (rg.provider='workbuddy' AND rg.id=CAST((SELECT value FROM settings WHERE key='portal_default_group') AS INTEGER)
+ OR (rg.provider IN ('workbuddy','trae') AND rg.id=CAST((SELECT value FROM settings WHERE key='portal_default_group') AS INTEGER)
  AND (SELECT value FROM settings WHERE key='portal_default_auto_grant')='1'
- AND EXISTS(SELECT 1 FROM contributions WHERE user_id=? AND provider='workbuddy' AND status='active')))
+ AND EXISTS(SELECT 1 FROM contributions WHERE user_id=? AND provider=rg.provider AND status='active')))
  AND NOT EXISTS(SELECT 1 FROM user_group_denials deny WHERE deny.user_id=? AND deny.group_id=rg.id) ORDER BY rg.id`, userID, userID, userID)
 	if err != nil {
 		return nil, err
@@ -886,8 +886,8 @@ func (d *DB) GroupUserIDs(groupID int64) ([]int64, error) {
  (EXISTS(SELECT 1 FROM user_group_grants g WHERE g.group_id=? AND g.user_id=u.id)
  OR (u.status='active' AND ?=CAST((SELECT value FROM settings WHERE key='portal_default_group') AS INTEGER)
  AND (SELECT value FROM settings WHERE key='portal_default_auto_grant')='1'
- AND EXISTS(SELECT 1 FROM contributions c WHERE c.user_id=u.id AND c.provider='workbuddy' AND c.status='active')))
- AND NOT EXISTS(SELECT 1 FROM user_group_denials deny WHERE deny.group_id=? AND deny.user_id=u.id) ORDER BY u.id`, groupID, groupID, groupID)
+ AND EXISTS(SELECT 1 FROM contributions c WHERE c.user_id=u.id AND c.provider=(SELECT provider FROM resource_groups WHERE id=?) AND c.status='active')))
+ AND NOT EXISTS(SELECT 1 FROM user_group_denials deny WHERE deny.group_id=? AND deny.user_id=u.id) ORDER BY u.id`, groupID, groupID, groupID, groupID)
 	if err != nil {
 		return nil, err
 	}
@@ -916,8 +916,8 @@ func (d *DB) groupAccountUIDs(groupID int64, active bool) ([]string, error) {
 		q = `SELECT ga.account_uid FROM group_accounts ga JOIN resource_groups rg ON rg.id=ga.group_id
  WHERE ga.group_id=? AND rg.enabled=1 AND
  (EXISTS(SELECT 1 FROM contributions c WHERE c.account_uid=ga.account_uid AND c.status='active' AND c.provider=rg.provider)
- OR (rg.provider='workbuddy' AND NOT EXISTS(SELECT 1 FROM contributions c WHERE c.account_uid=ga.account_uid)
- AND EXISTS(SELECT 1 FROM platform_account_sharing ps JOIN accounts a ON a.uid=ps.account_uid WHERE ps.account_uid=ga.account_uid AND ps.mode IN ('shared','both') AND a.provider='workbuddy')))
+ OR (rg.provider IN ('workbuddy','trae') AND NOT EXISTS(SELECT 1 FROM contributions c WHERE c.account_uid=ga.account_uid)
+ AND EXISTS(SELECT 1 FROM platform_account_sharing ps JOIN accounts a ON a.uid=ps.account_uid WHERE ps.account_uid=ga.account_uid AND ps.mode IN ('shared','both') AND a.provider=rg.provider)))
  ORDER BY ga.account_uid`
 	}
 	rows, err := d.db.Query(q, groupID)
@@ -1101,14 +1101,14 @@ func (d *DB) SetPlatformAccountSharing(uid, mode string, groupIDs []int64) error
 	}
 	defer tx.Rollback()
 	var valid bool
-	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM accounts a WHERE a.uid=? AND a.provider='workbuddy' AND NOT EXISTS(SELECT 1 FROM contributions c WHERE c.account_uid=a.uid))`, uid).Scan(&valid); err != nil {
+	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM accounts a WHERE a.uid=? AND a.provider IN ('workbuddy','trae') AND NOT EXISTS(SELECT 1 FROM contributions c WHERE c.account_uid=a.uid))`, uid).Scan(&valid); err != nil {
 		return err
 	}
 	if !valid {
 		return errors.New("仅可转换平台所属的 WorkBuddy 账号，不能更改用户账号归属")
 	}
 	for _, id := range groupIDs {
-		if err := tx.QueryRow("SELECT EXISTS(SELECT 1 FROM resource_groups WHERE id=? AND provider='workbuddy')", id).Scan(&valid); err != nil {
+		if err := tx.QueryRow("SELECT EXISTS(SELECT 1 FROM resource_groups WHERE id=? AND provider=(SELECT provider FROM accounts WHERE uid=?))", id, uid).Scan(&valid); err != nil {
 			return err
 		}
 		if !valid {
@@ -1142,7 +1142,7 @@ func (d *DB) SetDefaultPortalGroup(id int64, autoGrant bool) error {
 	defer tx.Rollback()
 	if id > 0 {
 		var valid bool
-		if err := tx.QueryRow("SELECT EXISTS(SELECT 1 FROM resource_groups WHERE id=? AND provider='workbuddy')", id).Scan(&valid); err != nil {
+		if err := tx.QueryRow("SELECT EXISTS(SELECT 1 FROM resource_groups WHERE id=? AND provider IN ('workbuddy','trae'))", id).Scan(&valid); err != nil {
 			return err
 		}
 		if !valid {
@@ -1159,7 +1159,7 @@ func (d *DB) SetDefaultPortalGroup(id int64, autoGrant bool) error {
 		}
 	}
 	if id > 0 {
-		if _, err := tx.Exec(`INSERT OR IGNORE INTO group_accounts(group_id,account_uid) SELECT ?,account_uid FROM contributions WHERE status='active' AND provider='workbuddy'`, id); err != nil {
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO group_accounts(group_id,account_uid) SELECT ?,account_uid FROM contributions WHERE status='active' AND provider=(SELECT provider FROM resource_groups WHERE id=?)`, id, id); err != nil {
 			return err
 		}
 	}

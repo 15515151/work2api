@@ -277,6 +277,9 @@ func TestExtractModelsReadsIsVL(t *testing.T) {
 	if models[1].IsVL {
 		t.Fatal("is_vl=false 的条目 IsVL 应为 false")
 	}
+	if models[0].PriceFactor == nil || *models[0].PriceFactor != 0.1 || models[1].PriceFactor != nil {
+		t.Fatal("价格倍率必须区分实际数值与缺失字段")
+	}
 }
 
 // 带 tool_calls 的 assistant content=null → content=""（上游拒 null，实测 "" 即 200）

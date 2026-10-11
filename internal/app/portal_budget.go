@@ -35,7 +35,7 @@ func (s *Server) refreshPortalRequest(w http.ResponseWriter, r *http.Request, p 
 		if admittedModel != "" && fresh.EffectiveModel != admittedModel {
 			return errBody(403, "模型映射已改变，请重新发起请求", "model_not_allowed")
 		}
-		if actualModel != "" && s.o.resolveModel(strOr(payload["model"], "")) != actualModel {
+		if actualModel != "" && s.o.resolveModel(strOr(payload["model"], "")) != s.o.resolveModel(actualModel) {
 			return errBody(403, "模型映射已改变，请重新发起请求", "model_not_allowed")
 		}
 		if fresh.UserID > 0 && uid != "" && !fresh.AccountScope[uid] {
