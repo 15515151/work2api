@@ -1,9 +1,57 @@
 package reasoning
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 )
+
+func TestRepairToolHistoryMatchesOnlyExactIDs(t *testing.T) {
+	call := func(id, name string) any {
+		return map[string]any{"id": id, "type": "function", "function": map[string]any{"name": name, "arguments": `{}`}}
+	}
+	assistant := map[string]any{"role": "assistant", "content": "Keep explanation", "tool_calls": []any{call("read", "read_file"), call("bad", ""), call("", "shell"), call("exec", "shell")}}
+	orphan := map[string]any{"role": "tool", "tool_call_id": "bad", "content": "NOT A SHELL RESULT"}
+	exec := map[string]any{"role": "tool", "tool_call_id": "exec", "content": "shell output"}
+	read := map[string]any{"role": "tool", "tool_call_id": "read", "content": "file output"}
+	body := Body{"messages": []any{assistant, orphan, exec, read, map[string]any{"role": "user", "content": "continue"}}}
+	want := []any{map[string]any{"role": "assistant", "content": "Keep explanation", "tool_calls": []any{call("read", "read_file"), call("exec", "shell")}}, exec, read, map[string]any{"role": "user", "content": "continue"}}
+	RepairToolSequence(body)
+	if !reflect.DeepEqual(body["messages"], want) {
+		t.Fatalf("history = %#v", body["messages"])
+	}
+	if len(assistant["tool_calls"].([]any)) != 4 || orphan["tool_call_id"] != "bad" {
+		t.Fatal("repair mutated original call or result")
+	}
+	RepairToolSequence(body)
+	if !reflect.DeepEqual(body["messages"], want) {
+		t.Fatal("repair is not idempotent")
+	}
+}
+
+func TestRepairToolHistoryDoesNotGuessMissingResults(t *testing.T) {
+	assistant := map[string]any{"role": "assistant", "tool_calls": []any{map[string]any{"id": "real", "function": map[string]any{"name": "read", "arguments": `{}`}}}}
+	for _, id := range []string{"wrong", ""} {
+		body := Body{"messages": []any{assistant, map[string]any{"role": "tool", "tool_call_id": id, "content": "unrelated secret"}}}
+		RepairToolSequence(body)
+		messages := body["messages"].([]any)
+		if len(messages) != 2 || messages[1].(map[string]any)["tool_call_id"] != "real" || strings.Contains(messages[1].(map[string]any)["content"].(string), "secret") {
+			t.Fatalf("unmatched result was misassigned: %#v", messages)
+		}
+	}
+	for _, content := range []any{nil, "", "preserve assistant text", []any{map[string]any{"type": "text", "text": "preserve block"}}} {
+		body := Body{"messages": []any{map[string]any{"role": "assistant", "content": content, "tool_calls": []any{map[string]any{"id": "bad"}}}}}
+		RepairToolSequence(body)
+		messages := body["messages"].([]any)
+		if content == nil || content == "" {
+			if len(messages) != 0 {
+				t.Fatal("empty invalid shell retained")
+			}
+		} else if len(messages) != 1 || !reflect.DeepEqual(messages[0].(map[string]any)["content"], content) {
+			t.Fatal("assistant content lost")
+		}
+	}
+}
 
 func eff(model, req string, supported []string) string {
 	body := Body{"model": model, "reasoning_effort": req}

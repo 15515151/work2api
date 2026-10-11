@@ -13,6 +13,11 @@ import (
 // replace an embedded quotation, arbitrary client names, or runtime metadata.
 var codexCLIIntro = regexp.MustCompile(`(?i)^you are a coding agent running in the codex cli(?:, a terminal-based coding assistant)?\.[ \t\r\n]+codex cli is an open source project led by openai\.`)
 
+// A ZCode template replay confirmed that this branch annotation alone triggers
+// 11128, while changing Main to Default lets the complete template pass. Keep
+// the actual branch value and every surrounding instruction intact.
+var mainBranchTemplate = regexp.MustCompile(`(?m)^Main branch \(you will usually use this for PRs\):`)
+
 func CompatibilityName(level int) string {
 	switch level {
 	case 1:
@@ -74,16 +79,20 @@ func BillingPrefix(text string) (prefix, rest string) {
 	return line, ""
 }
 
-// Transform only leading system text. Identity replacement retains every byte
-// after the fixed declaration; level 2 additionally removes client attribution.
+// Transform only leading system text. Replace verified client declarations and
+// the fixed branch annotation; level 2 additionally removes client attribution.
 // Skills, tools, permission rules, user messages and tool results are untouched.
 func ChannelCompatibilityBody(body map[string]any, level int) (map[string]any, bool) {
-	identityChanged, metadataChanged := false, false
+	templateChanged, metadataChanged := false, false
 	transform := func(text string) string {
 		prefix, rest := BillingPrefix(text)
 		padding := rest[:len(rest)-len(strings.TrimLeft(rest, "\r\n"))]
 		value, changed := CompatibleIdentity(strings.TrimLeft(rest, "\r\n"))
-		identityChanged = identityChanged || changed
+		if mainBranchTemplate.MatchString(value) {
+			value = mainBranchTemplate.ReplaceAllString(value, "Default branch (you will usually use this for PRs):")
+			changed = true
+		}
+		templateChanged = templateChanged || changed
 		if level == 2 && prefix != "" {
 			metadataChanged = true
 			prefix = ""
@@ -130,7 +139,7 @@ func ChannelCompatibilityBody(body map[string]any, level int) (map[string]any, b
 		copyMessage["content"] = content
 		copyMessages[i] = copyMessage
 	}
-	if level == 1 && !identityChanged || level == 2 && !metadataChanged {
+	if level == 1 && !templateChanged || level == 2 && !metadataChanged {
 		return body, false
 	}
 	out := make(map[string]any, len(body))

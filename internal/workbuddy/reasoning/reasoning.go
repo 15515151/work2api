@@ -257,25 +257,22 @@ func RepairToolSequence(body Body) Body {
 	var pendingIDs []string
 	var consumed []bool
 	byID := map[string][]int{}
-	firstPending, pendingCount := 0, 0
+	pendingCount := 0
 	resetPending := func() {
 		pendingIDs, consumed = nil, nil
 		byID = map[string][]int{}
-		firstPending, pendingCount = 0, 0
+		pendingCount = 0
 	}
 	consume := func(idx int) {
 		consumed[idx] = true
 		pendingCount--
 		id := pendingIDs[idx]
 		positions := byID[id]
-		// The matched node or fallback is always this ID's earliest live node.
+		// Consume only the result with this call's exact ID.
 		if len(positions) <= 1 {
 			delete(byID, id)
 		} else {
 			byID[id] = positions[1:]
-		}
-		for firstPending < len(consumed) && consumed[firstPending] {
-			firstPending++
 		}
 	}
 	var userBuffer []any
@@ -307,6 +304,38 @@ func RepairToolSequence(body Body) Body {
 		role, _ := msg["role"].(string)
 		switch role {
 		case "assistant":
+			if calls, ok := msg["tool_calls"].([]any); ok {
+				kept := make([]any, 0, len(calls))
+				for _, rawCall := range calls {
+					call, ok := rawCall.(map[string]any)
+					if !ok {
+						continue
+					}
+					id, _ := call["id"].(string)
+					fn, _ := call["function"].(map[string]any)
+					name, _ := fn["name"].(string)
+					typ, _ := call["type"].(string)
+					if strings.TrimSpace(id) == "" || strings.TrimSpace(name) == "" || (typ != "" && typ != "function") {
+						continue
+					}
+					kept = append(kept, call)
+				}
+				if len(kept) != len(calls) {
+					copyMessage := make(map[string]any, len(msg))
+					for key, value := range msg {
+						copyMessage[key] = value
+					}
+					msg = copyMessage
+					if len(kept) > 0 {
+						msg["tool_calls"] = kept
+					} else {
+						delete(msg, "tool_calls")
+						if msg["content"] == nil || msg["content"] == "" {
+							continue
+						}
+					}
+				}
+			}
 			if pendingCount > 0 {
 				out = append(out, missingResults()...)
 			}
@@ -319,9 +348,6 @@ func RepairToolSequence(body Body) Body {
 				for _, c := range calls {
 					if call, ok := c.(map[string]any); ok {
 						id := toStr(call["id"])
-						if id == "" {
-							id = "missing-" + strconv.Itoa(len(pendingIDs))
-						}
 						byID[id] = append(byID[id], len(pendingIDs))
 						pendingIDs = append(pendingIDs, id)
 						consumed = append(consumed, false)
@@ -334,12 +360,8 @@ func RepairToolSequence(body Body) Body {
 			if positions := byID[callID]; len(positions) > 0 {
 				out = append(out, msg)
 				consume(positions[0])
-			} else if pendingCount > 0 {
-				msg["tool_call_id"] = pendingIDs[firstPending]
-				consume(firstPending)
-				out = append(out, msg)
 			} else {
-				log.Printf("丢弃孤立的 tool 结果: tool_call_id=%s", callID)
+				log.Print("丢弃无法匹配有效调用的 tool 结果")
 			}
 		default:
 			if pendingCount > 0 {

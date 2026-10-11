@@ -248,16 +248,26 @@ func (f *channelRetryUpstream) StreamUpstream(_ context.Context, _ map[string]st
 func TestChannelIdentityCompatibilityPreservesCapabilitiesAndBounds(t *testing.T) {
 	const banner = "You are Claude Code, Anthropic's official CLI for Claude."
 	const codexBanner = "You are a coding agent running in the Codex CLI, a terminal-based coding assistant. Codex CLI is an open source project led by OpenAI."
+	const zcodeBranch = "You are ZCode, an interactive coding agent\nMain branch (you will usually use this for PRs): main"
+	const zcodeCompatible = "You are ZCode, an interactive coding agent\nDefault branch (you will usually use this for PRs): main"
 	const tail = "\n### Available skills\nfind-skills: skill://find-skills/SKILL.md\nAvailable agent types for the Agent tool:\nreviewer: read CLAUDE.md\n## MCP Server Instructions\nUse MCP tools only with permission."
 	const denial = `{"code":11128,"msg":"Illegal API invocation from an unapproved channel"}`
 	for _, tc := range []struct {
 		name                              string
 		profile, prompt, errorBody        string
+		wantRewrite                       string
 		disabled, partial, always, revoke bool
 		wantCalls                         int
 		wantCompat                        bool
 	}{
 		{name: "domestic", profile: "cn-cli", prompt: banner + tail, errorBody: denial, wantCalls: 2, wantCompat: true},
+		{name: "zcode branch", profile: "cn-cli", prompt: zcodeBranch + tail, errorBody: denial, wantCalls: 2, wantCompat: true, wantRewrite: zcodeCompatible + tail},
+		{name: "zcode disabled", profile: "cn-cli", prompt: zcodeBranch + tail, errorBody: denial, disabled: true, wantCalls: 2},
+		{name: "zcode international", profile: "intl-cli", prompt: zcodeBranch + tail, errorBody: denial, wantCalls: 2},
+		{name: "zcode content policy", profile: "cn-cli", prompt: zcodeBranch + tail, errorBody: `{"code":11128,"msg":"blocked by security policy"}`, wantCalls: 1},
+		{name: "zcode partial output", profile: "cn-cli", prompt: zcodeBranch + tail, errorBody: denial, partial: true, wantCalls: 1},
+		{name: "zcode persistent denial", profile: "cn-cli", prompt: zcodeBranch + tail, errorBody: denial, always: true, wantCalls: 5, wantCompat: true, wantRewrite: zcodeCompatible + tail},
+		{name: "zcode revoked during retry", profile: "cn-cli", prompt: zcodeBranch + tail, errorBody: denial, revoke: true, wantCalls: 1},
 		{name: "codex domestic", profile: "cn-cli", prompt: codexBanner + tail, errorBody: denial, wantCalls: 2, wantCompat: true},
 		{name: "codex disabled", profile: "cn-cli", prompt: codexBanner + tail, errorBody: denial, disabled: true, wantCalls: 2},
 		{name: "codex international", profile: "intl-cli", prompt: codexBanner + tail, errorBody: denial, wantCalls: 2},
@@ -319,13 +329,16 @@ func TestChannelIdentityCompatibilityPreservesCapabilitiesAndBounds(t *testing.T
 			if client.calls != tc.wantCalls {
 				t.Fatalf("calls=%d, want %d, error=%v", client.calls, tc.wantCalls, err)
 			}
-			if (tc.name == "domestic" || tc.name == "codex domestic") && (err != nil || served.UID != first.UID || o.modelCooldownUntil(first.UID, "test-model") > nowSec() || o.sessions.Lookup("sticky") != first.UID) {
+			if (tc.name == "domestic" || tc.name == "codex domestic" || tc.name == "zcode branch") && (err != nil || served.UID != first.UID || o.modelCooldownUntil(first.UID, "test-model") > nowSec() || o.sessions.Lookup("sticky") != first.UID) {
 				t.Fatal("successful banner compatibility penalized/rotated account", err)
 			}
 			for i, attempt := range client.bodies {
 				expected := tc.prompt
 				if tc.wantCompat && i == 1 {
 					expected = "You are a coding assistant." + tail
+					if tc.wantRewrite != "" {
+						expected = tc.wantRewrite
+					}
 				}
 				if attempt["messages"].([]any)[0].(map[string]any)["content"] != expected {
 					t.Fatal("incorrect identity rewrite", i, attempt)
@@ -414,6 +427,52 @@ func TestChannelIdentityBannerMatchingIsExactAndNonMutating(t *testing.T) {
 	for _, prompt := range []string{"Quote: " + codex, "You are Codex, a coding agent.", strings.Replace(codex, "open source", "proprietary", 1), codex + "example", "You are a coding agent running in the Codex CLI. Follow project instructions."} {
 		if _, matched := channelIdentityCompatBody(map[string]any{"messages": []any{map[string]any{"role": "system", "content": prompt}}}); matched {
 			t.Fatal("unknown or quoted Codex template rewritten", prompt)
+		}
+	}
+}
+
+func TestChannelBranchTemplateCompatibilityPreservesContext(t *testing.T) {
+	const prefix = "You are ZCode, an interactive coding agent\r\nKeep the original authorization and safety policy.\r\n"
+	const branch = "Main branch (you will usually use this for PRs): feature/测试"
+	const tail = "\r\n<system-reminder>Available skills and MCP tools remain available.</system-reminder>"
+	for _, blocks := range []bool{false, true} {
+		var content any = prefix + branch + tail
+		if blocks {
+			content = []any{map[string]any{"type": "text", "text": content, "cache_control": map[string]any{"type": "ephemeral"}}}
+		}
+		body := map[string]any{"messages": []any{
+			map[string]any{"role": "system", "content": content},
+			map[string]any{"role": "user", "content": branch},
+			map[string]any{"role": "tool", "content": branch, "tool_call_id": "tool-1"},
+		}}
+		before, _ := json.Marshal(body)
+		result, matched := channelIdentityCompatBody(body)
+		if !matched {
+			t.Fatal("known branch template not recognized")
+		}
+		messages := result["messages"].([]any)
+		got := messages[0].(map[string]any)["content"]
+		if blocks {
+			block := got.([]any)[0].(map[string]any)
+			if block["cache_control"] == nil {
+				t.Fatal("cache metadata removed")
+			}
+			got = block["text"]
+		}
+		if got != prefix+strings.Replace(branch, "Main branch", "Default branch", 1)+tail || messages[1].(map[string]any)["content"] != branch || messages[2].(map[string]any)["content"] != branch {
+			t.Fatal("branch compatibility changed other instructions or roles")
+		}
+		after, _ := json.Marshal(body)
+		if string(before) != string(after) {
+			t.Fatal("branch compatibility mutated input")
+		}
+		if _, changed := channelIdentityCompatBody(result); changed {
+			t.Fatal("branch compatibility is not idempotent")
+		}
+	}
+	for _, text := range []string{"Quote: " + branch, "> " + branch, "Main branch: main", "Main branch (you will usually use this for PRs elsewhere): main"} {
+		if _, matched := channelIdentityCompatBody(map[string]any{"messages": []any{map[string]any{"role": "system", "content": text}}}); matched {
+			t.Fatal("unknown/quoted branch template changed", text)
 		}
 	}
 }
