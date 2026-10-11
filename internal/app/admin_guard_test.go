@@ -3,10 +3,40 @@ package app
 import (
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 
 	"work2api/internal/config"
 )
+
+func TestAgentCapacityDefaultsFollowRequestSize(t *testing.T) {
+	previousRoot := config.PackageRoot
+	config.PackageRoot = t.TempDir()
+	t.Cleanup(func() { config.PackageRoot = previousRoot })
+	for _, key := range []string{"MAX_REQUEST_BYTES", "REQUEST_BODY_BUDGET", "MODEL_BUFFER_BUDGET_BYTES", "MODEL_MEMORY_GUARD", "MAX_RESPONSE_BYTES", "MAX_CONCURRENT_REQUESTS"} {
+		t.Setenv(key, "")
+		_ = os.Unsetenv(key)
+	}
+	cfg := config.Load(nil)
+	if cfg.MaxRequestBytes != 64<<20 || cfg.RequestBodyBudget != 256<<20 || cfg.ModelMemoryGuard {
+		t.Fatal("ordinary Agent requests retain restrictive defaults")
+	}
+	if cfg.ModelBufferBudgetBytes != 4*cfg.MaxResponseBytes*int64(cfg.MaxConcurrentRequests) {
+		t.Fatal("response budget cannot cover configured execution capacity")
+	}
+	t.Setenv("MAX_REQUEST_BYTES", "134217728")
+	cfg = config.Load(nil)
+	if cfg.RequestBodyBudget != 384<<20 {
+		t.Fatal("body budget did not follow increased single-request limit")
+	}
+	t.Setenv("REQUEST_BODY_BUDGET", "33554432")
+	t.Setenv("MODEL_BUFFER_BUDGET_BYTES", "67108864")
+	t.Setenv("MODEL_MEMORY_GUARD", "true")
+	cfg = config.Load(nil)
+	if cfg.RequestBodyBudget != 32<<20 || cfg.ModelBufferBudgetBytes != 64<<20 || !cfg.ModelMemoryGuard {
+		t.Fatal("operator capacity overrides were ignored")
+	}
+}
 
 // TestAdminGuard locks the /admin/* auth matrix: with a token set, every admin
 // request must carry it; with no token, admin is loopback-only regardless of

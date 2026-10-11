@@ -181,6 +181,44 @@ func TestBodyBudgetChargesCapacityAndRecovers(t *testing.T) {
 	b.release(unknown)
 }
 
+func TestLargeAgentBodyPreservesAuthLimits(t *testing.T) {
+	o, _ := newDNSFailoverOrch(t, &failingUpstream{})
+	o.cfg.MaxRequestBytes = config.DefaultMaxRequestBytes
+	o.cfg.RequestBodyBudget = config.DefaultRequestBodyBudget
+	if _, err := o.db.CreateApp("large-agent", o.hashKey("large-agent-key"), "", "", "", "", 0); err != nil {
+		t.Fatal(err)
+	}
+	s := NewServer(o)
+	payload := `{"model":"test","input":"` + strings.Repeat("x", 20<<20) + `"}`
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil || len(body) != len(payload) {
+			t.Fatal("large body was damaged", err)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	for _, lengthKnown := range []bool{true, false} {
+		r := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(payload))
+		r.Header.Set("Authorization", "Bearer large-agent-key")
+		if !lengthKnown {
+			r.ContentLength = -1
+		}
+		w := httptest.NewRecorder()
+		s.requestGuard(next).ServeHTTP(w, r)
+		if w.Code != http.StatusNoContent || s.bodies.usage() != 0 {
+			t.Fatal("large Agent request rejected or leaked its body budget", w.Code)
+		}
+	}
+	for _, path := range []string{"/admin/login", "/portal/api/auth/login"} {
+		r := httptest.NewRequest(http.MethodPost, path, strings.NewReader(strings.Repeat("x", 9<<10)))
+		w := httptest.NewRecorder()
+		s.requestGuard(next).ServeHTTP(w, r)
+		if w.Code != http.StatusRequestEntityTooLarge {
+			t.Fatal("large authentication request was permitted", path, w.Code)
+		}
+	}
+}
+
 func TestBodyReaderQueueCancellationAndRecovery(t *testing.T) {
 	s := NewServer(&Orchestrator{cfg: &config.Config{BodyReadConcurrency: 1, ModelQueueSize: 1}})
 	s.bodySlots <- struct{}{}

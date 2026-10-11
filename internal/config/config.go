@@ -91,6 +91,9 @@ type Config struct {
 // process CWD.
 var PackageRoot string
 
+const DefaultMaxRequestBytes = 64 << 20
+const DefaultRequestBodyBudget = 256 << 20
+
 func init() {
 	if wd, err := os.Getwd(); err == nil {
 		PackageRoot = wd
@@ -130,6 +133,14 @@ func Load(args []string) *Config {
 			explicitPort = true
 		}
 	})
+	memoryGuard, _ := deploymentBoolEnv("MODEL_MEMORY_GUARD", false)
+	requestLimit := int64(positiveEnvInt("MAX_REQUEST_BYTES", DefaultMaxRequestBytes))
+	responseLimit := int64(positiveEnvInt("MAX_RESPONSE_BYTES", 8<<20))
+	modelConcurrency := positiveEnvInt("MAX_CONCURRENT_REQUESTS", 13)
+	// Cover raw-buffer growth and all configured execution slots without requiring
+	// operators to tune independent byte budgets for ordinary Agent requests.
+	bodyBudget := max(int64(DefaultRequestBodyBudget), 3*requestLimit)
+	responseBudget := 4 * responseLimit * int64(modelConcurrency)
 	return &Config{
 		AllowPortFallback:      !explicitPort,
 		Host:                   *host,
@@ -139,11 +150,11 @@ func Load(args []string) *Config {
 		AdminToken:             *adminToken,
 		AdminCookieSecure:      boolEnv("ADMIN_COOKIE_SECURE", boolEnv("ALLOW_EXTERNAL_HOST", false)),
 		TrustedProxyCIDRs:      envOr("TRUSTED_PROXY_CIDRS", ""),
-		MaxRequestBytes:        int64(positiveEnvInt("MAX_REQUEST_BYTES", 16*1024*1024)),
-		ModelMemoryGuard:       boolEnv("MODEL_MEMORY_GUARD", true),
-		ModelBufferBudgetBytes: int64(positiveEnvInt("MODEL_BUFFER_BUDGET_BYTES", 224<<20)),
+		MaxRequestBytes:        requestLimit,
+		ModelMemoryGuard:       memoryGuard,
+		ModelBufferBudgetBytes: int64(positiveEnvInt("MODEL_BUFFER_BUDGET_BYTES", int(responseBudget))),
 		ModelMemoryHighBytes:   int64(positiveEnvInt("MODEL_MEMORY_HIGH_BYTES", 256<<20)),
-		MaxConcurrentRequests:  positiveEnvInt("MAX_CONCURRENT_REQUESTS", 13),
+		MaxConcurrentRequests:  modelConcurrency,
 		ModelQueueSize:         positiveEnvInt("MODEL_QUEUE_SIZE", 32),
 		ModelQueueWaitSeconds:  positiveEnvInt("MODEL_QUEUE_WAIT_SECONDS", 60),
 		ModelKeyQueueSize:      positiveEnvInt("MODEL_KEY_QUEUE_SIZE", 16),
@@ -152,8 +163,8 @@ func Load(args []string) *Config {
 		HeavyAdminConcurrency:  positiveEnvInt("HEAVY_ADMIN_CONCURRENCY", 2),
 		QueryConcurrency:       positiveEnvInt("QUERY_CONCURRENCY", 4),
 		BodyReadConcurrency:    positiveEnvInt("BODY_READ_CONCURRENCY", 4),
-		RequestBodyBudget:      int64(positiveEnvInt("REQUEST_BODY_BUDGET", 32<<20)),
-		MaxResponseBytes:       int64(positiveEnvInt("MAX_RESPONSE_BYTES", 8<<20)),
+		RequestBodyBudget:      int64(positiveEnvInt("REQUEST_BODY_BUDGET", int(bodyBudget))),
+		MaxResponseBytes:       responseLimit,
 		MaxJSONItems:           positiveEnvInt("MAX_JSON_ITEMS", 100000),
 		MaxJSONDepth:           positiveEnvInt("MAX_JSON_DEPTH", 128),
 		LogLevel:               strings.ToUpper(*logLevel),
@@ -191,6 +202,15 @@ func Load(args []string) *Config {
 		// 主要截断 base64 图片这类撑爆库的大 payload。
 		UsageContentMaxBytes: envInt("USAGE_CONTENT_MAX_BYTES", 32768),
 	}
+}
+
+// Empty optional deployment overrides retain automatic defaults.
+func deploymentBoolEnv(key string, fallback bool) (value, explicit bool) {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return fallback, false
+	}
+	return v != "0" && !strings.EqualFold(v, "false"), true
 }
 
 func positiveEnvInt(k string, def int) int {

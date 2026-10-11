@@ -97,13 +97,13 @@ func newModelAdmission(c *config.Config) *modelAdmission {
 	a.byModel = map[string]int{}
 	a.accountLimit = positiveOr(c.WorkBuddyAccountConcurrency, 4)
 	a.byAccount = map[string]int{}
-	a.bufferBudget = c.ModelBufferBudgetBytes
-	if a.bufferBudget <= 0 {
-		a.bufferBudget = 224 << 20
-	}
 	responseLimit := c.MaxResponseBytes
 	if responseLimit <= 0 {
 		responseLimit = 8 << 20
+	}
+	a.bufferBudget = c.ModelBufferBudgetBytes
+	if a.bufferBudget <= 0 {
+		a.bufferBudget = 4 * responseLimit * int64(a.capacity)
 	}
 	// Reserve enough response budget for one private nonstream request.
 	a.sharedBufferBudget = max(int64(0), a.bufferBudget-4*responseLimit)
