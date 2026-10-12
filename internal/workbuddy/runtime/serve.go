@@ -55,14 +55,18 @@ func (o *Runtime) serveChat(w http.ResponseWriter, r *http.Request, payload map[
 		writeAPIErr(w, aerr)
 		return
 	}
-	input := o.ExtractInputText(body)
+	input := ""
+	if principal.UserID == 0 {
+		input = o.ExtractInputText(body)
+	}
 	effort := UsageReasoningEffort(body)
 	t0 := time.Now()
 
 	if clientStream {
 		usage := map[string]any{}
 		status := "ok"
-		var out, reason strings.Builder
+		out := provider.NewLogCaptureWithPolicy(provider.LogCapturePolicy{Enabled: principal.UserID == 0, Limit: o.cfg.UsageContentMaxBytes})
+		reason := provider.NewLogCaptureWithPolicy(provider.LogCapturePolicy{Enabled: principal.UserID == 0, Limit: o.cfg.UsageContentMaxBytes})
 		var send func(string) error
 		opened := false
 		writeChunk := func(chunk string) error {
@@ -78,19 +82,21 @@ func (o *Runtime) serveChat(w http.ResponseWriter, r *http.Request, payload map[
 		}
 		sentRole := false
 		sink := func(line string) error {
-			clean := SanitizeChatSSEWithRole(line, &sentRole)
+			chunk := upstream.DecodeFrame(r.Context(), line)
+			// Observe the original chunk before sanitization drops empty fields.
+			usage = MergeUsageChunk(chunk, usage)
+			c, rr, finish := DeltaPartsChunk(chunk)
+			clean := SanitizeChatChunkWithRole(line, chunk, &sentRole)
 			if clean != "" {
 				if err := writeChunk(clean + "\n\n"); err != nil {
 					return err
 				}
 			}
-			usage = MergeUsageFromLine(line, usage)
-			c, rr, finish := DeltaParts(line)
 			if finish == "length" || finish == "content_filter" {
 				status = "incomplete"
 			}
-			AppendLogText(&out, c, o.cfg.UsageContentMaxBytes)
-			AppendLogText(&reason, rr, o.cfg.UsageContentMaxBytes)
+			out.WriteString(c)
+			reason.WriteString(rr)
 			return nil
 		}
 		served, err := o.OpenUpstreamScoped(r.Context(), acc, body, model, sessionKey, sink, func(fa *pool.Account, e *upstream.UpstreamError) {
@@ -169,6 +175,7 @@ type converter interface {
 	CompletionStatus() string
 	SetNonstream()
 	FeedLine(string) string
+	FeedChunk(map[string]any) string
 	Finish() string
 	GetNonstreamResponse() map[string]any
 	ToolsSummaryLimited(int) string
@@ -214,7 +221,10 @@ func (o *Runtime) serveConverted(w http.ResponseWriter, r *http.Request, payload
 		writeAPIErr(w, aerr)
 		return
 	}
-	input := o.ExtractInputText(chatBody)
+	input := ""
+	if principal.UserID == 0 {
+		input = o.ExtractInputText(chatBody)
+	}
 	effort := UsageReasoningEffort(chatBody)
 	t0 := time.Now()
 
@@ -245,7 +255,7 @@ func (o *Runtime) serveConverted(w http.ResponseWriter, r *http.Request, payload
 		return send(chunk)
 	}
 	sink := func(line string) error {
-		evt := conv.FeedLine(line)
+		evt := conv.FeedChunk(upstream.DecodeFrame(r.Context(), line))
 		if evt != "" && streamMode {
 			return writeChunk(evt)
 		}
@@ -279,10 +289,12 @@ func (o *Runtime) serveConverted(w http.ResponseWriter, r *http.Request, payload
 		return
 	}
 	var outLog strings.Builder
-	AppendLogText(&outLog, conv.TextContent(), o.cfg.UsageContentMaxBytes)
-	remaining := o.cfg.UsageContentMaxBytes - outLog.Len()
-	if o.cfg.UsageContentMaxBytes <= 0 || remaining > 0 {
-		AppendLogText(&outLog, conv.ToolsSummaryLimited(remaining), o.cfg.UsageContentMaxBytes)
+	if principal.UserID == 0 {
+		AppendLogText(&outLog, conv.TextContent(), o.cfg.UsageContentMaxBytes)
+		remaining := o.cfg.UsageContentMaxBytes - outLog.Len()
+		if o.cfg.UsageContentMaxBytes <= 0 || remaining > 0 {
+			AppendLogText(&outLog, conv.ToolsSummaryLimited(remaining), o.cfg.UsageContentMaxBytes)
+		}
 	}
 	out := outLog.String()
 	status := "ok"
@@ -399,6 +411,7 @@ func (o *Runtime) pickForCaller(p *provider.Caller, model, key string) (*pool.Ac
 	return o.PickAccount(model, key)
 }
 func (o *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (provider.UsageReport, error) {
+	ctx = upstream.WithParsedFrames(ctx)
 	caller := req.Caller
 	r := (&http.Request{Header: req.Headers}).WithContext(ctx)
 	switch req.Protocol {

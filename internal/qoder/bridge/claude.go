@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"work2api/internal/core/provider"
 
 	"work2api/internal/qoder/cosy"
 	"work2api/internal/qoder/logger"
@@ -121,8 +122,8 @@ func (b *Bridge) ServeClaude(ctx context.Context, w http.ResponseWriter, req map
 
 		// thinking block 状态追踪
 		thinkingBlockOpen := false
-		thinkingBuf := ""
-		var streamFull strings.Builder
+		thinkingBuf := provider.NewLogCapture(ctx)
+		streamFull := provider.NewLogCapture(ctx)
 
 		err := b.CallQoderWithOpts(ctx, "claude", messages, model, tools, opts, func(d Delta) {
 			if d.Err != nil {
@@ -140,7 +141,7 @@ func (b *Bridge) ServeClaude(ctx context.Context, w http.ResponseWriter, req map
 					})
 					thinkingBlockOpen = true
 				}
-				thinkingBuf += d.Reasoning
+				thinkingBuf.WriteString(d.Reasoning)
 				writeSse("content_block_delta", map[string]interface{}{
 					"type": "content_block_delta", "index": contentBlockIndex,
 					"delta": map[string]interface{}{"type": "thinking_delta", "thinking": d.Reasoning},
@@ -171,7 +172,7 @@ func (b *Bridge) ServeClaude(ctx context.Context, w http.ResponseWriter, req map
 		result.InputTokens = totalInputTokens
 		result.OutputTokens = totalOutputTokens
 		result.Output = streamFull.String()
-		result.Reasoning = thinkingBuf
+		result.Reasoning = thinkingBuf.String()
 		if err != nil {
 			logger.Error("[Claude][%s] stream 请求失败: %v (耗时 %dms)", reqID, err, time.Since(startTime).Milliseconds())
 			// Claude SSE 协议要求 error 事件的 data 为 JSON；纯文本会被客户端解析失败

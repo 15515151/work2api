@@ -28,6 +28,7 @@ type Caller struct {
 // immediately before dispatch, including after credentials or queue waits.
 // It does not grant permission merely because an earlier check succeeded.
 type Invocation struct {
+	LogCapture    *LogCapturePolicy
 	Provider      string
 	UsageObserver interface{ Observe(map[string]any) }
 	Select        func(context.Context, func(map[string]bool) (AccountRef, error)) (AccountRef, error)

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+	"work2api/internal/core/provider"
 	"work2api/internal/streamwatch"
 
 	"work2api/internal/store"
@@ -185,6 +186,10 @@ func MergeUsageFromLine(line string, acc map[string]any) map[string]any {
 	if json.Unmarshal([]byte(data), &chunk) != nil {
 		return acc
 	}
+	return MergeUsageChunk(chunk, acc)
+}
+
+func MergeUsageChunk(chunk map[string]any, acc map[string]any) map[string]any {
 	if u, ok := chunk["usage"].(map[string]any); ok && u != nil {
 		return upstream.MergeUsage(acc, u)
 	}
@@ -204,6 +209,10 @@ func DeltaParts(line string) (string, string, string) {
 	if json.Unmarshal([]byte(data), &chunk) != nil {
 		return "", "", ""
 	}
+	return DeltaPartsChunk(chunk)
+}
+
+func DeltaPartsChunk(chunk map[string]any) (string, string, string) {
 	var content, reasoning strings.Builder
 	var finish string
 	choices, _ := chunk["choices"].([]any)
@@ -262,6 +271,10 @@ func SanitizeChatSSEWithRole(line string, sentRole *bool) string {
 	if json.Unmarshal([]byte(raw), &chunk) != nil {
 		return line
 	}
+	return SanitizeChatChunkWithRole(line, chunk, sentRole)
+}
+
+func SanitizeChatChunkWithRole(line string, chunk map[string]any, sentRole *bool) string {
 	choices, ok := chunk["choices"].([]any)
 	if !ok || len(choices) == 0 {
 		return line
@@ -329,40 +342,60 @@ func IsEmptyVal(v any) bool {
 }
 
 func (o *Runtime) ExtractInputText(body map[string]any) string {
+	out := provider.NewLogCaptureWithPolicy(provider.LogCapturePolicy{Enabled: true, Limit: o.cfg.UsageContentMaxBytes})
 	msgs, _ := body["messages"].([]any)
-	var parts []string
-	for _, m := range msgs {
-		mm, _ := m.(map[string]any)
-		role, _ := mm["role"].(string)
+	written := false
+	for _, item := range msgs {
+		if out.Full() {
+			break
+		}
+		message, _ := item.(map[string]any)
+		role, _ := message["role"].(string)
 		if role == "" {
 			role = "user"
 		}
-		var text string
-		switch c := mm["content"].(type) {
+		started := false
+		appendText := func(text string) {
+			if text == "" {
+				return
+			}
+			if !started {
+				if written {
+					out.WriteString("\n")
+				}
+				out.WriteString(role)
+				out.WriteString(": ")
+				started = true
+				written = true
+			} else {
+				out.WriteString(" ")
+			}
+			out.WriteString(text)
+		}
+		switch content := message["content"].(type) {
 		case string:
-			text = c
+			appendText(content)
 		case []any:
-			var segs []string
-			for _, p := range c {
-				pm, _ := p.(map[string]any)
-				switch pm["type"] {
+			for _, item := range content {
+				if out.Full() {
+					break
+				}
+				part, _ := item.(map[string]any)
+				switch part["type"] {
 				case "text":
-					if t, ok := pm["text"].(string); ok {
-						segs = append(segs, t)
-					}
+					text, _ := part["text"].(string)
+					appendText(text)
 				case "image_url":
-					if iu, ok := pm["image_url"].(map[string]any); ok {
-						segs = append(segs, "[图片: image_url|"+ToStr(iu["url"])+"]")
+					if image, ok := part["image_url"].(map[string]any); ok {
+						appendText("[图片: image_url|")
+						out.WriteString(ToStr(image["url"]))
+						out.WriteString("]")
 					}
 				}
 			}
-			text = strings.Join(segs, " ")
-		}
-		if text != "" {
-			parts = append(parts, role+": "+text)
 		}
 	}
-	return strings.Join(parts, "\n")
+	return out.String()
 }
 
 type UsageObserver interface{ Observe(map[string]any) }

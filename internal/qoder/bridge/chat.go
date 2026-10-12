@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"work2api/internal/core/provider"
 
 	"work2api/internal/qoder/cosy"
 	"work2api/internal/qoder/logger"
@@ -136,8 +137,8 @@ func (b *Bridge) ServeChat(ctx context.Context, w http.ResponseWriter, req map[s
 
 		var toolCallBuf []interface{}
 		var totalInputTokens, totalOutputTokens int
-		var streamFull strings.Builder
-		var streamReasoning strings.Builder
+		streamFull := provider.NewLogCapture(ctx)
+		streamReasoning := provider.NewLogCapture(ctx)
 
 		err := b.CallQoderWithOpts(ctx, InferAgent(model), messages, model, tools, requestCallOpts(req), func(d Delta) {
 			if d.Err != nil {

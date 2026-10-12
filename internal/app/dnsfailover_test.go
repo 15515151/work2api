@@ -30,6 +30,7 @@ type failingUpstream struct {
 	err   error
 	calls int
 	emit  bool
+	lines []string
 }
 
 func (f *failingUpstream) StreamUpstream(_ context.Context, _ map[string]string, _ map[string]any, target string, yield upstream.LineFunc) error {
@@ -37,6 +38,11 @@ func (f *failingUpstream) StreamUpstream(_ context.Context, _ map[string]string,
 		return errors.New("test account has no upstream URL")
 	}
 	f.calls++
+	for _, line := range f.lines {
+		if err := yield(line); err != nil {
+			return err
+		}
+	}
 	if f.emit {
 		if err := yield(`data: {"choices":[{"delta":{"content":"partial"}}]}`); err != nil {
 			return err
@@ -76,6 +82,60 @@ func newDNSFailoverOrch(t *testing.T, client *failingUpstream) (*Orchestrator, *
 	}
 	return o, acc
 }
+func TestWorkBuddyToolFinishNormalization(t *testing.T) {
+	for _, reason := range []string{"stop", "length", "content_filter", ""} {
+		tool := `data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"shell","arguments":"{}"}}]}}]}`
+		lines := []string{tool}
+		if reason != "" {
+			lines = append(lines, `data: {"choices":[{"index":0,"delta":{},"finish_reason":"`+reason+`"}]}`)
+		}
+		lines = append(lines, "data: [DONE]")
+		client := &failingUpstream{lines: lines}
+		o, acc := newDNSFailoverOrch(t, client)
+		var output strings.Builder
+		converter := adapters.NewAnthropicStreamConverter("test-model")
+		_, err := o.openUpstream(context.Background(), acc, map[string]any{}, "test-model", "", func(line string) error { output.WriteString(converter.FeedLine(line)); return nil }, nil)
+		if err != nil || client.calls != 1 {
+			t.Fatal(err, client.calls)
+		}
+		output.WriteString(converter.Finish())
+		want := map[string]string{"stop": "tool_use", "": "tool_use", "length": "max_tokens", "content_filter": "refusal"}[reason]
+		if !strings.Contains(output.String(), `"stop_reason":"`+want+`"`) {
+			t.Fatal(reason, output.String())
+		}
+	}
+}
+
+func BenchmarkWorkBuddyChunkProcessing(b *testing.B) {
+	line := `data: {"choices":[{"index":0,"delta":{"content":"` + strings.Repeat("chunk", 40) + `","reasoning_content":"thinking"},"finish_reason":null}],"usage":{"prompt_tokens":100,"completion_tokens":20}}`
+	for _, cached := range []bool{false, true} {
+		name := "reparse"
+		if cached {
+			name = "shared_frame"
+		}
+		b.Run(name, func(b *testing.B) {
+			ctx := upstream.WithParsedFrames(context.Background())
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				var validated map[string]any
+				json.Unmarshal([]byte(line[6:]), &validated)
+				role := false
+				if cached {
+					upstream.RememberFrame(ctx, line, validated)
+					chunk := upstream.DecodeFrame(ctx, line)
+					wbruntime.MergeUsageChunk(chunk, nil)
+					wbruntime.DeltaPartsChunk(chunk)
+					wbruntime.SanitizeChatChunkWithRole(line, chunk, &role)
+				} else {
+					wbruntime.MergeUsageFromLine(line, nil)
+					wbruntime.DeltaParts(line)
+					wbruntime.SanitizeChatSSEWithRole(line, &role)
+				}
+			}
+		})
+	}
+}
+
 func TestOpenUpstreamFailureAccounting(t *testing.T) {
 	dnsErr := &net.DNSError{Err: "no such host", Name: "upstream.invalid", IsNotFound: true}
 	for _, tc := range []struct {

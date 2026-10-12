@@ -255,8 +255,13 @@ func streamSSE(resp *http.Response, yield LineFunc) error {
 		if err := state.observe(chunk); err != nil {
 			return err
 		}
-		raw, _ := json.Marshal(chunk) // Multi-line SSE data becomes one adapter-safe line.
-		line := "data: " + string(raw)
+		// Keep ordinary single-line payloads; only multiline SSE needs folding.
+		line := "data: " + data
+		if strings.Contains(data, "\n") {
+			raw, _ := json.Marshal(chunk)
+			line = "data: " + string(raw)
+		}
+		RememberFrame(resp.Request.Context(), line, chunk)
 		if state.finish != "" {
 			terminalBytes += len(line)
 			if terminalBytes > 8*1024*1024 {

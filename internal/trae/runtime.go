@@ -48,18 +48,20 @@ type accountState struct {
 }
 
 type Runtime struct {
-	mu              sync.Mutex
-	writeMu         sync.Mutex
-	accounts        map[string]*accountState
-	dir             string
-	db              *store.DB
-	transport       *http.Transport
-	affinities      map[string]string
-	affinityUsed    map[string]time.Time
-	affinityOrder   map[string]uint64
-	affinityClock   uint64
-	logins          map[string]*loginState
-	lastMaintenance time.Time
+	mu                sync.Mutex
+	writeMu           sync.Mutex
+	credentialFlights map[*auth.Auth]*credentialFlight
+	credentialDirty   map[*auth.Auth]bool
+	accounts          map[string]*accountState
+	dir               string
+	db                *store.DB
+	transport         *http.Transport
+	affinities        map[string]string
+	affinityUsed      map[string]time.Time
+	affinityOrder     map[string]uint64
+	affinityClock     uint64
+	logins            map[string]*loginState
+	lastMaintenance   time.Time
 }
 
 // One upstream UID is one ownership/quota/concurrency resource. Product
@@ -247,34 +249,7 @@ func (r *Runtime) client(ctx context.Context) *upstream.Client {
 	return c
 }
 func (r *Runtime) ensure(ctx context.Context, a *auth.Auth) error {
-	if a.RefreshTokenValue() == "" {
-		a.RLock()
-		expired := a.ExpiresAt > 0 && time.Now().Unix() >= a.ExpiresAt
-		a.RUnlock()
-		if expired {
-			return errors.New("Trae 登录已过期，请网页登录以取得刷新凭据")
-		}
-		return ctx.Err()
-	}
-	r.writeMu.Lock()
-	defer r.writeMu.Unlock()
-	leave := statebackup.Enter()
-	defer leave()
-	r.mu.Lock()
-	current := r.accounts[accountID(a.UID)]
-	valid := current != nil && current.Identities[a.Variant] == a
-	r.mu.Unlock()
-	if !valid {
-		return errors.New("Trae 账号授权已变更，请重试")
-	}
-	changed, err := r.client(ctx).RefreshTokenIfNeeded(a, 10*time.Minute)
-	if err != nil {
-		return errors.New("Trae 凭据刷新失败，请重新授权")
-	}
-	if changed {
-		return a.SaveAtomic()
-	}
-	return nil
+	return r.refreshCredentials(ctx, a, false)
 }
 
 func (r *Runtime) Models(context.Context) []provider.CatalogModel {

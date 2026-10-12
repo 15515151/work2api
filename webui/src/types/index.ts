@@ -204,6 +204,7 @@ export interface UsagePoint {
 }
 
 export interface UsageDiagnostics {
+ content_cleared?: boolean
  token_details?: { reasoning_tokens?: number | null; cache_creation_tokens?: number | null }
   requested_model?: string
   physical_model?: string
@@ -258,7 +259,21 @@ export interface UsageRecord {
   cached_tokens?: number | null
 }
 
+export interface ResourceMetrics {
+  sampled_at: number
+  heap_objects_bytes: number | null
+  heap_goal_bytes: number | null
+  gc_cycles: number | null
+  goroutines: number
+  go_memory_in_use_bytes: number
+  request_body_bytes: number
+  database_bytes: number | null
+  wal_bytes: number | null
+  usage: { write_attempts: number; write_errors: number; write_average_ms: number; maintenance_runs: number; maintenance_last_ms: number; maintenance_errors: number; maintenance_running: boolean }
+}
+
 export interface Overview {
+  resource_metrics?: ResourceMetrics
   display_accounts?: AccountInfo[]
   call_metrics?: { recent?: { request_id: string; attempts: number; http_status: number; attempt_stages?: { number: number; header_wait_ms: number; http_status: number; headers_finished: boolean; upstream_request_id?: string }[] }[]; requests: number; errors: number; incomplete: number; attempts: number; upstream_429: number; wait_p95_ms: number | null; queue_p95_ms: number | null; account_wait_p95_ms: number | null; execution_p95_ms: number | null; first_byte_p95_ms: number | null; total_p95_ms: number | null }
   admission?: { limits_disabled?: boolean; waiting_reasons?: Record<string, number>; memory_pressure?: boolean; buffer_reserved_bytes?: number; buffer_budget_bytes?: number; shared_running?: number; shared_capacity?: number; account_running?: Record<string,number>; account_capacity?: number; running: number; queued: number; capacity: number; queue_capacity: number; oldest_wait_ms: number; wait_limit_ms: number; rejected: Record<string,number> }

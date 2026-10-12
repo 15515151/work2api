@@ -278,8 +278,10 @@ func (c *BearerClient) openStreamLines(ctx context.Context, fullURL string, json
 		done := make(chan struct{})
 		defer close(done)
 		go func() {
+			buffer, release := streamwatch.BorrowLineBuffer()
+			defer release()
 			scanner := bufio.NewScanner(watch.Reader(resp.Body))
-			scanner.Buffer(make([]byte, 0, streamwatch.DefaultMaxLineBytes), streamwatch.DefaultMaxLineBytes)
+			scanner.Buffer(buffer, streamwatch.DefaultMaxLineBytes)
 			for scanner.Scan() {
 				select {
 				case lineCh <- scanner.Text():

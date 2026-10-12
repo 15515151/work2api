@@ -23,6 +23,40 @@ import (
 	"work2api/internal/workbuddy/pool"
 )
 
+func TestResourceRouteRequiresAdminAuthentication(t *testing.T) {
+	s, _ := portalFixture(t)
+	s.o.cfg.AdminToken = "resource-test-token"
+	s.o.cfg.DBPath = filepath.Join(t.TempDir(), "resource.db")
+	if err := os.WriteFile(s.o.cfg.DBPath, []byte("file metadata"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	h := s.Handler()
+	request := func(token string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest("GET", "http://127.0.0.1/admin/resources", nil)
+		r.RemoteAddr = "127.0.0.1:23456"
+		if token != "" {
+			r.Header.Set("Authorization", "Bearer "+token)
+		}
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w
+	}
+	if w := request(""); w.Code == 200 {
+		t.Fatal("unauthenticated resource access")
+	}
+	w := request("resource-test-token")
+	if w.Code != 200 {
+		t.Fatal(w.Code, w.Body.String())
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &fields); err != nil {
+		t.Fatal(err)
+	}
+	if fields["database_bytes"] == nil || fields["usage"] == nil || strings.Contains(w.Body.String(), s.o.cfg.DBPath) {
+		t.Fatal("missing metrics or leaked path", w.Body.String())
+	}
+}
+
 func portalFixture(t *testing.T) (*Server, *store.User) {
 	t.Helper()
 	o, _ := newDNSFailoverOrch(t, &failingUpstream{})

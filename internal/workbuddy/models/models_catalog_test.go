@@ -3,6 +3,7 @@ package models
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -12,6 +13,52 @@ import (
 
 	"work2api/internal/workbuddy/pool"
 )
+
+func TestCachedModelIndexRefreshAndSnapshot(t *testing.T) {
+	r := &Registry{models: []map[string]any{{"id": "old", "max_output_tokens": 100, "credits_by_region": map[string]float64{"domestic": 1}}}}
+	entry, ready := r.CachedModel("old")
+	if !ready || entry == nil || r.MaxOutputTokens("old") != 100 || r.CreditsByRegion("old")["domestic"] != 1 {
+		t.Fatal("indexed facts missing")
+	}
+	entry["id"] = "mutated"
+	if _, ready := r.CachedModel("missing"); !ready {
+		t.Fatal("unknown model confused with empty catalog")
+	}
+	r.mu.Lock()
+	r.models = []map[string]any{{"id": "new"}}
+	r.modelIndex = nil
+	r.mu.Unlock()
+	if entry, _ := r.CachedModel("old"); entry != nil {
+		t.Fatal("old model survived publication")
+	}
+	if entry, _ := r.CachedModel("new"); entry == nil {
+		t.Fatal("new model absent")
+	}
+}
+
+func BenchmarkCatalogLookup(b *testing.B) {
+	r := &Registry{}
+	for i := 0; i < 300; i++ {
+		r.models = append(r.models, map[string]any{"id": fmt.Sprintf("model-%d", i), "name": "test", "account_uids": []string{"a", "b"}})
+	}
+	r.CachedModel("model-299")
+	b.Run("whole_snapshot", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			for _, entry := range r.ListCached() {
+				if entry["id"] == "model-299" {
+					break
+				}
+			}
+		}
+	})
+	b.Run("indexed_entry", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			r.CachedModel("model-299")
+		}
+	})
+}
 
 type catalogTestCredential struct{ profile string }
 

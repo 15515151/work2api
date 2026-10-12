@@ -3,6 +3,7 @@ package app
 import (
 	"testing"
 	"time"
+	"work2api/internal/store"
 )
 
 // 预热已经刷过一遍额度；若 lastCredit 未被预热同步，首个 tick 的周期判据
@@ -21,16 +22,66 @@ func TestWarmupUpdatesLastCredit(t *testing.T) {
 	}
 }
 
-// A7 回归：lastRowCheck 与 lastCredit 同形状——零值会让首个 tick 立即对
-// usage_logs 跑行数检查（MIN/MAX + 可能截断）。预热必须一并同步。
-func TestWarmupUpdatesLastRowCheck(t *testing.T) {
-	s := &Scheduler{}
-	s.lastCredit = float64(time.Now().Unix())
-	s.lastRowCheck = s.lastCredit // 与 scheduler.go run() 预热保持一致
+func TestIndependentUsageMaintenanceAndResourceSnapshot(t *testing.T) {
+	server, _ := portalFixture(t)
+	server.o.cfg.UsageContentBudgetBytes = 1
+	id, err := server.o.db.LogUsageWithID(store.UsageParams{Model: "test", InputTokens: 10, InputContent: "saved diagnostic text"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scheduler := NewScheduler(server.o)
+	done := make(chan struct{})
+	go scheduler.runUsageMaintenance(done)
+	defer func() {
+		scheduler.cancel()
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Error("maintenance did not stop")
+		}
+	}()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		row, err := server.o.db.GetUsage(int(id))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if row["input_content"] == "" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("maintenance required upstream scheduler tick")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	snapshot := server.resourceSnapshot()
+	if snapshot["goroutines"].(int) < 1 || snapshot["usage"].(map[string]any)["write_attempts"].(uint64) < 1 {
+		t.Fatal("resource counters missing", snapshot)
+	}
+	if server.resourceSnapshot()["sampled_at"] != snapshot["sampled_at"] {
+		t.Fatal("snapshot cache missed")
+	}
+}
 
-	checkEvery := 30 // 默认 USAGE_CHECK_INTERVAL_MIN
-	now := time.Now().Add(time.Second)
-	if float64(now.Unix())-s.lastRowCheck >= float64(checkEvery)*60 {
-		t.Fatal("首个 tick 不应触发 usage 行数检查：预热未同步 lastRowCheck")
+func TestScheduledMaintenanceClearsOnlyDiagnosticText(t *testing.T) {
+	server, _ := portalFixture(t)
+	server.o.cfg.UsageContentBudgetBytes = 1
+	server.o.cfg.UsageContentRetentionDays = 0
+	id, err := server.o.db.LogUsageWithID(store.UsageParams{Model: "test", InputTokens: 10, OutputTokens: 5, InputContent: "large saved text"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scheduler := NewScheduler(server.o)
+	defer scheduler.cancel()
+	scheduler.cleanupUsage()
+	row, err := server.o.db.GetUsage(int(id))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row["input_content"] != "" || row["input_tokens"] != int64(10) || !row["diagnostics"].(store.UsageDiagnostics).ContentCleared {
+		t.Fatal("scheduled cleanup changed accounting or retained text", row)
+	}
+	if scheduler.usageMaintenancePending || scheduler.lastUsageMaintenance.IsZero() {
+		t.Fatal("maintenance completion not tracked")
 	}
 }

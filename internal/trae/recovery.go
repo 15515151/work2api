@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"work2api/internal/core/provider"
-	"work2api/internal/statebackup"
 	"work2api/internal/trae/auth"
 	"work2api/internal/trae/upstream"
 )
@@ -69,22 +68,8 @@ func rejectionError(kind upstream.ErrKind, status int, code int64) error {
 }
 
 func (r *Runtime) forceRefresh(ctx context.Context, id string, identity *auth.Auth) error {
-	r.writeMu.Lock()
-	defer r.writeMu.Unlock()
-	leave := statebackup.Enter()
-	defer leave()
-	if ctx.Err() != nil {
-		return ctx.Err()
-	}
-	r.mu.Lock()
-	a := r.accounts[id]
-	valid := a != nil && a.Identities[identity.Variant] == identity
-	r.mu.Unlock()
-	if !valid {
+	if accountID(identity.UID) != id {
 		return errors.New("Trae 账号授权已变更")
 	}
-	if err := r.client(ctx).RefreshToken(identity); err != nil {
-		return errors.New("Trae 凭据刷新失败")
-	}
-	return identity.SaveAtomic()
+	return r.refreshCredentials(ctx, identity, true)
 }

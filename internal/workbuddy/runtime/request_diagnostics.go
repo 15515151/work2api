@@ -72,6 +72,14 @@ func (d *RequestDiagnostics) Observe(line string) {
 	if json.Unmarshal([]byte(strings.TrimSpace(strings.TrimPrefix(line, "data:"))), &chunk) != nil {
 		return
 	}
+	d.ObserveChunk(chunk)
+}
+
+func (d *RequestDiagnostics) ObserveChunk(chunk map[string]any) {
+	if d == nil {
+		return
+	}
+	d.Started = true
 	choices, _ := chunk["choices"].([]any)
 	for _, item := range choices {
 		choice, _ := item.(map[string]any)

@@ -203,7 +203,7 @@ func (rt *Runtime) doAnonymousUpstream(ctx context.Context, route Route, bodies 
 		if ids.AccountUID != nil {
 			*ids.AccountUID = "opencode:anonymous"
 		}
-		resp, err := node.proxy.client.Do(req)
+		resp, err := doInferenceAttempt(node.proxy.client, req, route.Protocol)
 		attemptStatus := 0
 		if resp != nil {
 			attemptStatus = resp.StatusCode
@@ -442,7 +442,7 @@ func (rt *Runtime) doKeyUpstream(ctx context.Context, route Route, bodies map[Ti
 		if ids.AccountUID != nil {
 			*ids.AccountUID = uid
 		}
-		resp, err := proxy.client.Do(req)
+		resp, err := doInferenceAttempt(proxy.client, req, route.Protocol)
 		attemptStatus := 0
 		if resp != nil {
 			attemptStatus = resp.StatusCode

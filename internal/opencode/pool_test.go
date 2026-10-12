@@ -306,3 +306,86 @@ func TestSingleAllowedKeyRetainsTransientRetryBudget(t *testing.T) {
 	}
 	resp.Body.Close()
 }
+
+func TestSSEHeadFailureUsesExistingRetryBudget(t *testing.T) {
+	for _, kind := range []string{"server_error", "policy_rejection", "after_output", "empty"} {
+		calls := 0
+		prelude := "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n"
+		answer := "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"
+		proxy := &proxyTransport{client: &http.Client{Transport: catalogTestTransport(func(req *http.Request) (*http.Response, error) {
+			if req.Method == http.MethodGet {
+				return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("ok"))}, nil
+			}
+			calls++
+			wire := prelude + answer
+			if calls == 1 {
+				wire = prelude + "data: {\"error\":{\"type\":\"" + kind + "\",\"message\":\"rejected\"}}\n\n"
+				if kind == "after_output" {
+					wire = prelude + answer + "data: {\"error\":{\"type\":\"server_error\"}}\n\n"
+				}
+				if kind == "empty" {
+					wire = prelude
+				}
+			}
+			return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: io.NopCloser(strings.NewReader(wire))}, nil
+		})}}
+		proxy.healthy.Store(true)
+		transports := &transportPool{items: []*proxyTransport{proxy}}
+		nodes, e := newNodePool([]string{"one"}, transports, time.Minute)
+		if e != nil {
+			t.Fatal(e)
+		}
+		rt := &Runtime{cfg: Config{Retry: RetryConfig{MaxAttempts: 2}, Upstream: UpstreamConfig{Zen: "https://upstream.invalid"}}, zenNodes: nodes, transports: transports, catalog: NewCatalog(TierZen, nil)}
+		resp, e, attempts := rt.doKeyUpstream(context.Background(), Route{ID: "model", Tier: TierZen, Protocol: protocol.Chat}, map[Tier][]byte{TierZen: []byte(`{}`)}, RequestIDs{}, 0)
+		if e != nil || resp == nil {
+			t.Fatal(kind, e)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		want := 1
+		if kind == "server_error" || kind == "empty" {
+			want = 2
+		}
+		if calls != want || attempts != want {
+			t.Fatal(kind, "wrong retry count", calls, attempts)
+		}
+		if kind == "policy_rejection" {
+			if resp.StatusCode != 400 {
+				t.Fatal("policy rejection retried", resp.StatusCode)
+			}
+		} else if !strings.HasPrefix(string(body), prelude+answer) {
+			t.Fatal(kind, "prefix lost", string(body))
+		}
+	}
+}
+
+func TestSSEHeadCancellationClosesReader(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	reader, writer := io.Pipe()
+	defer writer.Close()
+	entered := make(chan struct{})
+	client := &http.Client{Transport: catalogTestTransport(func(req *http.Request) (*http.Response, error) {
+		close(entered)
+		return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: reader}, nil
+	})}
+	req, _ := http.NewRequestWithContext(ctx, "POST", "https://upstream.invalid/v1/chat/completions", strings.NewReader(`{}`))
+	done := make(chan error, 1)
+	go func() {
+		resp, err := doInferenceAttempt(client, req, protocol.Chat)
+		if resp != nil {
+			resp.Body.Close()
+		}
+		done <- err
+	}()
+	<-entered
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("prelude reader survived client cancellation")
+	}
+}

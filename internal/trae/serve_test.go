@@ -374,6 +374,114 @@ func fixtureRuntime(t *testing.T, handler http.HandlerFunc) *Runtime {
 	return r
 }
 
+func TestCredentialRefreshDoesNotBlockOtherAccountsAndPersists(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	var calls atomic.Int32
+	r := fixtureRuntime(t, func(w http.ResponseWriter, req *http.Request) {
+		if calls.Add(1) == 1 {
+			close(entered)
+			<-release
+		}
+		io.WriteString(w, `{"Result":{"Token":"rotated","RefreshToken":"rotated-refresh","TokenExpireDuration":3600}}`)
+	})
+	register := func(uid string, expires int64) *auth.Auth {
+		a := &auth.Auth{UID: uid, Variant: "cn", AccessToken: "fixture", RefreshToken: "refresh", ExpiresAt: expires, FilePath: filepath.Join(r.dir, accountID(uid)+"-cn.json")}
+		r.accounts[accountID(uid)] = &accountState{Auth: a, Enabled: true, Identities: map[string]*auth.Auth{"cn": a}}
+		return a
+	}
+	expired := register("expired", time.Now().Add(-time.Minute).Unix())
+	fresh := register("fresh", time.Now().Add(time.Hour).Unix())
+	done := make(chan error, 1)
+	go func() { done <- r.ensure(context.Background(), expired) }()
+	<-entered
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	other := make(chan error, 1)
+	go func() { other <- r.ensure(ctx, fresh) }()
+	select {
+	case err := <-other:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		close(release)
+		t.Fatal("fresh account waited for unrelated refresh")
+	}
+	waitCtx, waitCancel := context.WithCancel(context.Background())
+	waitCancel()
+	if err := r.ensure(waitCtx, expired); !errors.Is(err, context.Canceled) {
+		close(release)
+		t.Fatal("waiter cancellation ignored", err)
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 1 {
+		t.Fatal("rotation retried", calls.Load())
+	}
+	raw, err := os.ReadFile(expired.FilePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := auth.Parse(raw)
+	if err != nil || loaded.JWT() != "rotated" || loaded.RefreshTokenValue() != "rotated-refresh" {
+		t.Fatal("rotated chain not saved", err)
+	}
+	if err := r.ensure(context.Background(), expired); err != nil || calls.Load() != 1 {
+		t.Fatal("fresh token unnecessarily refreshed", err, calls.Load())
+	}
+}
+
+func TestCredentialRotationSaveRetryAndRevocation(t *testing.T) {
+	for _, revoke := range []bool{false, true} {
+		t.Run(fmt.Sprintf("revoke=%v", revoke), func(t *testing.T) {
+			entered, release := make(chan struct{}), make(chan struct{})
+			var calls atomic.Int32
+			r := fixtureRuntime(t, func(w http.ResponseWriter, req *http.Request) {
+				calls.Add(1)
+				close(entered)
+				<-release
+				io.WriteString(w, `{"Result":{"Token":"rotated","RefreshToken":"rotated-refresh","TokenExpireDuration":3600}}`)
+			})
+			a := &auth.Auth{UID: "save-test", Variant: "cn", AccessToken: "fixture", RefreshToken: "refresh", ExpiresAt: 1, FilePath: filepath.Join(r.dir, "missing", "credentials.json")}
+			id := accountID(a.UID)
+			r.accounts[id] = &accountState{Auth: a, Enabled: true, Identities: map[string]*auth.Auth{"cn": a}}
+			done := make(chan error, 1)
+			go func() { done <- r.ensure(context.Background(), a) }()
+			<-entered
+			if revoke {
+				if err := r.DeleteAccount(id); err != nil {
+					close(release)
+					t.Fatal(err)
+				}
+			}
+			close(release)
+			if err := <-done; err == nil {
+				t.Fatal("failed publication reported success")
+			}
+			if revoke {
+				if _, err := os.Stat(a.FilePath); !os.IsNotExist(err) {
+					t.Fatal("removed credential resurrected")
+				}
+				return
+			}
+			a.Lock()
+			a.FilePath = filepath.Join(r.dir, "saved.json")
+			a.Unlock()
+			if err := r.ensure(context.Background(), a); err != nil {
+				t.Fatal("fresh unsaved token did not retry persistence", err)
+			}
+			if calls.Load() != 1 {
+				t.Fatal("saving required another upstream rotation", calls.Load())
+			}
+			if _, err := os.Stat(a.FilePath); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestCatalogSnapshotAndProductPreference(t *testing.T) {
 	r := fixtureRuntime(t, nil)
 	id := accountID("fixture-user")
@@ -460,8 +568,8 @@ func TestQuotaRecoveryCoalescesAndPreservesOtherCooldowns(t *testing.T) {
 		}
 		io.WriteString(w, `{"is_credits_billing":true,"user_entitlement_pack_list":[{"display_desc":"Credits","entitlement_base_info":{"product_type":1,"end_time":1793462400,"quota":{"credits_limit":100}},"usage":{"credits_amount":99.75}}]}`)
 	})
-	id := "fixture"
-	identity := &auth.Auth{Variant: "cn", AccessToken: "fixture"}
+	id := accountID("fixture")
+	identity := &auth.Auth{UID: "fixture", Variant: "cn", AccessToken: "fixture"}
 	a := &accountState{Auth: identity, Enabled: true, Identities: map[string]*auth.Auth{"cn": identity}, Cooldown: time.Now().Add(time.Hour), CooldownKind: upstream.ErrPlanLimit}
 	r.accounts[id] = a
 	var wait sync.WaitGroup
@@ -503,9 +611,9 @@ func TestWarmLoadsQuotaWithoutPeriodicRefresh(t *testing.T) {
 		reads.Add(1)
 		io.WriteString(w, `{"is_credits_billing":true,"user_entitlement_pack_list":[{"entitlement_base_info":{"quota":{"credits_limit":100}},"usage":{"credits_amount":25}}]}`)
 	})
-	identity := &auth.Auth{Variant: "cn", AccessToken: "fixture"}
+	identity := &auth.Auth{UID: "enabled", Variant: "cn", AccessToken: "fixture"}
 	a := &accountState{Auth: identity, Enabled: true, Identities: map[string]*auth.Auth{"cn": identity}}
-	r.accounts["enabled"] = a
+	r.accounts[accountID("enabled")] = a
 	r.accounts["disabled"] = &accountState{Auth: identity, Enabled: false}
 	r.Warm(context.Background())
 	if reads.Load() != 1 || a.Remaining == nil || *a.Remaining != 75 || a.QuotaAt.IsZero() || a.QuotaFailed || r.accounts["disabled"].Remaining != nil {

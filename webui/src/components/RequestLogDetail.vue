@@ -21,6 +21,7 @@ function stageLabel(stage:{headers_finished:boolean;http_status:number;header_wa
 </script>
 <template>
  <div class="space-y-4 text-small">
+  <p v-if="admin && d?.content_cleared" class="rounded-lg bg-elevated px-3 py-2 text-muted">正文已按保留策略清理；用量、成本与性能记录保留。</p>
   <div class="flex flex-wrap items-center justify-between gap-2"><span class="inline-flex items-center gap-2 rounded-md border px-2 py-1 text-micro font-medium" :class="resultClass(record)">{{resultLabel(record)}}<span v-if="p?.http_status">HTTP {{p.http_status}}</span></span><span class="text-micro text-muted">{{dt(record.ts,'YYYY-MM-DD HH:mm:ss')}}</span></div>
   <p v-if="record.status!=='ok' || d?.finish_reason==='tool_calls'" class="rounded-lg bg-elevated px-3 py-2 text-muted">{{explanation}}</p>
   <div v-if="record.error" class="rounded-lg border border-fault/25 bg-fault/5 p-3 whitespace-pre-wrap break-all text-fault">{{record.error}}</div>

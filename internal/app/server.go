@@ -20,9 +20,10 @@ import (
 
 // Server is the HTTP surface over an Orchestrator.
 type Server struct {
-	updater *selfupdate.Manager
-	calls   callMonitor
-	o       *Orchestrator
+	updater   *selfupdate.Manager
+	calls     callMonitor
+	resources resourceMonitor
+	o         *Orchestrator
 	// adminSessions + loginLimiter back the WebUI login (HttpOnly cookie
 	// sessions). In-memory only: restart signs everyone out.
 	sessions                                                    *adminSessionManager

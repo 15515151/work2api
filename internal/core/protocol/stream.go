@@ -169,7 +169,38 @@ func ForwardStream(ctx context.Context, w http.ResponseWriter, reader io.Reader,
 		return Usage{}, false, fmt.Errorf("response writer does not support streaming")
 	}
 	observer := newStreamUsageObserver(protocol)
-	_, copyErr := io.Copy(&sseFlushWriter{writer: w, flusher: flusher}, io.TeeReader(reader, observer))
+	buffer, release := streamwatch.BorrowLineBuffer()
+	defer release()
+	writer := &sseFlushWriter{writer: w, flusher: flusher}
+	var copyErr error
+	for {
+		n, readErr := reader.Read(buffer)
+		if n > 0 {
+			accepted, _ := observer.Write(buffer[:n])
+			written, err := writer.Write(buffer[:accepted])
+			if err != nil {
+				copyErr = err
+				break
+			}
+			if written != accepted {
+				copyErr = io.ErrShortWrite
+				break
+			}
+			if observer.NormalTermination() || observer.ErrorTermination() {
+				break
+			}
+		}
+		if readErr != nil {
+			if !errors.Is(readErr, io.EOF) {
+				copyErr = readErr
+			}
+			break
+		}
+		if ctx.Err() != nil {
+			copyErr = ctx.Err()
+			break
+		}
+	}
 	usage := observer.Finish()
 	if observer.ErrorTermination() {
 		if copyErr != nil {
@@ -203,6 +234,7 @@ func ForwardStream(ctx context.Context, w http.ResponseWriter, reader io.Reader,
 type streamUsageObserver struct {
 	parser   *bridgeStreamParser
 	buffer   []byte
+	scan     int
 	usage    Usage
 	reported bool
 	normal   bool
@@ -218,23 +250,54 @@ func newStreamUsageObserver(protocol Protocol) *streamUsageObserver {
 }
 
 func (observer *streamUsageObserver) Write(data []byte) (int, error) {
+	previous := len(observer.buffer)
 	observer.buffer = append(observer.buffer, data...)
+	consumed := 0
+	accepted := len(data)
 	for {
-		index, width := nextSSEBoundary(observer.buffer)
+		index, width := nextSSEBoundary(observer.buffer[consumed+observer.scan:])
 		if index < 0 {
+			// Only the last three bytes can form a delimiter with the next
+			// fragment; don't rescan a long unfinished frame from its start.
+			observer.scan = max(0, len(observer.buffer)-consumed-3)
 			break
 		}
-		frame := append([]byte(nil), observer.buffer[:index+width]...)
-		observer.buffer = observer.buffer[index+width:]
+		// consume is synchronous and does not retain frame bytes; the string
+		// parser owns its copy. Do not clone the same frame before parsing it.
+		end := consumed + observer.scan + index + width
+		frame := observer.buffer[consumed:end]
 		observer.consume(frame)
+		consumed = end
+		observer.scan = 0
+		if observer.normal || observer.error {
+			accepted = max(0, end-previous)
+			observer.buffer = observer.buffer[:end]
+			break
+		}
 	}
-	return len(data), nil
+	if consumed > 0 {
+		n := copy(observer.buffer, observer.buffer[consumed:])
+		observer.buffer = observer.buffer[:n]
+	}
+	// Retain normal-size working storage, but release a completed oversized
+	// frame without changing how much data the protocol can receive.
+	if cap(observer.buffer) > 128<<10 && len(observer.buffer) <= 64<<10 {
+		if len(observer.buffer) == 0 {
+			observer.buffer = nil
+		} else {
+			buffer := make([]byte, len(observer.buffer), 64<<10)
+			copy(buffer, observer.buffer)
+			observer.buffer = buffer
+		}
+	}
+	return accepted, nil
 }
 
 func (observer *streamUsageObserver) Finish() Usage {
 	// An unterminated final line is not an SSE frame. In particular, do not
 	// count a usage object from a response that was cut off at EOF.
 	observer.buffer = nil
+	observer.scan = 0
 	return observer.usage
 }
 
@@ -290,7 +353,9 @@ func nextSSEBoundary(data []byte) (int, int) {
 
 func readSSE(reader io.Reader, handler func(eventName, data string) error) error {
 	scanner := bufio.NewScanner(reader)
-	scanner.Buffer(make([]byte, 64<<10), streamwatch.DefaultMaxLineBytes)
+	buffer, release := streamwatch.BorrowLineBuffer()
+	defer release()
+	scanner.Buffer(buffer, streamwatch.DefaultMaxLineBytes)
 	var eventName string
 	var dataLines []string
 	flush := func() error {

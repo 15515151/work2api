@@ -87,7 +87,9 @@ type Config struct {
 	// UsageContentMaxBytes truncates each stored input/output/reasoning content
 	// field at write (0 = unlimited). The real DB-size driver is base64 image
 	// payloads in request/response bodies; this bounds per-row bytes.
-	UsageContentMaxBytes int
+	UsageContentMaxBytes      int
+	UsageContentRetentionDays int
+	UsageContentBudgetBytes   int64
 }
 
 // PackageRoot is the directory containing the executable's working tree root.
@@ -212,7 +214,9 @@ func Load(args []string) *Config {
 		UsageCheckIntervalMin: envInt("USAGE_CHECK_INTERVAL_MIN", 30),
 		// 单条 content 字段上限默认 32KB（0=不限）：纯文本远够（约 8k tokens），
 		// 主要截断 base64 图片这类撑爆库的大 payload。
-		UsageContentMaxBytes: envInt("USAGE_CONTENT_MAX_BYTES", 32768),
+		UsageContentMaxBytes:      envInt("USAGE_CONTENT_MAX_BYTES", 32768),
+		UsageContentRetentionDays: max(0, envInt("USAGE_CONTENT_RETENTION_DAYS", 7)),
+		UsageContentBudgetBytes:   int64(max(0, envInt("USAGE_CONTENT_BUDGET_BYTES", 512<<20))),
 	}
 }
 

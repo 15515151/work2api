@@ -12,6 +12,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"log"
 	"sort"
 	"strconv"
@@ -30,8 +31,9 @@ type Scheduler struct {
 	stop   chan struct{}
 	done   chan struct{}
 
-	lastCredit   float64
-	lastRowCheck float64
+	lastCredit              float64
+	lastUsageMaintenance    time.Time
+	usageMaintenancePending bool
 
 	lastModelRefreshDate string
 	lastBenchDate        string
@@ -124,17 +126,20 @@ func today() string { return time.Now().Format("2006-01-02") }
 
 // cleanupUsage applies common retention and row limits.
 func (s *Scheduler) cleanupUsage() {
-	n, err := s.o.db.CleanupUsage(s.o.cfg.UsageRetentionDays)
-	if err != nil {
-		log.Printf("使用记录清理异常: %v", err)
-	} else if n > 0 {
-		log.Printf("使用记录清理完成（保留 %d 天，删除 %d 条）", s.o.cfg.UsageRetentionDays, n)
+	ctx, cancel := context.WithTimeout(s.context(), time.Second)
+	defer cancel()
+	err := s.o.db.MaintainUsage(ctx, s.o.cfg.UsageRetentionDays, s.o.cfg.UsageMaxRows, s.o.cfg.UsageContentRetentionDays, s.o.cfg.UsageContentBudgetBytes)
+	s.usageMaintenancePending = err != nil
+	if err != nil && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+		log.Printf("使用记录维护异常: %v", err)
 	}
-	s.checkUsageRows()
-	if n, err := s.o.db.CleanupOldDailyQuota(); err != nil {
-		log.Printf("日额度记录清理异常: %v", err)
-	} else if n > 0 {
-		log.Printf("日额度记录清理完成（删除 %d 条）", n)
+	s.lastUsageMaintenance = time.Now()
+	if s.lastCleanupDate != today() && ctx.Err() == nil {
+		if _, err := s.o.db.CleanupOldDailyQuota(); err != nil {
+			log.Printf("日额度记录清理异常: %v", err)
+		} else {
+			s.lastCleanupDate = today()
+		}
 	}
 }
 
@@ -142,7 +147,15 @@ func (s *Scheduler) cleanupUsage() {
 // and uses catch-up semantics (>= hour, not == hour) so a service that starts
 // after a window still performs that day's task.
 func (s *Scheduler) run() {
-	defer close(s.done)
+	maintenanceDone := make(chan struct{})
+	go s.runUsageMaintenance(maintenanceDone)
+	defer func() {
+		if s.cancel != nil {
+			s.cancel()
+		}
+		<-maintenanceDone
+		close(s.done)
+	}()
 	// Warm credits + model catalog once so the WebUI/API has data immediately.
 	// Bail early if shutdown races startup.
 	select {
@@ -160,8 +173,7 @@ func (s *Scheduler) run() {
 	// 同步 lastCredit：否则首个 tick 的周期判据（now-lastCredit >= interval）
 	// 因零值必然命中，刚预热完又对全部账号白刷一遍额度（Workbuddy2API #34 同款）。
 	s.lastCredit = float64(time.Now().Unix())
-	// lastRowCheck 同形：零值会让首个 tick 立即对 usage_logs 跑行数检查。
-	s.lastRowCheck = s.lastCredit
+
 	// AA benchmarks: warm once at startup so the Models page has data without
 	// waiting for the daily window (skipped cheaply when no key is configured).
 	if s.o.bench.Configured() {
@@ -202,10 +214,6 @@ func (s *Scheduler) tick() {
 		}
 	}
 	t := today()
-	if now.Hour() == 4 && s.lastCleanupDate != t {
-		s.cleanupUsage()
-		s.lastCleanupDate = t
-	}
 	if now.Hour() == parseHour(s.setting("model_refresh_hour", "6"), 6) && s.lastModelRefreshDate != t {
 		s.o.refreshRuntimeModels(ctx)
 		s.lastModelRefreshDate = t
@@ -215,41 +223,7 @@ func (s *Scheduler) tick() {
 		s.o.bench.Refresh()
 		s.lastBenchDate = t
 	}
-	// --- periodic usage row-count guard ---
-	// 天数保留一天判一次够用，但行数上限可能被一天内的高频调用冲破，所以按
-	// UsageCheckIntervalMin 定期检查。检查很便宜：先读 MIN/MAX(id) 预判，真超才删。
-	if s.o.cfg.UsageMaxRows > 0 {
-		checkEvery := s.o.cfg.UsageCheckIntervalMin
-		if checkEvery < 1 {
-			checkEvery = 30
-		}
-		if float64(now.Unix())-s.lastRowCheck >= float64(checkEvery)*60 {
-			s.checkUsageRows()
-			s.lastRowCheck = float64(now.Unix())
-		}
-	}
-}
 
-// checkUsageRows trims usage_logs to UsageMaxRows when exceeded. Uses the cheap
-// MIN/MAX(id) span as a "maybe over" precheck to avoid a COUNT(*)/DELETE on the
-// common (under-cap) path.
-func (s *Scheduler) checkUsageRows() {
-	max := s.o.cfg.UsageMaxRows
-	if max <= 0 {
-		return
-	}
-	lo, hi, err := s.o.db.UsageRowSpan()
-	if err != nil || hi <= 0 || (hi-lo+1) <= int64(max) {
-		return
-	}
-	n, err := s.o.db.CleanupUsageRows(max)
-	if err != nil {
-		log.Printf("使用记录行数检查异常: %v", err)
-		return
-	}
-	if n > 0 {
-		log.Printf("使用记录超出上限 %d 行，已截断最旧 %d 条", max, n)
-	}
 }
 
 func (s *Scheduler) setting(key, def string) string {
@@ -270,5 +244,34 @@ func (s *Scheduler) StopAndWait(ctx context.Context) error {
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
+	}
+}
+
+// Log maintenance is serialized independently of upstream warming/refreshing.
+// It participates in snapshot coordination, and shutdown joins both workers.
+func (s *Scheduler) runUsageMaintenance(done chan struct{}) {
+	defer close(done)
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.stop:
+			return
+		case <-s.context().Done():
+			return
+		default:
+		}
+		if s.usageMaintenancePending || s.lastUsageMaintenance.IsZero() || time.Since(s.lastUsageMaintenance) >= time.Duration(positiveOr(s.o.cfg.UsageCheckIntervalMin, 30))*time.Minute {
+			leave := statebackup.Enter()
+			s.cleanupUsage()
+			leave()
+		}
+		select {
+		case <-s.stop:
+			return
+		case <-s.context().Done():
+			return
+		case <-ticker.C:
+		}
 	}
 }

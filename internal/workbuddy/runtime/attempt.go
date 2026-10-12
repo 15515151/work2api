@@ -2,7 +2,6 @@ package runtime
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"strings"
 	"work2api/internal/core/provider"
@@ -77,9 +76,9 @@ func (r *Runtime) Stream(ctx context.Context, acc *pool.Account, body map[string
 			return streamwatch.ErrResponseTooLarge
 		}
 		if !started {
-			var chunk map[string]any
+			chunk := upstream.DecodeFrame(ctx, line)
 			data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-			parsed := json.Unmarshal([]byte(data), &chunk) == nil
+			parsed := chunk != nil
 			terminal := data == "[DONE]"
 			if choices, ok := chunk["choices"].([]any); ok {
 				for _, value := range choices {
@@ -120,6 +119,14 @@ func (r *Runtime) Stream(ctx context.Context, acc *pool.Account, body map[string
 	if opts.OnAttempt != nil {
 		opts.OnAttempt(ref)
 	}
-	err = client.StreamUpstream(ctx, headers, body, url, wrapped)
+	normalizer := &toolFinishNormalizer{}
+	err = client.StreamUpstream(ctx, headers, body, url, func(line string) error {
+		for _, normalized := range normalizer.lines(ctx, line) {
+			if err := wrapped(normalized); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 	return started, err
 }

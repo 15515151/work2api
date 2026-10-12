@@ -47,9 +47,10 @@ func (s *Server) dispatchRuntimeTo(w http.ResponseWriter, r *http.Request, proto
 	// strips its own prefix before talking to its upstream.
 	payload["model"] = resolved
 	var customNames map[string]bool
+	var namespaceNames map[string]protocol.NamespaceName
 	if proto == provider.ProtocolResponses {
 		var err error
-		payload, customNames, err = protocol.PrepareCustomTools(payload)
+		payload, customNames, namespaceNames, err = protocol.PrepareClientTools(payload)
 		if err != nil {
 			writeAPIErr(w, errBody(400, err.Error(), "invalid_request_error"))
 			return true
@@ -62,6 +63,7 @@ func (s *Server) dispatchRuntimeTo(w http.ResponseWriter, r *http.Request, proto
 	call.Provider = rt.Name()
 	call.Caller = principal.SessionCaller()
 	call.UsageObserver = principal.quota
+	call.LogCapture = &provider.LogCapturePolicy{Enabled: principal.UserID == 0, Limit: s.o.cfg.UsageContentMaxBytes}
 	ctx = s.o.invocationContext(provider.WithInvocation(ctx, call))
 	writer := &cancelWriter{ResponseWriter: w, cancel: cancel}
 	var output http.ResponseWriter = writer
@@ -69,8 +71,8 @@ func (s *Server) dispatchRuntimeTo(w http.ResponseWriter, r *http.Request, proto
 		output = &flushCancelWriter{writer}
 	}
 	var customWriter *protocol.CustomToolWriter
-	if len(customNames) > 0 {
-		customWriter = protocol.NewCustomToolWriter(output, customNames, 4*int(s.o.cfg.MaxResponseBytes))
+	if len(customNames) > 0 || len(namespaceNames) > 0 {
+		customWriter = protocol.NewClientToolWriter(output, customNames, namespaceNames, 4*int(s.o.cfg.MaxResponseBytes))
 		output = customWriter
 	}
 	request := provider.ServeRequest{

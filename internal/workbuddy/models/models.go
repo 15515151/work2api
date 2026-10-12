@@ -71,14 +71,15 @@ type Registry struct {
 	db     Settings
 	client *http.Client
 
-	refreshMu sync.Mutex
-	mu        sync.Mutex
-	models    []map[string]any
-	reasoning map[string]map[string]any
-	fetchedAt float64
-	lastFail  float64
-	stale     bool
-	source    string
+	refreshMu  sync.Mutex
+	mu         sync.Mutex
+	models     []map[string]any
+	modelIndex map[string]map[string]any
+	reasoning  map[string]map[string]any
+	fetchedAt  float64
+	lastFail   float64
+	stale      bool
+	source     string
 	// catalogCache 按 (profile, uid, url) 保存各来源的成功快照：单一路失败
 	// 不砍掉另一来源的专属模型（上游 0.6.3 _catalog_cache 同款）。
 	catalogCache map[[3]string][]fetchedModel
@@ -144,6 +145,31 @@ func (r *Registry) ListCached() []map[string]any {
 	return withStandardAll(r.models)
 }
 
+// CachedModel reads one catalog entry without projecting the whole directory.
+// The second result distinguishes an empty catalog from an unknown model.
+func (r *Registry) CachedModel(model string) (map[string]any, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	entry := r.modelLocked(model)
+	if entry == nil {
+		return nil, len(r.models) > 0
+	}
+	return cloneMap(entry), true
+}
+
+func (r *Registry) modelLocked(model string) map[string]any {
+	if r.modelIndex == nil {
+		r.modelIndex = make(map[string]map[string]any, len(r.models))
+		for _, entry := range r.models {
+			id := str(entry["id"])
+			if _, ok := r.modelIndex[id]; !ok {
+				r.modelIndex[id] = entry
+			}
+		}
+	}
+	return r.modelIndex[model]
+}
+
 // ClearCatalogSnapshots drops every per-source success snapshot (tests and
 // administrative resets only): the next refresh republishes from live sources
 // alone, without any fallback history.
@@ -176,17 +202,15 @@ func (r *Registry) Source() string {
 func (r *Registry) CreditsByRegion(model string) map[string]float64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	for _, m := range r.models {
-		if str(m["id"]) == model {
-			if cbr, ok := m["credits_by_region"].(map[string]float64); ok && len(cbr) > 0 {
-				out := make(map[string]float64, len(cbr))
-				for k, v := range cbr {
-					out[k] = v
-				}
-				return out
+	if m := r.modelLocked(model); m != nil {
+		if cbr, ok := m["credits_by_region"].(map[string]float64); ok && len(cbr) > 0 {
+			out := make(map[string]float64, len(cbr))
+			for k, v := range cbr {
+				out[k] = v
 			}
-			return nil
+			return out
 		}
+		return nil
 	}
 	return nil
 }
@@ -248,6 +272,7 @@ func (r *Registry) RefreshWithStatus(ctx context.Context) ([]map[string]any, err
 		return withStandardAll(r.models), ErrRefreshFailed
 	}
 	r.models = nil
+	r.modelIndex = nil
 	r.reasoning = map[string]map[string]any{}
 	for _, f := range fetched {
 		r.models = append(r.models, f.entry)
@@ -354,11 +379,9 @@ func (r *Registry) RequestEfforts(model, requested string) []string {
 func (r *Registry) MaxOutputTokens(model string) int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	for _, m := range r.models {
-		if str(m["id"]) == model {
-			if n, ok := toInt(m["max_output_tokens"]); ok {
-				return n
-			}
+	if m := r.modelLocked(model); m != nil {
+		if n, ok := toInt(m["max_output_tokens"]); ok {
+			return n
 		}
 	}
 	return 0
@@ -602,6 +625,7 @@ func (r *Registry) RefreshAccount(ctx context.Context, uid string) bool {
 		}
 	}
 	r.models = updated
+	r.modelIndex = nil
 	r.source = "dynamic"
 	r.lastFail = 0
 	return true

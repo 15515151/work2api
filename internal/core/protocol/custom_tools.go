@@ -123,6 +123,7 @@ func copyCustomMap(input map[string]any) map[string]any {
 type CustomToolWriter struct {
 	http.ResponseWriter
 	names      map[string]bool
+	namespaces map[string]NamespaceName
 	items      map[string]bool
 	delivered  map[string]bool
 	buffer     bytes.Buffer
@@ -139,6 +140,12 @@ func NewCustomToolWriter(w http.ResponseWriter, names map[string]bool, limit int
 		limit = 32 << 20
 	}
 	return &CustomToolWriter{ResponseWriter: w, names: names, items: map[string]bool{}, delivered: map[string]bool{}, limit: limit}
+}
+
+func NewClientToolWriter(w http.ResponseWriter, names map[string]bool, namespaces map[string]NamespaceName, limit int) *CustomToolWriter {
+	writer := NewCustomToolWriter(w, names, limit)
+	writer.namespaces = namespaces
+	return writer
 }
 
 func (w *CustomToolWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
@@ -286,7 +293,16 @@ func customInput(arguments any) (string, error) {
 	return input, nil
 }
 func (w *CustomToolWriter) restoreItem(item map[string]any, added bool) error {
-	if jsonutil.StringAt(item, "type") != "function_call" || !w.names[jsonutil.StringAt(item, "name")] {
+	if jsonutil.StringAt(item, "type") != "function_call" {
+		return nil
+	}
+	name := jsonutil.StringAt(item, "name")
+	defer func() {
+		if original, ok := w.namespaces[name]; ok {
+			item["name"], item["namespace"] = original.Name, original.Namespace
+		}
+	}()
+	if !w.names[name] {
 		return nil
 	}
 	input := ""
@@ -337,6 +353,8 @@ func (w *CustomToolWriter) restoreEvent(event map[string]any) ([]map[string]any,
 			if !added && !w.delivered[id] {
 				events = append(events, w.inputEvents(id, event["output_index"], jsonutil.StringAt(item, "input"))...)
 			}
+		} else if err := w.restoreItem(item, added); err != nil {
+			return nil, err
 		}
 	case "response.function_call_arguments.delta":
 		if w.items[id] {

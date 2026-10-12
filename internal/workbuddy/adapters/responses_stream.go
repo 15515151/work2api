@@ -86,6 +86,13 @@ func (c *ResponsesStreamConverter) FeedLine(line string) string {
 	if json.Unmarshal([]byte(data), &chunk) != nil {
 		return ""
 	}
+	return c.FeedChunk(chunk)
+}
+
+func (c *ResponsesStreamConverter) FeedChunk(chunk map[string]any) string {
+	if chunk == nil {
+		return ""
+	}
 	return c.processChunk(chunk)
 }
 

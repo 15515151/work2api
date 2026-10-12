@@ -41,6 +41,11 @@ async function load() {
   }
 }
 
+function memorySize(value: number | null | undefined): string {
+  if (value == null) return '—'
+  return `${(value / 1048576).toFixed(1)} MiB`
+}
+
 function waitingLabel(reason: string): string {
   return ({ upstream_pacing: '请求间隔', key_or_user_limit: '用户/Key 并发', shared_limit: '共享并发', memory_pressure: '内存保护', response_buffer_budget: '响应缓冲', execution_limit: '全局并发', account_busy: '账号名额', fairness: '公平调度' } as Record<string,string>)[reason] || reason
 }
@@ -93,7 +98,7 @@ onUnmounted(() => timer && clearInterval(timer))
         <span>模型执行 {{ ov.admission.running }}<template v-if="ov.admission.limits_disabled"> · 无本地并发限制</template><template v-else> / {{ ov.admission.capacity }}（硬上限）</template></span>
         <span v-if="ov.admission.shared_capacity != null">用户池 {{ ov.admission.shared_running }} / {{ ov.admission.shared_capacity }}</span>
         <span v-if="ov.admission.buffer_budget_bytes">响应预留 {{ ((ov.admission.buffer_reserved_bytes || 0) / 1048576).toFixed(0) }} / {{ (ov.admission.buffer_budget_bytes / 1048576).toFixed(0) }} MiB</span>
-        <span v-if="ov.admission.memory_pressure" class="text-warn">内存压力保护中，新请求等待恢复</span>
+        <span v-if="!ov.admission.limits_disabled && ov.admission.memory_pressure" class="text-warn">内存压力保护中，新请求等待恢复</span>
         <span v-if="!ov.admission.limits_disabled">排队 {{ ov.admission.queued }} / {{ ov.admission.queue_capacity }}</span>
         <span>最长等待 {{ (ov.admission.oldest_wait_ms / 1000).toFixed(1) }} 秒</span>
         <span>请求体占用 {{ ((ov.request_body_bytes || 0) / 1048576).toFixed(1) }} MiB</span>
@@ -127,6 +132,20 @@ onUnmounted(() => timer && clearInterval(timer))
           <div v-if="call.attempts > (call.attempt_stages?.length || 0)" class="ml-3 text-micro text-faint">仅保留前 16 次尝试的阶段记录</div>
         </div>
         <p class="mt-2 text-micro text-faint">响应头耗时不包含完整生成时间；请求正文与凭据不进入这些记录。</p>
+      </details>
+    </WCard>
+    <WCard v-if="ov?.resource_metrics" class="mb-4">
+      <details class="text-small">
+        <summary class="cursor-pointer text-muted">资源与日志维护</summary>
+        <dl class="mt-3 grid gap-x-6 gap-y-3 sm:grid-cols-2 lg:grid-cols-3">
+          <div><dt class="text-micro text-faint">Go 内存 / 堆对象</dt><dd class="mono mt-1">{{ memorySize(ov.resource_metrics.go_memory_in_use_bytes) }} / {{ memorySize(ov.resource_metrics.heap_objects_bytes) }}</dd></div>
+          <div><dt class="text-micro text-faint">请求体内存 / Goroutines</dt><dd class="mono mt-1">{{ memorySize(ov.resource_metrics.request_body_bytes) }} / {{ int(ov.resource_metrics.goroutines) }}</dd></div>
+          <div><dt class="text-micro text-faint">数据库 / WAL</dt><dd class="mono mt-1">{{ memorySize(ov.resource_metrics.database_bytes) }} / {{ memorySize(ov.resource_metrics.wal_bytes) }}</dd></div>
+          <div><dt class="text-micro text-faint">日志写入平均耗时 / 失败</dt><dd class="mono mt-1">{{ ov.resource_metrics.usage.write_average_ms.toFixed(2) }} ms / {{ int(ov.resource_metrics.usage.write_errors) }}</dd></div>
+          <div><dt class="text-micro text-faint">日志维护</dt><dd class="mt-1">{{ ov.resource_metrics.usage.maintenance_running ? '进行中' : '空闲' }} · {{ int(ov.resource_metrics.usage.maintenance_runs) }} 次 · 失败 {{ int(ov.resource_metrics.usage.maintenance_errors) }}</dd></div>
+          <div><dt class="text-micro text-faint">上次维护耗时</dt><dd class="mono mt-1">{{ ov.resource_metrics.usage.maintenance_runs ? ov.resource_metrics.usage.maintenance_last_ms + ' ms' : '—' }}</dd></div>
+        </dl>
+        <p class="mt-3 text-micro text-faint">资源采样缓存 10 秒，计数随服务重启重置；Go 内存不等于进程或整机占用。写入耗时包含锁等待，维护耗时包含分批清理。</p>
       </details>
     </WCard>
     <template v-if="ov">

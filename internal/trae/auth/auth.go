@@ -31,10 +31,11 @@ type Auth struct {
 	FilePath         string // 落盘路径；refresh 后原子写回
 }
 
-func (a *Auth) Lock()    { a.mu.Lock() }
-func (a *Auth) Unlock()  { a.mu.Unlock() }
-func (a *Auth) RLock()   { a.mu.RLock() }
-func (a *Auth) RUnlock() { a.mu.RUnlock() }
+func (a *Auth) Lock()          { a.mu.Lock() }
+func (a *Auth) Unlock()        { a.mu.Unlock() }
+func (a *Auth) RLock()         { a.mu.RLock() }
+func (a *Auth) TryRLock() bool { return a.mu.TryRLock() }
+func (a *Auth) RUnlock()       { a.mu.RUnlock() }
 func (a *Auth) JWT() string {
 	a.mu.RLock()
 	defer a.mu.RUnlock()

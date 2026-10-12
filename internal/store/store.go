@@ -31,7 +31,8 @@ import (
 // v16 adds stable usage app IDs and independent daily execution quotas.
 // v18 adds bounded, content-free request diagnostics to usage records.
 // v19 adds owner identity, credential epochs, temporary passwords and identity audit.
-const SchemaVersion = 22
+// v23 adds indexed diagnostic-content byte accounting, lazily backfilled.
+const SchemaVersion = 23
 
 // DB wraps the SQLite connection.
 type DB struct {
@@ -44,6 +45,7 @@ type DB struct {
 	// invalidated on SaveSettings; nil means "not populated yet".
 	settingsCache map[string]string
 	routesCache   []ModelRoute
+	usageRuntime  usageRuntime
 }
 
 // DefaultSettings mirror db.py DEFAULT_SETTINGS.
@@ -268,6 +270,13 @@ CREATE INDEX IF NOT EXISTS idx_usage_protocol ON usage_logs(protocol);
 		}
 	}
 	if _, err := tx.Exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_apps_user_name ON apps(user_id,name)"); err != nil {
+		return err
+	}
+	// Nullable for old records: backfill occurs in bounded background batches.
+	if _, err := tx.Exec("ALTER TABLE usage_logs ADD COLUMN content_bytes INTEGER"); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+		return err
+	}
+	if _, err := tx.Exec("CREATE INDEX IF NOT EXISTS idx_usage_content_bytes ON usage_logs(content_bytes)"); err != nil {
 		return err
 	}
 	if _, err := tx.Exec("ALTER TABLE usage_logs ADD COLUMN app_id INTEGER"); err != nil && !strings.Contains(err.Error(), "duplicate column") {

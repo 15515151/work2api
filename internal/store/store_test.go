@@ -3,7 +3,9 @@ package store
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestBudgetSamplesExcludeUnknownTokensErrorsAndOldHistory(t *testing.T) {
@@ -434,5 +436,71 @@ func TestUsageTokenDetailsRejectImpossibleCounts(t *testing.T) {
 		if diag, ok := row["diagnostics"].(UsageDiagnostics); ok && diag.TokenDetails != nil {
 			t.Fatal("impossible counts retained", row)
 		}
+	}
+}
+
+func TestUsageMaintenanceKeepsAccountingAndBoundsContent(t *testing.T) {
+	db, err := New(filepath.Join(t.TempDir(), "maintenance.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	credit := 2.0
+	known := true
+	ids := []int64{}
+	for i := 0; i < 5; i++ {
+		id, err := db.LogUsageWithID(UsageParams{Model: "test", InputTokens: 10, OutputTokens: 5, TokensKnown: &known, Credits: &credit, InputContent: strings.Repeat("a", 40), OutputContent: "reply", Diagnostics: &UsageDiagnostics{FinishReason: "stop", Performance: &UsagePerformance{RequestID: "test-id"}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	if _, err := db.db.Exec("UPDATE usage_logs SET content_bytes=NULL WHERE id=?", ids[3]); err != nil {
+		t.Fatal(err)
+	}
+	old := float64(time.Now().Add(-8 * 24 * time.Hour).Unix())
+	if _, err := db.db.Exec("UPDATE usage_logs SET ts=? WHERE id=?", old, ids[0]); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MaintainUsage(t.Context(), 30, 100, 7, 90); err != nil {
+		t.Fatal(err)
+	}
+	for i, id := range ids {
+		row, err := db.GetUsage(int(id))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if row["input_tokens"] != int64(10) || row["output_tokens"] != int64(5) {
+			t.Fatal("accounting changed", row)
+		}
+		diag := row["diagnostics"].(UsageDiagnostics)
+		if diag.FinishReason != "stop" || diag.Performance.RequestID != "test-id" {
+			t.Fatal("diagnostics lost", diag)
+		}
+		if (row["input_content"] == "") != (i < 3) || diag.ContentCleared != (i < 3) {
+			t.Fatal("oldest content policy failed", i, row)
+		}
+	}
+	var queryPlan string
+	if err := db.db.QueryRow("EXPLAIN QUERY PLAN SELECT COALESCE(SUM(content_bytes),0) FROM usage_logs").Scan(new(int), new(int), new(int), &queryPlan); err != nil || !strings.Contains(queryPlan, "idx_usage_content_bytes") {
+		t.Fatal("budget reads full bodies", queryPlan, err)
+	}
+	var measured int64
+	if err := db.db.QueryRow("SELECT SUM(content_bytes) FROM usage_logs").Scan(&measured); err != nil || measured != 90 {
+		t.Fatal("size backfill or accounting failed", measured, err)
+	}
+	if n, _ := db.UsageRowCount(); n != 5 {
+		t.Fatal("content cleanup removed rows", n)
+	}
+	canceled, cancel := context.WithCancel(t.Context())
+	cancel()
+	if err := db.MaintainUsage(canceled, 1, 1, 1, 1); err != context.Canceled {
+		t.Fatal(err)
+	}
+	if err := db.MaintainUsage(t.Context(), 0, 2, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := db.UsageRowCount(); n != 2 {
+		t.Fatal("row cleanup failed", n)
 	}
 }

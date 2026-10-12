@@ -1,9 +1,11 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -130,6 +132,7 @@ type UsageParams struct {
 
 // UsageDiagnostics contains protocol facts only, never prompts or credentials.
 type UsageDiagnostics struct {
+	ContentCleared  bool               `json:"content_cleared,omitempty"`
 	TokenDetails    *UsageTokenDetails `json:"token_details,omitempty"`
 	RequestedModel  string             `json:"requested_model,omitempty"`
 	PhysicalModel   string             `json:"physical_model,omitempty"`
@@ -154,7 +157,15 @@ func (d *DB) LogUsage(p UsageParams) error {
 	return err
 }
 
-func (d *DB) LogUsageWithID(p UsageParams) (int64, error) {
+func (d *DB) LogUsageWithID(p UsageParams) (id int64, resultErr error) {
+	started := time.Now()
+	defer func() {
+		d.usageRuntime.writes.Add(1)
+		d.usageRuntime.writeNS.Add(uint64(time.Since(started)))
+		if resultErr != nil {
+			d.usageRuntime.writeErrors.Add(1)
+		}
+	}()
 	if p.Status == "" {
 		p.Status = "ok"
 	}
@@ -207,11 +218,11 @@ func (d *DB) LogUsageWithID(p UsageParams) (int64, error) {
 	result, err := d.db.Exec(
 		`INSERT INTO usage_logs (ts, model, protocol, account_uid, input_tokens, output_tokens,
 		   total_tokens, latency_ms, status, error, input_content, output_content,
-		   reasoning_content, credits, app_name, user_id, reasoning_effort, tokens_known, cached_tokens, app_id, diagnostics)
-		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		   reasoning_content, credits, app_name, user_id, reasoning_effort, tokens_known, cached_tokens, app_id, diagnostics, content_bytes)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		float64(time.Now().UnixNano())/1e9, p.Model, p.Protocol, p.AccountUID,
 		p.InputTokens, p.OutputTokens, total, p.LatencyMs, p.Status, p.Error,
-		p.InputContent, p.OutputContent, p.ReasoningContent, credits, p.AppName, userID, effort, p.TokensKnown, cached, nullableID(p.AppID), diagnostics)
+		p.InputContent, p.OutputContent, p.ReasoningContent, credits, p.AppName, userID, effort, p.TokensKnown, cached, nullableID(p.AppID), diagnostics, len(p.InputContent)+len(p.OutputContent)+len(p.ReasoningContent))
 	if err != nil {
 		return 0, err
 	}
@@ -571,4 +582,142 @@ func (d *DB) UsageTimeseries(granularity string, points int, model string) ([]ma
 		})
 	}
 	return out, nil
+}
+
+// MaintainUsage performs bounded transactions. A canceled run can resume safely;
+// clearing diagnostic text never changes usage, billing or performance counters.
+func (d *DB) MaintainUsage(ctx context.Context, days, maxRows, contentDays int, contentBudget int64) (resultErr error) {
+	started := time.Now()
+	d.usageRuntime.maintenanceActive.Store(true)
+	defer func() {
+		d.usageRuntime.maintenanceMS.Store(uint64(time.Since(started).Milliseconds()))
+		d.usageRuntime.maintenanceRuns.Add(1)
+		if resultErr != nil && ctx.Err() == nil {
+			d.usageRuntime.maintenanceErrors.Add(1)
+		}
+		d.usageRuntime.maintenanceActive.Store(false)
+	}()
+	const batch = 64
+	run := func(query string, args ...any) (int64, error) {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		d.mu.Lock()
+		res, err := d.db.ExecContext(ctx, query, args...)
+		d.mu.Unlock()
+		if err != nil {
+			return 0, err
+		}
+		return res.RowsAffected()
+	}
+	loop := func(query string, args ...any) error {
+		for {
+			n, err := run(query, args...)
+			if err != nil {
+				return err
+			}
+			if n < batch {
+				return nil
+			}
+		}
+	}
+	now := float64(time.Now().UnixNano()) / 1e9
+	if days > 0 {
+		if err := loop("DELETE FROM usage_logs WHERE id IN (SELECT id FROM usage_logs WHERE ts < ? ORDER BY ts LIMIT 64)", now-float64(days)*86400); err != nil {
+			return err
+		}
+	}
+	if maxRows > 0 {
+		if err := loop(`DELETE FROM usage_logs WHERE id IN (SELECT id FROM usage_logs WHERE id <=
+   (SELECT MAX(id) FROM (SELECT id FROM usage_logs ORDER BY id DESC LIMIT -1 OFFSET ?)) ORDER BY id LIMIT 64)`, maxRows); err != nil {
+			return err
+		}
+	}
+	const hasContent = "(content_bytes>0 OR (content_bytes IS NULL AND (COALESCE(input_content,'')<>'' OR COALESCE(output_content,'')<>'' OR COALESCE(reasoning_content,'')<>'')))"
+	const clear = `UPDATE usage_logs SET input_content='',output_content='',reasoning_content='',content_bytes=0,
+ diagnostics=json_set(CASE WHEN json_valid(diagnostics) THEN CASE WHEN json_type(diagnostics)='object' THEN diagnostics ELSE '{}' END ELSE '{}' END,'$.content_cleared',json('true')) WHERE id IN `
+	if contentDays > 0 {
+		if err := loop(clear+"(SELECT id FROM usage_logs WHERE ts < ? AND "+hasContent+" ORDER BY ts LIMIT 64)", now-float64(contentDays)*86400); err != nil {
+			return err
+		}
+	}
+	if contentBudget <= 0 {
+		return nil
+	}
+	// Backfill historical sizes once, in resumable short batches. Aggregation
+	// then reads the covering numeric index, not every saved prompt body.
+	const size = "COALESCE(length(CAST(input_content AS BLOB)),0)+COALESCE(length(CAST(output_content AS BLOB)),0)+COALESCE(length(CAST(reasoning_content AS BLOB)),0)"
+	if err := loop("UPDATE usage_logs SET content_bytes=" + size + " WHERE id IN (SELECT id FROM usage_logs WHERE content_bytes IS NULL LIMIT 64)"); err != nil {
+		return err
+	}
+	d.mu.Lock()
+	var total int64
+	err := d.db.QueryRowContext(ctx, "SELECT COALESCE(SUM(content_bytes),0) FROM usage_logs").Scan(&total)
+	d.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	for total > contentBudget {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		d.mu.Lock()
+		rows, err := d.db.QueryContext(ctx, "SELECT id,content_bytes FROM usage_logs WHERE content_bytes>0 ORDER BY ts,id LIMIT 64")
+		if err != nil {
+			d.mu.Unlock()
+			return err
+		}
+		ids := []int64{}
+		var released int64
+		for rows.Next() {
+			var id, n int64
+			if err = rows.Scan(&id, &n); err != nil {
+				break
+			}
+			ids = append(ids, id)
+			released += n
+			if total-released <= contentBudget {
+				break
+			}
+		}
+		if err == nil {
+			err = rows.Err()
+		}
+		rows.Close()
+		d.mu.Unlock()
+		if err != nil {
+			return err
+		}
+		if len(ids) == 0 {
+			return nil
+		}
+		marks := make([]string, len(ids))
+		args := make([]any, len(ids))
+		for i, id := range ids {
+			marks[i] = "?"
+			args[i] = id
+		}
+		if _, err := run(clear+"("+strings.Join(marks, ",")+")", args...); err != nil {
+			return err
+		}
+		total -= released
+	}
+	return nil
+}
+
+// Content-free, fixed-cardinality counters; these are observation, not limits.
+type usageRuntime struct {
+	writes, writeNS, writeErrors                      atomic.Uint64
+	maintenanceRuns, maintenanceMS, maintenanceErrors atomic.Uint64
+	maintenanceActive                                 atomic.Bool
+}
+
+func (d *DB) UsageRuntimeStats() map[string]any {
+	calls := d.usageRuntime.writes.Load()
+	var average float64
+	if calls > 0 {
+		average = float64(d.usageRuntime.writeNS.Load()) / float64(calls) / 1e6
+	}
+	return map[string]any{"write_attempts": calls, "write_errors": d.usageRuntime.writeErrors.Load(), "write_average_ms": average,
+		"maintenance_runs": d.usageRuntime.maintenanceRuns.Load(), "maintenance_last_ms": d.usageRuntime.maintenanceMS.Load(), "maintenance_errors": d.usageRuntime.maintenanceErrors.Load(), "maintenance_running": d.usageRuntime.maintenanceActive.Load()}
 }

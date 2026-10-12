@@ -36,6 +36,7 @@ func (s *Server) mountAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("POST /admin/login", s.handleAdminLogin)
 	mux.HandleFunc("POST /admin/logout", s.handleAdminLogout)
 	mux.HandleFunc("GET /admin/overview", s.adminOverview)
+	mux.HandleFunc("GET /admin/resources", s.adminResources)
 	mux.HandleFunc("GET /admin/update", s.adminUpdate)
 	mux.HandleFunc("POST /admin/update/check", s.adminUpdate)
 	mux.HandleFunc("POST /admin/update/download", s.adminUpdate)
@@ -162,6 +163,7 @@ func (s *Server) adminOverview(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{
 		"admission":          s.modelsAdmission.snapshot(),
 		"call_metrics":       s.calls.snapshot(),
+		"resource_metrics":   s.resourceSnapshot(),
 		"backup":             s.o.backupStatus(),
 		"request_body_bytes": s.bodies.usage(),
 		"accounts":           accounts,

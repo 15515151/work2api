@@ -77,16 +77,9 @@ func (o *Runtime) PenalizeAccount(acc *pool.Account, model string, ue *upstream.
 }
 
 func (o *Runtime) ModelAccountUIDs(model string) (map[string]bool, *apiError) {
-	entries := o.Catalog.ListCached()
-	if len(entries) == 0 {
+	entry, ready := o.Catalog.CachedModel(model)
+	if !ready {
 		return nil, errBody(503, "模型目录尚未就绪，请稍后重试或在管理端刷新模型目录", "model_unavailable")
-	}
-	var entry map[string]any
-	for _, m := range entries {
-		if m["id"] == model {
-			entry = m
-			break
-		}
 	}
 	if entry == nil {
 		return nil, errBody(400, "模型 "+model+" 不在当前模型目录中，请检查模型名或刷新模型目录", "invalid_request_error")

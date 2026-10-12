@@ -39,7 +39,6 @@ type bridgeStreamEmitter struct {
 	reasoningEncrypted string
 	text               strings.Builder
 	reasoning          strings.Builder
-	reasoningSignature strings.Builder
 
 	tools map[string]*bridgeStreamTool
 	order []string
@@ -97,19 +96,22 @@ func (emitter *bridgeStreamEmitter) Emit(event bridgeStreamEvent) error {
 		if event.Text == "" {
 			return nil
 		}
-		emitter.reasoning.WriteString(event.Text)
+		if emitter.target == Responses {
+			emitter.reasoning.WriteString(event.Text)
+		}
 		return emitter.emitReasoning(event.Text)
 	case "reasoning_signature":
 		if event.Signature == "" {
 			return nil
 		}
-		emitter.reasoningSignature.WriteString(event.Signature)
 		return emitter.emitReasoningSignature(event.Signature)
 	case "text":
 		if event.Text == "" {
 			return nil
 		}
-		emitter.text.WriteString(event.Text)
+		if emitter.target == Responses {
+			emitter.text.WriteString(event.Text)
+		}
 		return emitter.emitText(event.Text)
 	case "tool_start":
 		tool := emitter.tool(event.ToolKey)
@@ -469,7 +471,16 @@ func (emitter *bridgeStreamEmitter) emitPendingToolArguments(tool *bridgeStreamT
 	}
 	delta := arguments[tool.EmittedArguments:]
 	tool.EmittedArguments = len(arguments)
-	return emitter.emitToolDelta(tool, delta)
+	if err := emitter.emitToolDelta(tool, delta); err != nil {
+		return err
+	}
+	// Responses needs complete arguments in its done events. Chat/Messages
+	// have already sent this prefix and only need any future unsent fragment.
+	if emitter.target != Responses {
+		tool.Arguments.Reset()
+		tool.EmittedArguments = 0
+	}
+	return nil
 }
 
 func (emitter *bridgeStreamEmitter) Finish() error {

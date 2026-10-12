@@ -9,8 +9,104 @@ import (
 	"strings"
 	"testing"
 
+	"context"
+	"unicode/utf8"
+	"work2api/internal/core/provider"
 	"work2api/internal/jsonutil"
 )
+
+type terminalOnlyReader struct {
+	wire  string
+	reads int
+}
+
+func (r *terminalOnlyReader) Read(p []byte) (int, error) {
+	r.reads++
+	if r.reads > 1 {
+		return 0, fmt.Errorf("read after terminal")
+	}
+	return copy(p, r.wire), nil
+}
+
+func TestForwardStreamStopsAtTerminalWithoutEOF(t *testing.T) {
+	for _, tc := range []struct {
+		proto Protocol
+		wire  string
+	}{
+		{Chat, "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3,\"total_tokens\":10}}\n\ndata: [DONE]\n\n"},
+		{Anthropic, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"},
+		{Responses, "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"},
+	} {
+		reader := &terminalOnlyReader{wire: tc.wire + ": after terminal\n\n"}
+		w := httptest.NewRecorder()
+		usage, known, err := ForwardStream(context.Background(), w, reader, tc.proto, "test")
+		if err != nil || reader.reads != 1 || w.Body.String() != tc.wire {
+			t.Fatal(tc.proto, err, reader.reads, w.Body.String())
+		}
+		if tc.proto == Chat && (!known || usage.Total != 10) {
+			t.Fatal("terminal usage lost", usage)
+		}
+	}
+}
+
+func TestNamespaceToolsRoundTrip(t *testing.T) {
+	body := map[string]any{
+		"tools":       []any{map[string]any{"type": "function", "name": "shell"}, map[string]any{"type": "namespace", "name": "functions", "tools": []any{map[string]any{"type": "function", "name": "shell", "parameters": map[string]any{"type": "object"}}, map[string]any{"type": "custom", "name": "patch"}}}},
+		"tool_choice": map[string]any{"type": "function", "namespace": "functions", "name": "shell"},
+		"input":       []any{map[string]any{"type": "function_call", "namespace": "functions", "name": "shell", "call_id": "call_1", "arguments": "{}"}, map[string]any{"type": "function_call_output", "call_id": "call_1", "output": "ok"}},
+	}
+	before, _ := json.Marshal(body)
+	prepared, custom, mapping, err := PrepareClientTools(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, _ := json.Marshal(body)
+	if !bytes.Equal(before, after) {
+		t.Fatal("namespace adaptation mutated request")
+	}
+	flat := jsonutil.StringAt(prepared, "tool_choice", "name")
+	if mapping[flat] != (NamespaceName{"functions", "shell"}) || len(custom) != 1 || jsonutil.StringAt(jsonutil.SliceAt(prepared, "input")[0].(map[string]any), "name") != flat {
+		t.Fatal("namespace history or choice lost", prepared)
+	}
+	for _, stream := range []bool{false, true} {
+		w := httptest.NewRecorder()
+		writer := NewClientToolWriter(w, custom, mapping, 1<<20)
+		item := map[string]any{"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": flat, "arguments": "{}"}
+		patchFlat := ""
+		for name, entry := range mapping {
+			if entry.Name == "patch" {
+				patchFlat = name
+			}
+		}
+		patch := map[string]any{"type": "function_call", "id": "fc_patch", "call_id": "call_patch", "name": patchFlat, "arguments": `{"input":"hello"}`}
+		response := map[string]any{"output": []any{item, patch}, "status": "completed"}
+		if stream {
+			writer.Header().Set("Content-Type", "text/event-stream")
+			for _, event := range []map[string]any{{"type": "response.output_item.added", "item": item}, {"type": "response.output_item.done", "item": patch}, {"type": "response.completed", "response": response}} {
+				raw, _ := json.Marshal(event)
+				if _, err := writer.Write([]byte("data: " + string(raw) + "\n\n")); err != nil {
+					t.Fatal(err)
+				}
+			}
+		} else {
+			raw, _ := json.Marshal(response)
+			writer.Write(raw)
+		}
+		if err := writer.Finish(); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(w.Body.String(), `"namespace":"functions"`) || !strings.Contains(w.Body.String(), `"name":"shell"`) || strings.Contains(w.Body.String(), flat) {
+			t.Fatal("namespace response not restored", w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), `"type":"custom_tool_call"`) || !strings.Contains(w.Body.String(), `"input":"hello"`) || strings.Contains(w.Body.String(), patchFlat) {
+			t.Fatal("namespaced custom call lost", w.Body.String())
+		}
+	}
+	bad := map[string]any{"tools": []any{map[string]any{"type": "namespace", "name": "functions", "tools": []any{map[string]any{"type": "function", "name": "shell"}, map[string]any{"type": "function", "name": "shell"}}}}}
+	if _, _, _, err := PrepareClientTools(bad); err == nil {
+		t.Fatal("duplicate namespace tools accepted")
+	}
+}
 
 func TestCustomToolsRoundTrip(t *testing.T) {
 	patch := "*** Begin Patch\n*** Add File: hello.txt\n+你好\\world\n*** End Patch"
@@ -304,6 +400,72 @@ func TestCollapseDoesNotInventMissingUsage(t *testing.T) {
 			if reported || got.FinishReason != reason {
 				t.Fatalf("response %s: %+v", reason, got)
 			}
+		}
+	}
+}
+
+func TestUsageObserverFragmentationAndBufferRelease(t *testing.T) {
+	for _, delimiter := range []string{"\n\n", "\r\n\r\n"} {
+		frame := `data: {"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}` + delimiter
+		wire := ":" + strings.Repeat("x", 160<<10) + delimiter + frame + "data: [DONE]" + delimiter
+		for _, size := range []int{1, 3, 65536, len(wire)} {
+			observer := newStreamUsageObserver(Chat)
+			for start := 0; start < len(wire); start += size {
+				observer.Write([]byte(wire[start:min(start+size, len(wire))]))
+			}
+			if !observer.Reported() || !observer.NormalTermination() || observer.ParseError() != nil || observer.usage.Total != 10 {
+				t.Fatalf("fragment size %d: usage=%+v normal=%v error=%v", size, observer.usage, observer.normal, observer.parseErr)
+			}
+			if len(observer.buffer) != 0 || cap(observer.buffer) > 128<<10 {
+				t.Fatal("completed oversized frame retained")
+			}
+			observer.Write([]byte(strings.TrimSuffix(frame, delimiter)))
+			observer.Finish()
+			if observer.usage.Total != 10 || observer.buffer != nil {
+				t.Fatal("unterminated frame counted or retained")
+			}
+		}
+	}
+}
+
+func TestStreamingCaptureDoesNotTrimProtocolOutput(t *testing.T) {
+	text, reason := strings.Repeat("text", 20000), strings.Repeat("think", 20000)
+	for _, target := range []Protocol{Chat, Anthropic, Responses} {
+		w := httptest.NewRecorder()
+		emitter := newBridgeStreamEmitter(w, w, target, "test")
+		for _, e := range []bridgeStreamEvent{{Kind: "text", Text: text}, {Kind: "reasoning", Text: reason}, {Kind: "finish", Stop: "stop"}, {Kind: "done"}} {
+			if err := emitter.Emit(e); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if !strings.Contains(w.Body.String(), text) || !strings.Contains(w.Body.String(), reason) {
+			t.Fatal("protocol content truncated", target)
+		}
+		want := 0
+		if target == Responses {
+			want = len(text)
+		}
+		if emitter.text.Len() != want {
+			t.Fatal("unnecessary text retained", target, emitter.text.Len())
+		}
+	}
+	for _, policy := range []provider.LogCapturePolicy{{Enabled: true, Limit: 4}, {Enabled: false, Limit: 4}, {Enabled: true, Limit: 0}} {
+		ctx := provider.WithInvocation(context.Background(), provider.Invocation{LogCapture: &policy})
+		capture := provider.NewLogCapture(ctx)
+		capture.WriteString("中文abc")
+		capture.WriteString("later")
+		got := capture.String()
+		if !utf8.ValidString(got) {
+			t.Fatal("UTF8 broken")
+		}
+		if !policy.Enabled && got != "" {
+			t.Fatal("private capture performed")
+		}
+		if policy.Enabled && policy.Limit == 4 && got != "中" {
+			t.Fatal("not a bounded prefix", got)
+		}
+		if policy.Enabled && policy.Limit == 0 && got != "中文abclater" {
+			t.Fatal("explicit unlimited ignored")
 		}
 	}
 }
