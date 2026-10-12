@@ -1,0 +1,26 @@
+# 统一按 LF 存储与检出，避免跨平台构建产物不一致。
+#
+# 背景：Vite/Rollup 的内容哈希会受源码换行符影响。Windows 上 core.autocrlf=true
+# 会把工作树换成 CRLF，Linux CI 检出 LF，两边构建出不同的 chunk 文件名，
+# 于是 check:embed 在 CI 必然失败（本地却通过）。这里固定成 LF，
+# 让本机构建与 CI 构建产出同一套哈希。
+* text=auto eol=lf
+
+# 二进制资源不做任何换行转换。
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.otf binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.exe binary
+*.dll binary
+*.so binary
+*.dylib binary
