@@ -84,16 +84,19 @@ type bridgeRequest struct {
 }
 
 type Usage struct {
+	FinishReason string // observed canonical termination, independent of token availability
 	// Input is the total prompt input, including cache reads and writes. This
 	// matches OpenAI's prompt_tokens semantics and lets each output encoder
 	// split the provider-specific cache fields exactly once.
-	Input         int
-	Output        int
-	Total         int
-	Cached        int
-	CachedKnown   bool
-	CacheCreation int
-	Reasoning     int
+	Input              int
+	Output             int
+	Total              int
+	Cached             int
+	CachedKnown        bool
+	CacheCreation      int
+	CacheCreationKnown bool
+	Reasoning          int
+	ReasoningKnown     bool
 }
 
 type bridgeResponse struct {

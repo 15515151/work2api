@@ -421,11 +421,65 @@ func TestUpdateControlBackupFailureReopensOldService(t *testing.T) {
 	}
 }
 
+func TestPendingStartupMatchesFilesystemIdentity(t *testing.T) {
+	data := t.TempDir()
+	root := filepath.Join(data, ".updates", "transaction-fixture")
+	if err := os.MkdirAll(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := selfupdate.HashFile(executable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := selfupdate.Plan{Target: executable, Root: root, Phase: "verifying", OldHash: strings.Repeat("0", 64)}
+	if runtime.GOOS == "windows" {
+		plan.Target = strings.ToUpper(executable)
+		plan.Root = strings.ToUpper(root)
+	}
+	check := func(want bool) {
+		t.Helper()
+		if err := selfupdate.WriteJSON(filepath.Join(data, ".updates", "pending.json"), plan); err != nil {
+			t.Fatal(err)
+		}
+		if _, active := pendingStartup(data, currentBuild()); active != want {
+			t.Fatalf("startup active=%v want=%v phase=%s", active, want, plan.Phase)
+		}
+	}
+	check(true)
+	plan.OldHash = digest
+	check(false)
+	plan.OldHash = strings.Repeat("0", 64)
+	plan.Phase = "complete"
+	check(false)
+	plan.Phase = "verifying"
+	plan.Target = filepath.Join(data, "foreign.exe")
+	if err := os.WriteFile(plan.Target, []byte("foreign"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	check(false)
+	plan.Target = filepath.Join(data, "missing.exe")
+	check(false)
+	plan.Target = executable
+	plan.Root = filepath.Join(data, "unrelated", "transaction-fixture")
+	if err := os.MkdirAll(filepath.Dir(plan.Root), 0700); err != nil {
+		t.Fatal(err)
+	}
+	check(false)
+}
+
 func TestIsolatedReleaseUpdateProcess(t *testing.T) {
 	if testing.Short() {
 		t.Skip("isolated release process requires binary builds")
 	}
 	root := t.TempDir()
+	if runtime.GOOS == "windows" {
+		// Exercise the path spelling mismatch seen on Windows hosted runners.
+		root = strings.ToUpper(root)
+	}
 	module, err := filepath.Abs(filepath.Join("..", ".."))
 	if err != nil {
 		t.Fatal(err)

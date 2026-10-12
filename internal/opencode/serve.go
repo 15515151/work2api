@@ -97,6 +97,16 @@ func (rt *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (result
 		return provider.UsageReport{Status: "error", Error: "upstream error"}, nil
 	}
 	defer resp.Body.Close()
+	var sent map[string]any
+	if json.Unmarshal(bodies[upstreamRoute.Tier], &sent) == nil {
+		limits := map[string]int{}
+		for _, key := range []string{"max_tokens", "max_completion_tokens", "max_output_tokens"} {
+			if n, ok := sent[key].(float64); ok && n > 0 && n <= 1<<30 && n == float64(int(n)) {
+				limits[key] = int(n)
+			}
+		}
+		defer func() { result.EffectiveLimits = limits }()
+	}
 
 	w.Header().Set("x-request-id", ids.Request)
 	if resp.StatusCode/100 != 2 {
@@ -288,16 +298,30 @@ func copyErrorResponse(w http.ResponseWriter, proto protocol.Protocol, resp *htt
 }
 
 func usageReport(usage protocol.Usage, known bool) provider.UsageReport {
+	status := "ok"
+	if usage.FinishReason == "length" || usage.FinishReason == "content_filter" {
+		status = "incomplete"
+	}
 	var cached *int
 	if usage.CachedKnown {
 		n := usage.Cached
 		cached = &n
 	}
 	return provider.UsageReport{
-		TokensKnown:  &known,
-		CachedTokens: cached,
-		InputTokens:  usage.Input,
-		OutputTokens: usage.Output,
-		Status:       "ok",
+		FinishReason:        usage.FinishReason,
+		TokensKnown:         &known,
+		ReasoningTokens:     observedCount(usage.Reasoning, usage.ReasoningKnown),
+		CacheCreationTokens: observedCount(usage.CacheCreation, usage.CacheCreationKnown),
+		CachedTokens:        cached,
+		InputTokens:         usage.Input,
+		OutputTokens:        usage.Output,
+		Status:              status,
 	}
+}
+
+func observedCount(n int, known bool) *int {
+	if !known {
+		return nil
+	}
+	return &n
 }

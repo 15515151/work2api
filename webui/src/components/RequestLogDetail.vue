@@ -1,45 +1,56 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 import type { UsageRecord } from '../types'
 import { dt, int, latency } from '../lib/format'
-const props=defineProps<{ record: UsageRecord; admin?: boolean; accountLabel?: (uid: string, model: string) => string }>()
-const d=computed(()=>props.record.diagnostics), p=computed(()=>d.value?.performance)
-const known=computed(()=>props.record.tokens_known===true || props.record.tokens_known===1)
-const budget=(v?:Record<string,number>)=>v && Object.keys(v).length?Object.entries(v).map(([k,n])=>k + ': ' + n).join(' · '):'未显式指定'
+import { tokensKnown, reasoningTokens, nonReasoningTokens, observed, channelName, resultLabel, resultClass, costUnit, outputRate, outputBudget } from '../lib/usage-log'
+const props=defineProps<{record:UsageRecord;admin?:boolean;accountLabel?:(uid:string,model:string)=>string}>()
+const d=computed(()=>props.record.diagnostics),p=computed(()=>d.value?.performance)
+const budget=(v?:Record<string,number>)=>v && Object.keys(v).length?Object.entries(v).map(([k,n])=>k+': '+int(n)).join(' · '):'未显式指定'
 const compatibility=computed(()=>({original:'原文',identity:'固定身份兼容',client_metadata:'客户端身份与归因精简'} as Record<string,string>)[d.value?.compatibility || ''] || '未记录')
-const channel=(model:string)=>model.includes('/')?model.split('/')[0]:'workbuddy'
-const unit=(model:string)=>channel(model)==='opencode'?'上游报告消耗（单位未确认）':channel(model) + ' 渠道积分'
-function stageLabel(stage: {headers_finished:boolean;http_status:number;header_wait_ms:number}) { return stage.headers_finished ? 'HTTP '+(stage.http_status || '无响应')+' · 响应头等待 '+stage.header_wait_ms+' ms' : '未收到响应头' }
+const explanation=computed(()=>{
+ if(d.value?.finish_reason==='length')return '上游报告 length：达到生成预算或上下文边界。本次已产生的思考、回答或工具参数可能不完整。'
+ if(d.value?.finish_reason==='content_filter')return '上游报告审核拒绝，HTTP 成功不代表模型输出完整。'
+ if(props.record.status==='incomplete')return '响应未完整结束，请结合故障阶段与上游尝试记录定位。'
+ if(props.record.status==='error')return '调用失败，请保留请求标识以便定位。'
+ return d.value?.finish_reason==='tool_calls'?'模型已返回工具调用，后续由客户端执行。':'本次调用已正常结束。'
+})
+const copied=ref(''),copyError=ref('')
+async function copy(value:string) {try{await navigator.clipboard.writeText(value);copied.value=value;copyError.value=''}catch{copyError.value='复制失败，请手动选择标识复制'}}
+const sections=computed(()=>[{title:'输入（已保存片段）',text:props.record.input_content},{title:'思考内容（已保存片段）',text:props.record.reasoning_content},{title:'输出（已保存片段）',text:props.record.output_content}].filter(v=>v.text))
+function stageLabel(stage:{headers_finished:boolean;http_status:number;header_wait_ms:number}) {return stage.headers_finished?'HTTP '+(stage.http_status || '无响应')+' · 响应头等待 '+latency(stage.header_wait_ms):'未收到响应头'}
 </script>
 <template>
- <div class="space-y-5 text-small">
-  <section class="rounded-xl border border-line p-4">
-   <h4 class="mb-3 font-semibold">请求与路由</h4>
-   <dl class="grid gap-3 sm:grid-cols-2">
-    <div><dt class="text-micro text-faint">调用模型</dt><dd class="mono break-all">{{ d?.requested_model || record.model }}</dd></div>
-    <div><dt class="text-micro text-faint">实际渠道模型</dt><dd class="mono break-all">{{ d?.physical_model || record.model }}</dd></div>
-    <div><dt class="text-micro text-faint">Key / 协议</dt><dd class="break-all">{{ record.app_name || '未命名 Key' }} · {{ record.protocol }}<template v-if="p?.response_stream != null"> · {{ p.response_stream?'流式':'非流式' }}</template></dd></div>
-    <div><dt class="text-micro text-faint">时间 / 结果</dt><dd>{{ dt(record.ts,'YYYY-MM-DD HH:mm:ss') }} · {{ record.status }}<template v-if="p?.http_status"> · HTTP {{ p.http_status }}</template></dd></div>
-    <div v-if="admin && record.account_uid"><dt class="text-micro text-faint">最终账号 / 用户</dt><dd class="break-all">{{ accountLabel?.(record.account_uid,record.model) || record.account_uid }} · {{ record.user_id ? '用户 #' + record.user_id : '管理员 Key' }}</dd></div>
-    <div><dt class="text-micro text-faint">结束原因 / 思考强度</dt><dd>{{ d?.finish_reason || '未上报' }} · {{ record.reasoning_effort || '未记录' }}</dd></div>
+ <div class="space-y-4 text-small">
+  <div class="flex flex-wrap items-center justify-between gap-2"><span class="inline-flex items-center gap-2 rounded-md border px-2 py-1 text-micro font-medium" :class="resultClass(record)">{{resultLabel(record)}}<span v-if="p?.http_status">HTTP {{p.http_status}}</span></span><span class="text-micro text-muted">{{dt(record.ts,'YYYY-MM-DD HH:mm:ss')}}</span></div>
+  <p v-if="record.status!=='ok' || d?.finish_reason==='tool_calls'" class="rounded-lg bg-elevated px-3 py-2 text-muted">{{explanation}}</p>
+  <div v-if="record.error" class="rounded-lg border border-fault/25 bg-fault/5 p-3 whitespace-pre-wrap break-all text-fault">{{record.error}}</div>
+  <section class="rounded-xl border border-line">
+   <h4 class="border-b border-line bg-elevated/40 px-4 py-2.5 font-semibold text-ink">请求信息</h4>
+   <dl class="grid gap-x-8 gap-y-3 p-4 sm:grid-cols-2">
+    <div class="sm:col-span-2"><dt class="text-micro text-muted">调用模型</dt><dd class="mt-0.5 break-all font-medium text-ink">{{d?.requested_model || record.model}}<span v-if="d?.physical_model && d.physical_model!==(d.requested_model || record.model)" class="ml-2 text-muted">↳ {{d.physical_model}}</span></dd></div>
+    <div class="flex gap-4"><dt class="w-20 flex-none text-muted">渠道</dt><dd class="text-ink">{{channelName(record)}}</dd></div>
+    <div class="flex gap-4"><dt class="w-20 flex-none text-muted">协议</dt><dd class="text-ink">{{record.protocol}}<template v-if="p?.response_stream!=null"> · {{p.response_stream?'流式':'非流式'}}</template></dd></div>
+    <div class="flex gap-4"><dt class="w-20 flex-none text-muted">Key</dt><dd class="min-w-0 break-all text-ink">{{record.app_name || '未命名 Key'}}</dd></div>
+    <div class="flex gap-4"><dt class="w-20 flex-none text-muted">思考强度</dt><dd class="text-ink">{{record.reasoning_effort || '未记录'}}</dd></div>
+    <div v-if="admin && record.account_uid" class="flex gap-4"><dt class="w-20 flex-none text-muted">账号</dt><dd class="min-w-0 break-all text-ink">{{accountLabel?.(record.account_uid,record.model) || record.account_uid}}</dd></div>
+    <div v-if="admin" class="flex gap-4"><dt class="w-20 flex-none text-muted">用户</dt><dd class="text-ink">{{record.user_id?'用户 #'+record.user_id:'管理员 Key'}}</dd></div>
+    <div class="flex gap-4"><dt class="w-20 flex-none text-muted">结束原因</dt><dd class="text-ink">{{d?.finish_reason || '未上报'}}</dd></div>
+    <div v-if="d?.compatibility" class="flex gap-4"><dt class="w-20 flex-none text-muted">输入兼容</dt><dd class="text-ink">{{compatibility}}</dd></div>
+    <div v-if="d?.error_kind" class="flex gap-4 sm:col-span-2"><dt class="w-20 flex-none text-muted">故障阶段</dt><dd class="min-w-0 break-all text-fault">{{d.upstream_started?'上游调用':'调用前校验'}} · {{d.error_kind}}</dd></div>
    </dl>
-   <div v-if="p?.request_id" class="mt-3 rounded-lg bg-elevated p-3"><span class="text-micro text-faint">网关请求标识（反馈问题时提供）</span><div class="mono select-all break-all">{{ p.request_id }}</div></div>
   </section>
-  <section class="rounded-xl border border-line p-4"><h4 class="mb-3 font-semibold">用量与性能</h4>
-   <div class="grid grid-cols-2 gap-3 sm:grid-cols-3">
-    <div><div class="text-micro text-faint">输入 / 输出 Tokens</div><div class="mono">{{ known?int(record.input_tokens):'—' }} / {{ known?int(record.output_tokens):'—' }}</div></div>
-    <div><div class="text-micro text-faint">缓存读取 Tokens</div><div class="mono">{{ record.cached_tokens == null?'—':int(record.cached_tokens) }}</div><p v-if="record.cached_tokens != null && (record.cached_tokens<0 || record.cached_tokens>record.input_tokens)" class="text-micro text-warn">缓存数值超出输入范围</p></div>
-    <div v-if="admin"><div class="text-micro text-faint">最终命中实际消耗</div><div class="mono">{{ record.credit_known && record.credits!=null?record.credits:'—' }}</div><p class="text-micro text-faint">{{ unit(d?.physical_model || record.model) }}</p></div>
-    <div><div class="text-micro text-faint">整次请求耗时</div><div class="mono">{{ latency(p?.total_ms ?? record.latency_ms) }}</div></div>
-    <div><div class="text-micro text-faint">排队 / 账号等待</div><div class="mono">{{ p?latency(p.queue_ms)+' / '+latency(p.account_wait_ms):'—' }}</div></div>
-    <div><div class="text-micro text-faint">首响应 / 上游执行</div><div class="mono">{{ p?.first_byte_ms==null?'—':latency(p.first_byte_ms) }} / {{ p?.execution_ms==null?'—':latency(p.execution_ms) }}</div></div>
+  <section class="rounded-xl border border-line">
+   <h4 class="border-b border-line bg-elevated/40 px-4 py-2.5 font-semibold text-ink">用量与性能</h4>
+   <div class="grid gap-5 p-4 sm:grid-cols-2">
+    <dl class="space-y-2.5"><div class="flex justify-between gap-3"><dt class="text-muted">输入 Tokens</dt><dd class="tabular-nums font-medium text-ink">{{tokensKnown(record)?int(record.input_tokens):'—'}}</dd></div><div class="flex justify-between gap-3"><dt class="text-muted">输出 Tokens</dt><dd class="tabular-nums font-medium text-ink">{{tokensKnown(record)?int(record.output_tokens):'—'}}</dd></div><div class="flex justify-between gap-3"><dt class="pl-3 text-muted">其中思考</dt><dd class="tabular-nums text-ink">{{int(reasoningTokens(record))}}</dd></div><div class="flex justify-between gap-3"><dt class="pl-3 text-muted" title="可能含工具参数，不等于纯正文">非思考输出</dt><dd class="tabular-nums text-ink">{{int(nonReasoningTokens(record))}}</dd></div><div class="flex justify-between gap-3"><dt class="text-muted">缓存读取</dt><dd class="tabular-nums text-ink">{{int(observed(record.cached_tokens))}}</dd></div><div class="flex justify-between gap-3"><dt class="text-muted">缓存写入</dt><dd class="tabular-nums text-ink">{{int(observed(d?.token_details?.cache_creation_tokens))}}</dd></div></dl>
+    <dl class="space-y-2.5 border-t border-line pt-4 sm:border-l sm:border-t-0 sm:pl-5 sm:pt-0"><div class="flex justify-between gap-3"><dt class="text-muted">总耗时</dt><dd class="tabular-nums font-medium text-ink">{{latency(p?.total_ms ?? record.latency_ms)}}</dd></div><div class="flex justify-between gap-3"><dt class="text-muted" title="输出总 Tokens ÷ 日志记录耗时，含思考、等待与重试">平均输出速度</dt><dd class="tabular-nums text-ink">{{outputRate(record)}}</dd></div><div class="flex justify-between gap-3"><dt class="text-muted" title="网关首字节，可能是协议事件，不等于模型首 Token">首响应</dt><dd class="tabular-nums text-ink">{{latency(p?.first_byte_ms)}}</dd></div><div class="flex justify-between gap-3"><dt class="text-muted">上游执行</dt><dd class="tabular-nums text-ink">{{latency(p?.execution_ms)}}</dd></div><div class="flex justify-between gap-3"><dt class="text-muted">排队 / 账号等待</dt><dd class="tabular-nums text-ink">{{p?latency(p.queue_ms)+' / '+latency(p.account_wait_ms):'—'}}</dd></div><div v-if="admin" class="flex justify-between gap-3"><dt class="text-muted">实际消耗</dt><dd class="tabular-nums text-ink">{{record.credits ?? '—'}}<span class="ml-1 text-micro text-muted">{{costUnit(record)}}</span></dd></div></dl>
    </div>
-   <p class="mt-3 text-micro text-faint">首响应是网关首字节，包含协议事件，不能作为模型首个 token；“—”表示未记录或上游未上报。重试记录共享整次请求耗时，不累加。</p>
+   <p class="border-t border-line px-4 py-2.5 text-micro text-muted">输入含缓存，输出含思考；不重复累加。「—」表示未记录，0 表示零。</p>
   </section>
-  <section v-if="d" class="rounded-xl border border-line p-4 space-y-2"><h4 class="font-semibold">协议处理</h4><div>客户端输出预算：{{ budget(d.requested_output_limits) }}</div><div>实际发送预算：{{ budget(d.effective_output_limits) }}</div><div>输入兼容：{{ compatibility }}</div><div v-if="d.error_kind">故障阶段 / 分类：{{ d.upstream_started?'上游调用阶段':'调用前校验' }} · {{ d.error_kind }}</div></section>
-  <section v-if="p?.attempt_stages?.length" class="rounded-xl border border-line p-4"><h4 class="mb-3 font-semibold">上游尝试阶段 · {{ p.attempts }} 次</h4><div class="space-y-2"><div v-for="stage in p.attempt_stages" :key="stage.number" class="rounded-lg bg-elevated p-3">#{{ stage.number }} · {{ stageLabel(stage) }}<div v-if="stage.upstream_request_id" class="mono mt-1 select-all break-all text-micro text-faint">上游请求标识：{{ stage.upstream_request_id }}</div></div></div><p v-if="p.attempts>p.attempt_stages.length" class="mt-2 text-micro text-faint">阶段信息最多保留前 16 次。</p></section>
-  <section v-if="record.attempt_records && record.attempt_records.length>1" class="rounded-xl border border-line p-4"><h4 class="mb-3 font-semibold">各次命中记录</h4><div v-for="item in record.attempt_records" :key="item.id" class="mb-2 rounded-lg bg-elevated p-3"><div class="break-all">{{ item.diagnostics?.physical_model || item.model }} · {{ item.status }}<template v-if="admin && item.account_uid"> · {{ accountLabel?.(item.account_uid,item.model) || item.account_uid }}</template><template v-if="admin && item.credit_known && item.credits!=null"> · {{ item.credits }} {{ unit(item.model) }}</template></div><div v-if="item.error" class="mt-1 whitespace-pre-wrap break-all text-micro text-fault">{{ item.error }}</div></div><p class="text-micro text-faint">只展开有用量日志的尝试；未生成用量行的重试见上方阶段记录。跨渠道消耗单位不同，不直接相加。</p></section>
-  <div v-if="record.error" class="rounded-xl border border-fault/30 bg-fault/5 p-4 whitespace-pre-wrap break-all text-fault">{{ record.error }}</div>
-  <template v-if="admin"><details v-for="section in [{title:'输入（已保存片段）',text:record.input_content},{title:'思考内容（已保存片段）',text:record.reasoning_content},{title:'输出（已保存片段）',text:record.output_content}].filter(v=>v.text)" :key="section.title" class="rounded-xl border border-line p-4"><summary class="cursor-pointer font-semibold">{{ section.title }}</summary><pre class="mono mt-3 max-h-80 overflow-auto whitespace-pre-wrap break-all text-micro">{{ section.text }}</pre></details></template>
+  <details v-if="outputBudget(d?.requested_output_limits)!=null || outputBudget(d?.effective_output_limits)!=null || d?.finish_reason==='length'" :open="d?.finish_reason==='length'" class="rounded-xl border border-line"><summary class="cursor-pointer px-4 py-2.5 font-medium text-ink">输出预算</summary><div class="grid gap-3 border-t border-line p-4 sm:grid-cols-3"><div><div class="text-micro text-muted">客户端请求</div><div class="mt-1 tabular-nums font-semibold text-ink">{{int(outputBudget(d?.requested_output_limits))}}</div><div class="mt-1 break-all text-micro text-muted">{{budget(d?.requested_output_limits)}}</div></div><div><div class="text-micro text-muted">实际发送</div><div class="mt-1 tabular-nums font-semibold text-ink">{{int(outputBudget(d?.effective_output_limits))}}</div><div class="mt-1 break-all text-micro text-muted">{{budget(d?.effective_output_limits)}}</div></div><div><div class="text-micro text-muted">实际生成</div><div class="mt-1 tabular-nums font-semibold text-ink">{{tokensKnown(record)?int(record.output_tokens):'—'}}</div></div></div></details>
+  <section v-if="p?.request_id" class="rounded-xl border border-line p-4"><div class="flex flex-wrap items-center justify-between gap-2"><h4 class="font-medium text-ink">网关请求 ID</h4><button class="rounded border border-line px-2 py-1 text-micro text-muted hover:text-brand" @click="copy(p.request_id)">{{copied===p.request_id?'已复制':'复制'}}</button></div><div class="mono mt-2 select-all break-all text-micro text-muted">{{p.request_id}}</div><p v-if="copyError" class="mt-1 text-micro text-fault">{{copyError}}</p></section>
+  <section v-if="p?.attempt_stages?.length" class="rounded-xl border border-line"><h4 class="border-b border-line bg-elevated/40 px-4 py-2.5 font-medium text-ink">上游尝试 · {{p.attempts}} 次</h4><ol class="divide-y divide-line px-4"><li v-for="stage in p.attempt_stages" :key="stage.number" class="flex gap-3 py-3"><span class="flex-none text-micro text-muted">#{{stage.number}}</span><div class="min-w-0 flex-1"><div class="text-ink">{{stageLabel(stage)}}</div><div v-if="stage.upstream_request_id" class="mt-1 flex items-start gap-2"><span class="min-w-0 break-all text-micro text-muted">上游请求 ID：<span class="mono select-all">{{stage.upstream_request_id}}</span></span><button class="flex-none text-micro text-muted hover:text-brand" @click="copy(stage.upstream_request_id)">{{copied===stage.upstream_request_id?'已复制':'复制'}}</button></div></div></li></ol><p v-if="p.attempts>p.attempt_stages.length" class="px-4 pb-3 text-micro text-muted">阶段信息最多保留前 16 次。</p></section>
+  <section v-if="record.attempt_records && record.attempt_records.length>1" class="rounded-xl border border-line"><h4 class="border-b border-line bg-elevated/40 px-4 py-2.5 font-medium text-ink">各次命中与消耗</h4><div v-for="item in record.attempt_records" :key="item.id" class="border-b border-line p-4 last:border-b-0"><div class="flex flex-wrap items-center gap-2"><span class="break-all text-ink">{{item.diagnostics?.physical_model || item.model}}</span><span class="rounded border px-1.5 py-0.5 text-micro" :class="resultClass(item)">{{resultLabel(item)}}</span><span v-if="admin && item.account_uid" class="text-micro text-muted">{{accountLabel?.(item.account_uid,item.model) || item.account_uid}}</span><span v-if="admin && item.credit_known && item.credits!=null" class="text-micro">{{item.credits}} {{costUnit(item)}}</span></div><div v-if="item.error" class="mt-1 whitespace-pre-wrap break-all text-micro text-fault">{{item.error}}</div></div><p class="border-t border-line px-4 py-2.5 text-micro text-muted">各次消耗分别保留，跨渠道单位不直接相加。</p></section>
+  <template v-if="admin"><details v-for="section in sections" :key="section.title" class="rounded-xl border border-line"><summary class="cursor-pointer px-4 py-2.5 font-medium text-ink">{{section.title}}</summary><pre class="mono max-h-80 overflow-auto border-t border-line p-4 whitespace-pre-wrap break-all text-micro text-muted">{{section.text}}</pre></details></template>
  </div>
 </template>

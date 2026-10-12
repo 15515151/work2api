@@ -627,7 +627,7 @@ func TestNativeStreamCompletion(t *testing.T) {
 				t.Fatal(err)
 			}
 			reply, usage, known, err := protocol.CollapseStreamWithUsage(&stream, protocol.Chat, "trae/test")
-			if err != nil || !known || usage.Input != 12 || usage.Output != 7 {
+			if err != nil || !known || usage.Input != 12 || usage.Output != 7 || usage.FinishReason != "stop" {
 				t.Fatalf("usage=%+v known=%v err=%v", usage, known, err)
 			}
 			if !bytes.Contains(reply, []byte(`"reasoning_content":"think more"`)) {

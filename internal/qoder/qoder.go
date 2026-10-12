@@ -667,9 +667,12 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (provide
 	report.InputTokens = res.InputTokens
 	report.TokensKnown = &res.UsageKnown
 	report.OutputTokens = res.OutputTokens
+	report.FinishReason = res.FinishReason
 	report.Output = res.Output
 	report.Reasoning = res.Reasoning
 	report.CachedTokens, _ = tokenusage.ValidCache(res.Usage)
+	report.ReasoningTokens = tokenusage.Reasoning(res.Usage)
+	report.CacheCreationTokens = tokenusage.Created(res.Usage)
 	for _, key := range []string{"credit", "credits"} {
 		if value, ok := res.Usage[key].(float64); ok && value >= 0 && !math.IsNaN(value) && !math.IsInf(value, 0) {
 			report.Credits = &value

@@ -84,13 +84,25 @@ func pendingStartup(data string, build selfupdate.Build) (selfupdate.Plan, bool)
 	active := plan.Phase == "backup_ready" || plan.Phase == "verifying" || plan.Phase == "accepting" || plan.Phase == "acceptance_unknown" || plan.Phase == "recovery_required"
 	executable, _ := os.Executable()
 	executable, _ = filepath.EvalSymlinks(executable)
-	if !active || plan.Target != executable || filepath.Dir(plan.Root) != filepath.Join(data, ".updates") {
+	if !active || !sameExistingPath(plan.Target, executable) || !sameExistingPath(filepath.Dir(plan.Root), filepath.Join(data, ".updates")) {
 		return plan, false
 	}
 	digest, err := selfupdate.HashFile(executable)
 	// A changed binary stays closed even if its metadata is unexpected. The
 	// helper must verify it or restore the old snapshot before public writes.
 	return plan, err == nil && digest != plan.OldHash
+}
+
+// Windows may report a different casing or expand a short path for the same
+// executable. Match filesystem identity rather than its textual spelling;
+// absent or different objects must never activate an update transaction.
+func sameExistingPath(a, b string) bool {
+	first, err := os.Stat(a)
+	if err != nil {
+		return false
+	}
+	second, err := os.Stat(b)
+	return err == nil && os.SameFile(first, second)
 }
 func launchUpdateHelper(path string) error {
 	var plan selfupdate.Plan

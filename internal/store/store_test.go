@@ -161,7 +161,8 @@ func TestUsageDiagnosticsMigrationAndRoundTrip(t *testing.T) {
 	}
 	defer db.Close()
 	facts := &UsageDiagnostics{FinishReason: "length", RequestedLimits: map[string]int{"max_tokens": 1200}, EffectiveLimits: map[string]int{"max_tokens": 1000}, Compatibility: "identity", Started: true}
-	if err = db.LogUsage(UsageParams{Model: "new", Status: "incomplete", Diagnostics: facts}); err != nil {
+	reasoning, creation := 7, 0
+	if err = db.LogUsage(UsageParams{Model: "new", Status: "incomplete", InputTokens: 20, OutputTokens: 10, ReasoningTokens: &reasoning, CacheCreationTokens: &creation, Diagnostics: facts}); err != nil {
 		t.Fatal(err)
 	}
 	if err = db.UpdateUsagePerformance([]int64{2}, UsagePerformance{RequestID: "test-request", Attempts: 1, QueueMS: 7}); err != nil {
@@ -173,7 +174,7 @@ func TestUsageDiagnosticsMigrationAndRoundTrip(t *testing.T) {
 			t.Fatal(rows, err)
 		}
 		value, ok := rows[0]["diagnostics"].(UsageDiagnostics)
-		if !ok || value.FinishReason != "length" || value.EffectiveLimits["max_tokens"] != 1000 || value.Performance == nil || value.Performance.QueueMS != 7 || rows[1]["diagnostics"] != nil {
+		if !ok || value.FinishReason != "length" || value.EffectiveLimits["max_tokens"] != 1000 || value.Performance == nil || value.Performance.QueueMS != 7 || value.TokenDetails == nil || value.TokenDetails.Reasoning == nil || *value.TokenDetails.Reasoning != 7 || value.TokenDetails.CacheCreation == nil || *value.TokenDetails.CacheCreation != 0 || rows[1]["diagnostics"] != nil {
 			t.Fatal(rows)
 		}
 	}
@@ -183,6 +184,9 @@ func TestUsageDiagnosticsMigrationAndRoundTrip(t *testing.T) {
 	}
 	if row["diagnostics"].(UsageDiagnostics).RequestedLimits["max_tokens"] != 1200 {
 		t.Fatal(row)
+	}
+	if facts.TokenDetails != nil {
+		t.Fatal("usage logging mutated the caller diagnostics")
 	}
 	var version int
 	if err = db.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil || version != SchemaVersion {
@@ -409,5 +413,26 @@ func TestRequestLogsGroupRetriesAndEnforceOwnership(t *testing.T) {
 	list, total, err = db.UsageRequests(&user, 20, 0, "", "unified/test", nil, "ok", "")
 	if err != nil || total != 1 || list[0]["id"] != last {
 		t.Fatal("failed retry leaked into status filter", list, total, err)
+	}
+}
+
+func TestUsageTokenDetailsRejectImpossibleCounts(t *testing.T) {
+	db, err := New(filepath.Join(t.TempDir(), "tokens.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for _, n := range []int{-1, 11} {
+		id, err := db.LogUsageWithID(UsageParams{InputTokens: 10, OutputTokens: 10, ReasoningTokens: &n, CacheCreationTokens: &n})
+		if err != nil {
+			t.Fatal(err)
+		}
+		row, err := db.GetUsage(int(id))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if diag, ok := row["diagnostics"].(UsageDiagnostics); ok && diag.TokenDetails != nil {
+			t.Fatal("impossible counts retained", row)
+		}
 	}
 }

@@ -259,6 +259,8 @@ func (observer *streamUsageObserver) consume(frame []byte) {
 			switch event.Kind {
 			case "done":
 				observer.normal = true
+			case "finish":
+				observer.usage.FinishReason = event.Stop
 			case "error":
 				observer.error = true
 			}

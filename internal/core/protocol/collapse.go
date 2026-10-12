@@ -141,6 +141,7 @@ func (acc *collapseAccumulator) apply(event bridgeStreamEvent) {
 		}
 	case "finish":
 		acc.response.Stop = event.Stop
+		acc.response.Usage.FinishReason = event.Stop
 	}
 }
 

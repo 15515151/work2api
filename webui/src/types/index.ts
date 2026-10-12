@@ -204,6 +204,7 @@ export interface UsagePoint {
 }
 
 export interface UsageDiagnostics {
+ token_details?: { reasoning_tokens?: number | null; cache_creation_tokens?: number | null }
   requested_model?: string
   physical_model?: string
   performance?: {

@@ -294,7 +294,17 @@ func decodeOpenAIUsage(usage map[string]any) Usage {
 	if observed := tokenusage.Cached(usage); observed != nil {
 		cached = *observed
 	}
-	return Usage{Input: input, Output: output, Total: total, Cached: cached, CachedKnown: tokenusage.Cached(usage) != nil, CacheCreation: cacheCreation, Reasoning: reasoning}
+	reasoningKnown := false
+	if observed := tokenusage.Reasoning(usage); observed != nil {
+		reasoning = *observed
+		reasoningKnown = true
+	}
+	creationKnown := false
+	if observed := tokenusage.Created(usage); observed != nil && *observed >= 0 && *observed <= input {
+		cacheCreation = *observed
+		creationKnown = true
+	}
+	return Usage{Input: input, Output: output, Total: total, Cached: cached, CachedKnown: tokenusage.Cached(usage) != nil, CacheCreation: cacheCreation, CacheCreationKnown: creationKnown, Reasoning: reasoning, ReasoningKnown: reasoningKnown}
 }
 
 func decodeAnthropicUsage(usage map[string]any) Usage {
@@ -304,12 +314,13 @@ func decodeAnthropicUsage(usage map[string]any) Usage {
 	output := jsonutil.IntAt(usage, "output_tokens")
 	input += cached + cacheCreation
 	return Usage{
-		Input:         input,
-		Output:        output,
-		Total:         input + output,
-		Cached:        cached,
-		CachedKnown:   tokenusage.Cached(usage) != nil,
-		CacheCreation: cacheCreation,
+		Input:              input,
+		Output:             output,
+		Total:              input + output,
+		Cached:             cached,
+		CachedKnown:        tokenusage.Cached(usage) != nil,
+		CacheCreation:      cacheCreation,
+		CacheCreationKnown: tokenusage.Created(usage) != nil,
 	}
 }
 
@@ -460,11 +471,31 @@ func ResponseUsage(protocol Protocol, body []byte) (Usage, bool) {
 		return Usage{}, false
 	}
 	usage := jsonutil.MapAt(payload, "usage")
-	if len(usage) == 0 {
-		return Usage{}, false
-	}
+	var result Usage
 	if protocol == Anthropic {
-		return decodeAnthropicUsage(usage), true
+		result = decodeAnthropicUsage(usage)
+	} else {
+		result = decodeOpenAIUsage(usage)
 	}
-	return decodeOpenAIUsage(usage), true
+	switch protocol {
+	case Chat:
+		choices := jsonutil.SliceAt(payload, "choices")
+		if len(choices) > 0 {
+			choice, _ := choices[0].(map[string]any)
+			if reason := jsonutil.StringAt(choice, "finish_reason"); reason != "" {
+				result.FinishReason = canonicalChatStop(reason)
+			}
+		}
+	case Anthropic:
+		if reason := jsonutil.StringAt(payload, "stop_reason"); reason != "" {
+			result.FinishReason = canonicalAnthropicStop(reason)
+		}
+	case Responses:
+		if jsonutil.StringAt(payload, "status") != "" {
+			if response, err := decodeBridgeResponse(protocol, payload); err == nil {
+				result.FinishReason = response.Stop
+			}
+		}
+	}
+	return result, len(usage) > 0
 }

@@ -178,6 +178,13 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 			return report, err
 		}
 		streamwatch.StartAttempt(ctx)
+		// Inspect the prepared wire body, not inferred client defaults.
+		var sent map[string]any
+		if json.Unmarshal(upstream.PrepareBodyResolved(encoded, identity.Variant, identityModel), &sent) == nil {
+			if n, ok := sent["max_tokens"].(float64); ok && n > 0 && n <= 1<<30 && n == float64(int(n)) {
+				report.EffectiveLimits = map[string]int{"max_tokens": int(n)}
+			}
+		}
 		stream, status, errorBody, headers, sendErr := r.client(ctx).ChatStreamWithHeaders(identity, encoded, identityModel)
 		streamwatch.AttemptHeaders(ctx, status, headers)
 		streamwatch.AttemptResult(ctx, status)
@@ -295,7 +302,16 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 		stream.Close()
 		<-readerDone
 		report.InputTokens = usage.Input
+		report.FinishReason = usage.FinishReason
 		report.OutputTokens = usage.Output
+		if usage.ReasoningKnown {
+			n := usage.Reasoning
+			report.ReasoningTokens = &n
+		}
+		if usage.CacheCreationKnown {
+			n := usage.CacheCreation
+			report.CacheCreationTokens = &n
+		}
 		report.TokensKnown = &known
 		if usage.CachedKnown {
 			cached := usage.Cached
@@ -306,6 +322,9 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 			return report, err
 		}
 		report.Status = "ok"
+		if report.FinishReason == "length" || report.FinishReason == "content_filter" {
+			report.Status = "incomplete"
+		}
 		r.mu.Lock()
 		a.Failures = 0
 		a.LastUsed = nowSec()

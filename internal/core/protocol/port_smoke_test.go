@@ -273,7 +273,7 @@ func TestCacheUnknownAndObservedZeroRemainDistinct(t *testing.T) {
 
 func TestCollapseDoesNotInventMissingUsage(t *testing.T) {
 	wire := `data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}` + "\n\n" + "data: [DONE]\n\n"
-	body, _, known, err := CollapseStreamWithUsage(strings.NewReader(wire), Chat, "test")
+	body, usage, known, err := CollapseStreamWithUsage(strings.NewReader(wire), Chat, "test")
 	if err != nil || known {
 		t.Fatal("unexpected usage observation", known, err)
 	}
@@ -283,5 +283,27 @@ func TestCollapseDoesNotInventMissingUsage(t *testing.T) {
 	}
 	if _, ok := doc["usage"]; ok {
 		t.Fatal("synthetic usage exposed as observed", string(body))
+	}
+	if usage.FinishReason != "stop" {
+		t.Fatalf("finish lost without usage: %+v", usage)
+	}
+	for _, target := range []Protocol{Chat, Anthropic, Responses} {
+		for _, reason := range []string{"stop", "length", "tool_calls", "content_filter"} {
+			stream := strings.Replace(wire, `"finish_reason":"stop"`, `"finish_reason":"`+reason+`"`, 1)
+			w := httptest.NewRecorder()
+			got, reported, err := TranscodeStream(t.Context(), w, strings.NewReader(stream), Chat, target, "test")
+			if err != nil || reported || got.FinishReason != reason {
+				t.Fatalf("%s/%s finish=%q known=%v err=%v", target, reason, got.FinishReason, reported, err)
+			}
+			single, collapsed, reported, err := CollapseStreamWithUsage(strings.NewReader(stream), Chat, "test")
+			if err != nil || reported || collapsed.FinishReason != reason {
+				t.Fatalf("collapse %s: %+v %v", reason, collapsed, err)
+			}
+			_ = single
+			got, reported = ResponseUsage(Chat, []byte(`{"choices":[{"finish_reason":"`+reason+`"}]}`))
+			if reported || got.FinishReason != reason {
+				t.Fatalf("response %s: %+v", reason, got)
+			}
+		}
 	}
 }

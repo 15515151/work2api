@@ -30,19 +30,24 @@ type CatalogModel struct {
 
 // UsageReport is what Serve returns for the shared usage logger + pool bookkeeping.
 type UsageReport struct {
-	Recorded     bool // runtime emitted attempt and final records through the shared logger
-	TokensKnown  *bool
-	AccountUID   string
-	InputTokens  int
-	OutputTokens int
-	Status       string // "ok" | "incomplete" | "error"
-	Error        string
-	Input        string
-	Output       string
-	Reasoning    string
-	Effort       string
-	Credits      *float64
-	CachedTokens *int
+	Recorded            bool // runtime emitted attempt and final records through the shared logger
+	TokensKnown         *bool
+	AccountUID          string
+	InputTokens         int
+	OutputTokens        int
+	Status              string // "ok" | "incomplete" | "error"
+	Error               string
+	Input               string
+	Output              string
+	Reasoning           string
+	Effort              string
+	Credits             *float64
+	CachedTokens        *int
+	ReasoningTokens     *int
+	CacheCreationTokens *int
+	FinishReason        string
+	RequestedLimits     map[string]int
+	EffectiveLimits     map[string]int
 }
 
 // ServeRequest carries a single inference call to a Runtime.

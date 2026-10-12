@@ -143,6 +143,7 @@ func (emitter *bridgeStreamEmitter) Emit(event bridgeStreamEvent) error {
 		}
 	case "finish":
 		emitter.stop = event.Stop
+		emitter.usage.FinishReason = event.Stop
 	case "error":
 		emitter.done = true
 		if err := emitter.emitError(jsonutil.FirstString(event.Error, "upstream stream failed"), jsonutil.FirstString(event.ErrorType, "upstream_error")); err != nil {
@@ -663,6 +664,9 @@ func (emitter *bridgeStreamEmitter) rawSSE(eventName, data string) error {
 }
 
 func mergeBridgeUsage(destination *Usage, source Usage) {
+	if source.FinishReason != "" {
+		destination.FinishReason = source.FinishReason
+	}
 	if source.Input != 0 {
 		destination.Input = source.Input
 	}
@@ -676,11 +680,13 @@ func mergeBridgeUsage(destination *Usage, source Usage) {
 		destination.Cached = source.Cached
 	}
 	destination.CachedKnown = destination.CachedKnown || source.CachedKnown
-	if source.CacheCreation != 0 {
+	if source.CacheCreationKnown || source.CacheCreation != 0 {
 		destination.CacheCreation = source.CacheCreation
 	}
-	if source.Reasoning != 0 {
+	destination.CacheCreationKnown = destination.CacheCreationKnown || source.CacheCreationKnown
+	if source.ReasoningKnown || source.Reasoning != 0 {
 		destination.Reasoning = source.Reasoning
 	}
+	destination.ReasoningKnown = destination.ReasoningKnown || source.ReasoningKnown
 	destination.Total = max(destination.Total, destination.Input+destination.Output)
 }

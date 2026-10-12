@@ -33,8 +33,10 @@ const alignCls = { left: 'text-left', right: 'text-right', center: 'text-center'
             :class="alignCls[c.align || 'left']"
             :style="{ width: c.width, minWidth: c.minWidth }"
           >
-            {{ c.label }}
-            <span v-if="c.hint" class="ml-1 cursor-help text-faint/70" :title="c.hint">?</span>
+            <slot :name="`head-${c.key}`" :column="c">
+              {{ c.label }}
+              <span v-if="c.hint" class="ml-1 cursor-help text-faint/70" :title="c.hint">?</span>
+            </slot>
           </th>
         </tr>
       </thead>

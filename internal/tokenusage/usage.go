@@ -62,7 +62,7 @@ func Cached(u map[string]any) *int {
 }
 
 func Created(u map[string]any) *int {
-	return cacheCount(u["cache_creation_input_tokens"], u["prompt_cache_write_tokens"])
+	return cacheCount(u["cache_creation_input_tokens"], u["prompt_cache_write_tokens"], detail(u, "prompt_tokens_details", "cache_creation_input_tokens"), detail(u, "prompt_tokens_details", "cache_write_tokens"), detail(u, "input_tokens_details", "cache_creation_input_tokens"))
 }
 
 // Reasoning preserves a valid observed output count; absent observations stay unknown.

@@ -91,7 +91,7 @@ func main() {
 		log.Fatal("没有可复用的运行实例，或旧实例不支持安全退出；未启动新服务")
 	}
 	bootPending, bootUpdating := pendingStartup(cfg.DataDir, currentBuild())
-	if bootUpdating && bootPending.DataDir == cfg.DataDir && bootPending.DBPath == cfg.DBPath && bootPending.BindPort > 0 && bootPending.BindPort < 65536 {
+	if bootUpdating && sameExistingPath(bootPending.DataDir, cfg.DataDir) && sameExistingPath(bootPending.DBPath, cfg.DBPath) && bootPending.BindPort > 0 && bootPending.BindPort < 65536 {
 		cfg.Host = bootPending.BindHost
 		cfg.Port = bootPending.BindPort
 		cfg.AllowPortFallback = false

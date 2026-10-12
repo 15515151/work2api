@@ -8,13 +8,19 @@
 
 ### 方式 A：下载 Release 二进制
 
-打 tag（`vX.Y.Z`）后，GitHub Actions 会交叉编译 Windows / Linux / macOS（amd64 + arm64）并发布到 [Releases](https://github.com/YuapXc/work2api/releases)，每个包附 `.sha256` 校验和。下载对应平台的压缩包，校验后解压即用：
+正式发布需在 Actions 手动运行 `Release binaries and GHCR image`，填写版本号（`vX.Y.Z`）；普通提交或推送 tag 不会自动发布。工作流交叉编译 Windows / Linux / macOS（amd64 + arm64）并发布到 [Releases](https://github.com/YuapXc/work2api/releases)，每个包附 `.sha256` 校验和。已有版本标签时构建该标签指向的提交；新版本号则构建手动运行时选定的分支或标签对应提交。下载对应平台的压缩包，校验后解压即用：
 
 ```powershell
 # Windows：校验后运行
 Get-FileHash .\work2api_vX.Y.Z_windows_amd64\work2api.exe -Algorithm SHA256
 .\work2api.exe
 ```
+
+### 临时部署指定提交
+
+每次分支推送通过全部检查后，`Checks and commit binaries` 会生成六种平台部署包，保留 14 天；也可手动运行该工作流。打开该次 Actions 运行页，在 Artifacts 下载对应系统及架构的包，解开外层 Artifact ZIP 后，校验其中压缩包的 `.sha256`，再解压运行。Linux x86-64 服务器选择 `linux_amd64`。
+
+临时包版本为 `dev-<12位提交SHA>`，包含完整提交标识 `build-info.json`、程序、README 和配置示例，不包含运行数据或凭据。它不发布 Release 或镜像，也没有正式 Release 标记；管理台自更新只检查正式版本，不自动覆盖此临时构建。更新已部署服务时，先备份数据、正常停止旧服务再替换程序，保留原配置和数据。
 
 ### 方式 B：Docker（配合 HTTPS 反代或 Tunnel）
 

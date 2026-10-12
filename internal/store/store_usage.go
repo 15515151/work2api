@@ -111,16 +111,18 @@ type UsageParams struct {
 	OutputTokens int
 	// CachedTokens is the upstream prompt-cache hit tokens; nil = unknown
 	// (upstream didn't report), 0 = reported but no hit.
-	CachedTokens     *int
-	LatencyMs        float64
-	Status           string
-	Error            string
-	InputContent     string
-	OutputContent    string
-	ReasoningContent string
-	Credits          *float64
-	AppName          string
-	ReasoningEffort  string
+	CachedTokens        *int
+	ReasoningTokens     *int
+	CacheCreationTokens *int
+	LatencyMs           float64
+	Status              string
+	Error               string
+	InputContent        string
+	OutputContent       string
+	ReasoningContent    string
+	Credits             *float64
+	AppName             string
+	ReasoningEffort     string
 	// UserID attributes the row to a portal user (0 = private/admin key).
 	UserID int64
 	AppID  int64
@@ -128,15 +130,22 @@ type UsageParams struct {
 
 // UsageDiagnostics contains protocol facts only, never prompts or credentials.
 type UsageDiagnostics struct {
-	RequestedModel  string            `json:"requested_model,omitempty"`
-	PhysicalModel   string            `json:"physical_model,omitempty"`
-	FinishReason    string            `json:"finish_reason,omitempty"`
-	RequestedLimits map[string]int    `json:"requested_output_limits,omitempty"`
-	EffectiveLimits map[string]int    `json:"effective_output_limits,omitempty"`
-	Compatibility   string            `json:"compatibility,omitempty"`
-	ErrorKind       string            `json:"error_kind,omitempty"`
-	Started         bool              `json:"upstream_started"`
-	Performance     *UsagePerformance `json:"performance,omitempty"`
+	TokenDetails    *UsageTokenDetails `json:"token_details,omitempty"`
+	RequestedModel  string             `json:"requested_model,omitempty"`
+	PhysicalModel   string             `json:"physical_model,omitempty"`
+	FinishReason    string             `json:"finish_reason,omitempty"`
+	RequestedLimits map[string]int     `json:"requested_output_limits,omitempty"`
+	EffectiveLimits map[string]int     `json:"effective_output_limits,omitempty"`
+	Compatibility   string             `json:"compatibility,omitempty"`
+	ErrorKind       string             `json:"error_kind,omitempty"`
+	Started         bool               `json:"upstream_started"`
+	Performance     *UsagePerformance  `json:"performance,omitempty"`
+}
+
+// UsageTokenDetails stores observed counts, never estimates. Nil means unreported.
+type UsageTokenDetails struct {
+	Reasoning     *int `json:"reasoning_tokens,omitempty"`
+	CacheCreation *int `json:"cache_creation_tokens,omitempty"`
 }
 
 // LogUsage inserts one usage record.
@@ -164,6 +173,25 @@ func (d *DB) LogUsageWithID(p UsageParams) (int64, error) {
 	}
 	var userID any
 	var diagnostics any
+	if p.ReasoningTokens != nil || p.CacheCreationTokens != nil {
+		diag := UsageDiagnostics{}
+		if p.Diagnostics != nil {
+			diag = *p.Diagnostics
+		}
+		details := UsageTokenDetails{}
+		if p.ReasoningTokens != nil && *p.ReasoningTokens >= 0 && *p.ReasoningTokens <= p.OutputTokens {
+			n := *p.ReasoningTokens
+			details.Reasoning = &n
+		}
+		if p.CacheCreationTokens != nil && *p.CacheCreationTokens >= 0 && *p.CacheCreationTokens <= p.InputTokens {
+			n := *p.CacheCreationTokens
+			details.CacheCreation = &n
+		}
+		if details.Reasoning != nil || details.CacheCreation != nil {
+			diag.TokenDetails = &details
+			p.Diagnostics = &diag
+		}
+	}
 	if p.Diagnostics != nil {
 		raw, err := json.Marshal(p.Diagnostics)
 		if err != nil {

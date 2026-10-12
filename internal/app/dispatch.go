@@ -25,6 +25,7 @@ func (s *Server) dispatchRuntimeTo(w http.ResponseWriter, r *http.Request, proto
 		return s.dispatchModelRoute(w, r, proto, payload, principal)
 	}
 	rawModel := strOr(payload["model"], "")
+	requestedLimits := wbruntime.OutputLimits(payload)
 	if rawModel == "" {
 		return false
 	}
@@ -116,6 +117,7 @@ func (s *Server) dispatchRuntimeTo(w http.ResponseWriter, r *http.Request, proto
 		result.ok = err == nil && (report.Status == "" || report.Status == "ok")
 	}
 	if !report.Recorded {
+		report.RequestedLimits = requestedLimits
 		s.o.logRuntimeUsageDiagnostic(report, string(proto), resolved, t0, principal.AppName, principal.UserID, principal.AppID, wbruntime.UsageDiagnostics(r.Context()), r.Context())
 	}
 	if !report.Recorded {
@@ -147,31 +149,54 @@ func (o *Orchestrator) logRuntimeUsageDiagnostic(rep provider.UsageReport, proto
 	if status == "" {
 		status = "ok"
 	}
+	// Enrich a copy: context diagnostics may be shared with routing attempts.
+	if diagnostics == nil {
+		diagnostics = &store.UsageDiagnostics{}
+	} else {
+		value := *diagnostics
+		diagnostics = &value
+	}
+	if rep.FinishReason != "" {
+		diagnostics.FinishReason = rep.FinishReason
+	}
+	if rep.RequestedLimits != nil {
+		diagnostics.RequestedLimits = rep.RequestedLimits
+	}
+	if rep.EffectiveLimits != nil {
+		diagnostics.EffectiveLimits = rep.EffectiveLimits
+	}
+	if ctx != nil {
+		if timing := streamwatch.TimingFrom(ctx); timing != nil {
+			diagnostics.Started = diagnostics.Started || timing.Snapshot().Attempts > 0
+		}
+	}
 	if userID > 0 {
 		rep.Input = ""
 		rep.Output = ""
 		rep.Reasoning = ""
 	}
 	o.recordUsage(ctx, store.UsageParams{
-		Model:            model,
-		Diagnostics:      diagnostics,
-		Protocol:         protocol,
-		AccountUID:       rep.AccountUID,
-		InputTokens:      rep.InputTokens,
-		TokensKnown:      rep.TokensKnown,
-		OutputTokens:     rep.OutputTokens,
-		CachedTokens:     rep.CachedTokens,
-		LatencyMs:        float64(time.Since(t0).Milliseconds()),
-		Status:           status,
-		Error:            rep.Error,
-		InputContent:     clipContent(rep.Input, o.cfg.UsageContentMaxBytes),
-		OutputContent:    clipContent(rep.Output, o.cfg.UsageContentMaxBytes),
-		ReasoningContent: clipContent(rep.Reasoning, o.cfg.UsageContentMaxBytes),
-		Credits:          rep.Credits,
-		AppName:          appName,
-		UserID:           userID,
-		AppID:            appID,
-		ReasoningEffort:  effort,
+		Model:               model,
+		Diagnostics:         diagnostics,
+		Protocol:            protocol,
+		AccountUID:          rep.AccountUID,
+		InputTokens:         rep.InputTokens,
+		TokensKnown:         rep.TokensKnown,
+		OutputTokens:        rep.OutputTokens,
+		CachedTokens:        rep.CachedTokens,
+		ReasoningTokens:     rep.ReasoningTokens,
+		CacheCreationTokens: rep.CacheCreationTokens,
+		LatencyMs:           float64(time.Since(t0).Milliseconds()),
+		Status:              status,
+		Error:               rep.Error,
+		InputContent:        clipContent(rep.Input, o.cfg.UsageContentMaxBytes),
+		OutputContent:       clipContent(rep.Output, o.cfg.UsageContentMaxBytes),
+		ReasoningContent:    clipContent(rep.Reasoning, o.cfg.UsageContentMaxBytes),
+		Credits:             rep.Credits,
+		AppName:             appName,
+		UserID:              userID,
+		AppID:               appID,
+		ReasoningEffort:     effort,
 	})
 }
 
