@@ -31,7 +31,7 @@ import (
 // v16 adds stable usage app IDs and independent daily execution quotas.
 // v18 adds bounded, content-free request diagnostics to usage records.
 // v19 adds owner identity, credential epochs, temporary passwords and identity audit.
-const SchemaVersion = 19
+const SchemaVersion = 22
 
 // DB wraps the SQLite connection.
 type DB struct {
@@ -43,6 +43,7 @@ type DB struct {
 	// it), so serving from memory avoids a SQLite round-trip per request. It is
 	// invalidated on SaveSettings; nil means "not populated yet".
 	settingsCache map[string]string
+	routesCache   []ModelRoute
 }
 
 // DefaultSettings mirror db.py DEFAULT_SETTINGS.
@@ -70,6 +71,7 @@ var DefaultSettings = map[string]string{
 	"qoder_machine_salt":      "",
 	// 用户门户（阶段 A）：管理员可配置的共享模型禁用列表（JSON 数组），从共享
 	// 权限集中扣除。注册方式等部署级开关走环境变量，不进 settings。
+	"portal_model_policy":            `{"mode":"auto","include":[],"exclude":[]}`,
 	"portal_disabled_models":         "",
 	"portal_public_url":              "",
 	"portal_default_group":           "0",
@@ -382,6 +384,23 @@ CREATE INDEX IF NOT EXISTS idx_contrib_user ON contributions(user_id);
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, actor_id INTEGER NOT NULL,
   auth_method TEXT NOT NULL, target_id INTEGER NOT NULL, action TEXT NOT NULL, before_value TEXT NOT NULL, after_value TEXT NOT NULL
  );`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`CREATE TABLE IF NOT EXISTS model_routes (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, model TEXT NOT NULL UNIQUE,
+ name TEXT NOT NULL, enabled INTEGER NOT NULL, members TEXT NOT NULL, revision INTEGER NOT NULL
+ );
+ CREATE TABLE IF NOT EXISTS app_route_grants (
+ app_id INTEGER NOT NULL REFERENCES apps(id) ON DELETE CASCADE,
+ route_id INTEGER NOT NULL REFERENCES model_routes(id) ON DELETE CASCADE,
+ members TEXT NOT NULL, PRIMARY KEY(app_id,route_id)
+ );`); err != nil {
+		return err
+	}
+	if err := migratePortalAccess(tx, version); err != nil {
+		return err
+	}
+	if err := migrateInvites(tx, version); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(fmt.Sprintf("PRAGMA user_version = %d", SchemaVersion)); err != nil {

@@ -13,7 +13,7 @@ const emit = defineEmits<{ refresh: [] }>()
 const identity = ref<AdminIdentity | null>(null), ownerExists = ref(true), error = ref(''), busy = ref(false)
 const filter = ref('user'), search = ref(''), showCreate = ref(false)
 const username = ref(''), password = ref(''), createRole = ref('user')
-const resets = ref<Record<number, string>>({}), concurrency = ref<Record<number, string>>({})
+const resets = ref<Record<number, string>>({})
 const verification = ref(false), proof = ref(''), operationLabel = ref('')
 const operationHint = ref('')
 let pending: (() => Promise<unknown>) | undefined
@@ -35,7 +35,7 @@ async function loadIdentity() {
   try { const result = await api.adminIdentity(); identity.value = result.identity; ownerExists.value = result.owner_exists; if (result.identity.role !== 'owner') createRole.value = 'user' }
   catch (e: any) { identity.value = null; error.value = e?.response?.data?.error?.message || '身份加载失败' }
 }
-watch(() => props.users, () => { for (const u of props.users) concurrency.value[u.id] = String(props.overrides?.[String(u.id)] || 0); void loadIdentity() }, { immediate: true })
+watch(() => props.users, () => { void loadIdentity() }, { immediate: true })
 function ask(label: string, action: () => Promise<unknown>, hint = '') {
   if (busy.value || !identity.value) return
   operationLabel.value = label; operationHint.value = hint; pending = action; proof.value = ''; error.value = ''; verification.value = true
@@ -81,13 +81,7 @@ async function loadAudit() {
   try { audit.value = (await api.identityAudit()).records }
   catch (e: any) { error.value = e?.response?.data?.error?.message || '审计查询失败' }
 }
-async function saveConcurrency(u: PortalUser) {
-  if (busy.value) return
-  busy.value = true; error.value = ''
-  try { await api.portalWrite(`users/${u.id}/concurrency`, { limit: Number(concurrency.value[u.id]) }); toast.success('门户执行并发已更新'); emit('refresh') }
-  catch (e: any) { error.value = e?.response?.data?.error?.message || '更新失败' }
-  finally { busy.value = false }
-}
+
 async function toggleAudit() { showAudit.value = !showAudit.value; if (showAudit.value) await loadAudit() }
 </script>
 
@@ -110,7 +104,6 @@ async function toggleAudit() { showAudit.value = !showAudit.value; if (showAudit
         <WButton v-if="isOwner && u.role === 'admin' && u.status === 'active' && !u.must_change_password && (ownerExists || identity?.recovery)" size="sm" :disabled="busy" @click="transfer(u)">{{ ownerExists ? '交接超级管理员' : '指定超级管理员' }}</WButton>
       </div>
       <div v-if="canManage(u) || (identity?.recovery && u.role === 'owner')" class="flex gap-2"><WInput v-model="resets[u.id]" type="password" autocomplete="new-password" :aria-label="`重置 ${u.username} 的临时密码`" placeholder="新临时密码" /><WButton size="sm" :disabled="busy" @click="reset(u)">重置密码并退出设备</WButton></div>
-      <div class="flex flex-wrap items-center gap-2 text-small"><label :for="`concurrency-${u.id}`">门户执行并发</label><select :id="`concurrency-${u.id}`" v-model="concurrency[u.id]" :disabled="busy" class="rounded-lg border border-line bg-bg p-2"><option value="0">默认</option><option v-for="n in maxConcurrency" :key="n" :value="String(n)">{{ n }}</option></select><WButton size="sm" :disabled="busy" @click="saveConcurrency(u)">保存</WButton></div>
     </article>
     <div v-if="showAudit" class="space-y-2"><h3 class="text-small font-medium">最近 100 条身份操作</h3><p v-if="!audit.length" class="text-micro text-faint">暂无记录。</p><div v-for="record in audit" :key="record.id" class="break-words text-micro text-muted">{{ dt(record.ts, 'MM-DD HH:mm:ss') }} · {{ record.actor_name }}（{{ authLabel(record.auth_method) }}）→ {{ record.target_name }} · {{ actionLabel(record.action) }} {{ auditDetail(record.action, record.before_value, record.after_value) }}</div></div>
     <WModal v-model:open="verification" :dismissible="!busy" :title="operationLabel" size="sm"><p class="mb-3 text-small text-muted">{{ identity?.recovery ? '请重新输入恢复 Token。' : '请验证你当前的管理密码。' }}操作将记录操作者；身份、停用和改密变更会退出相关设备。</p><p v-if="operationHint" class="mb-3 text-small text-warn">{{ operationHint }}</p><WInput v-model="proof" :disabled="busy" type="password" autocomplete="off" aria-label="身份验证凭据" :placeholder="identity?.recovery ? '恢复 Token' : '当前管理密码'" @enter="verifyAndRun" /><p v-if="error" role="alert" class="mt-2 text-small text-fault">{{ error }}</p><template #footer><WButton :disabled="busy" @click="verification = false">取消</WButton><WButton variant="primary" :loading="busy" :disabled="!proof" @click="verifyAndRun">验证并执行</WButton></template></WModal>

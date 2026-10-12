@@ -9,6 +9,7 @@ export interface ProviderMeta {
 }
 
 const REGISTRY: Record<string, ProviderMeta> = {
+  unified: { name: 'unified', label: '统一路由', short: 'UR', tone: 'brand', chip: 'bg-brand/12 text-brand' },
 	trae: { name:'trae', label:'Trae', short:'TR', tone:'live', chip:'bg-live/12 text-live' },
   workbuddy: { name: 'workbuddy', label: 'WorkBuddy', short: 'WB', tone: 'brand', chip: 'bg-brand/12 text-brand' },
   qoder: { name: 'qoder', label: 'Qoder', short: 'QD', tone: 'route', chip: 'bg-route/12 text-route' },

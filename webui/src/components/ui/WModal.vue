@@ -3,12 +3,12 @@
 // 点遮罩/ESC 关闭。宽度经 size 控制。
 import { onMounted, onUnmounted, useId } from 'vue'
 const titleID = useId()
-const props = withDefaults(defineProps<{ open: boolean; title?: string; size?: 'sm' | 'md' | 'lg'; dismissible?: boolean }>(), {
+const props = withDefaults(defineProps<{ open: boolean; title?: string; size?: 'sm' | 'md' | 'lg' | 'xl'; dismissible?: boolean }>(), {
   size: 'md',
   dismissible: true,
 })
 const emit = defineEmits<{ 'update:open': [v: boolean] }>()
-const width = { sm: 'max-w-md', md: 'max-w-xl', lg: 'max-w-3xl' }
+const width = { sm: 'max-w-md', md: 'max-w-xl', lg: 'max-w-3xl', xl: 'max-w-5xl' }
 function close() {
   if (!props.dismissible) return
   emit('update:open', false)

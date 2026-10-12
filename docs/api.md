@@ -58,3 +58,33 @@ WorkBuddy 国内渠道遇到明确的 `11128` 渠道验证拒绝时，可在输�
 - **密钥模型白名单**：`/v1/models` 只展示该密钥获准调用的模型及别名。省略 `model`（含 `null`、空字符串）时，不限模型的密钥默认使用 `auto`，仅允许一个模型的密钥默认使用该模型，允许多个模型的密钥需明确指定，否则返回 400。显式指定 `auto` 仍需获得授权；它会交给上游选择，并不表示在密钥白名单内自动选择。
 
 `/v1/messages/count_tokens` 当前提供文本及工具内容的粗估（含 system、工具定义和结果），不使用供应商 tokenizer；图片和音频未计入，不能作为精确计费或上下文容量依据。
+
+
+## 用户模型权限
+
+用户 Key 的 `model_policy` 为 `follow`（跟随当前权限）或 `fixed`（固定白名单）。旧用户 Key 保持 `fixed`；新建默认 `follow`。固定空列表拒绝所有模型，管理员私人 Key 的原有空列表语义不变。
+
+门户登录响应返回服务端决定的 `redirect_to`，管理员为 `/admin-ui/`，普通用户为 `/portal/`。两种会话 Cookie 仍隔离。
+
+管理接口 `POST /admin/portal/model-policy` 接受 `mode`（auto/manual）、`include`、`exclude` 字符串数组；`POST /admin/portal/users/{id}/models` 接受 `models` 与 `remove_scoped` 数组，后者用于明确移除历史账号范围授权。默认权限只决定模型可用范围，不保证实际命中免费账号。
+
+Qoder 贡献授权使用 `/portal/api/providers/qoder/oauth/{begin,poll,cancel}`；个人凭据使用 `POST /portal/api/providers/{qoder,opencode}/contribute`，包含 `accepted:true`、`token` 及 Qoder 的 `region` 或 OpenCode 的 `tier`。用户不能传入上游地址、配置文件路径或指定其他人归属。已有 WorkBuddy / Trae 授权路径保留。
+
+
+## 邀请码管理接口
+
+`POST /admin/portal/invites` 可传 `max_uses`（默认1，0表示明确不限）与 `expires_at`（Unix秒，0表示永不过期）。省略有效期时默认7天；兼容旧 `valid_days` 字段，但不能同时传两种时间参数。非法参数返回400，不再静默回退成7天。
+
+`POST /admin/portal/invites/{code}` 保存 `max_uses`、`expires_at`、`enabled`（布尔）和 `revision`。版本冲突或次数上限低于已使用次数返回409；使用次数不会因编辑或恢复而重置。原有DELETE接口现在停用邀请码并保留使用记录。
+
+`GET /admin/portal/invites/{code}/history?offset=0` 返回 `records`（每页最多50条，含注册用户名、用户ID和时间）及 `next_offset`，-1表示没有下一页。列表新增 `max_uses`、`used_count`、`enabled`、`revision`；`used_by/used_at`只为旧客户端保留首次使用信息，不能再用于判断邀请码是否可用。所有接口仍要求管理员身份及原有同源保护。
+
+### 门户本人 Key 与日志
+
+以下接口使用门户登录会话，需启用门户并完成登录：
+
+- `GET /portal/api/keys/{id}/key`：按需恢复本人 Key；不存在或不属于本人均返回 404，响应禁用缓存。
+- `GET /portal/api/usage/records?page=1&page_size=20`：本人调用日志，支持 `model`（请求或实际模型）、`protocol`、`status` 精确筛选；每页最多 100 条。
+- `GET /portal/api/usage/records/{id}`：本人调用详情及已记录的关联尝试。
+
+管理台 `GET /admin/usage/recent?group=request` 使用相同请求归并；不传该参数保留原始用量行接口。计费与额度统计仍使用原始记录，归并不会合并不同渠道积分或覆盖未知值。

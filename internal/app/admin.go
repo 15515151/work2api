@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"work2api/internal/core/provider"
+	"work2api/internal/store"
 	wbruntime "work2api/internal/workbuddy/runtime"
 )
 
@@ -35,6 +36,11 @@ func (s *Server) mountAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("POST /admin/login", s.handleAdminLogin)
 	mux.HandleFunc("POST /admin/logout", s.handleAdminLogout)
 	mux.HandleFunc("GET /admin/overview", s.adminOverview)
+	mux.HandleFunc("GET /admin/update", s.adminUpdate)
+	mux.HandleFunc("POST /admin/update/check", s.adminUpdate)
+	mux.HandleFunc("POST /admin/update/download", s.adminUpdate)
+	mux.HandleFunc("POST /admin/update/install", s.adminUpdate)
+	mux.HandleFunc("POST /admin/update/policy", s.adminUpdate)
 	mux.HandleFunc("GET /admin/backups", s.adminBackups)
 	mux.HandleFunc("POST /admin/backups", s.adminBackups)
 	mux.HandleFunc("GET /admin/accounts", s.adminAccounts)
@@ -66,6 +72,9 @@ func (s *Server) mountAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("GET /admin/usage/{id}", s.adminUsageDetail)
 	mux.HandleFunc("GET /admin/models", s.adminModels)
 	mux.HandleFunc("GET /admin/models/catalog", s.adminModelCatalog)
+	mux.HandleFunc("GET /admin/model-routes", s.adminModelRoutes)
+	mux.HandleFunc("POST /admin/model-routes", s.adminSaveModelRoute)
+	mux.HandleFunc("DELETE /admin/model-routes/{id}", s.adminDeleteModelRoute)
 	mux.HandleFunc("GET /admin/health", s.adminHealth)
 	mux.HandleFunc("POST /admin/models", s.adminRefreshModels)
 	mux.HandleFunc("POST /admin/models/refresh", s.adminRefreshModels)
@@ -425,6 +434,7 @@ func normalizeAllowedModels(v any) (string, error) {
 }
 
 func (s *Server) adminAppKey(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	enc, _ := s.o.db.GetAppKeyEnc(id)
 	if enc == "" {
@@ -487,7 +497,18 @@ func (s *Server) adminSetAppModels(w http.ResponseWriter, r *http.Request) {
 			warnings = append(warnings, "模型 "+m+" 不在当前模型目录中，请确认拼写")
 		}
 	}
-	if err := s.o.db.SetAppModels(id, allowed); err != nil {
+	policy, _ := body["model_policy"].(string)
+	if policy == "" {
+		policy = "fixed"
+	}
+	if policy == "follow" {
+		allowed = "[]"
+	}
+	if policy != "fixed" && policy != "follow" {
+		writeAPIErr(w, errBody(400, "无效模型权限模式", "invalid_request_error"))
+		return
+	}
+	if err := s.o.db.SetAppModels(id, allowed, policy); err != nil {
 		writeJSON(w, 404, errBody(404, err.Error(), "invalid_request_error").Body)
 		return
 	}
@@ -593,6 +614,16 @@ func (s *Server) adminUsageRecent(w http.ResponseWriter, r *http.Request) {
 	if v := q.Get("app_name"); q.Has("app_name") {
 		appName = &v
 	}
+	if q.Get("group") == "request" {
+		page, pageSize = logPage(r)
+		rows, total, err := s.o.db.UsageRequests(nil, pageSize, (page-1)*pageSize, q.Get("protocol"), q.Get("model"), appName, q.Get("status"), q.Get("search"))
+		if err != nil {
+			writeAPIErr(w, errBody(500, "查询调用日志失败", "server_error"))
+			return
+		}
+		writeJSON(w, 200, map[string]any{"records": rows, "total": total, "page": page, "page_size": pageSize})
+		return
+	}
 	rows, _ := s.o.db.UsageRecent(pageSize, q.Get("protocol"), q.Get("model"), appName, q.Get("status"), true, (page-1)*pageSize, q.Get("search"))
 	total, _ := s.o.db.UsageCount(q.Get("protocol"), q.Get("model"), appName, q.Get("status"), q.Get("search"))
 	writeJSON(w, 200, map[string]any{"records": rows, "total": total, "page": page, "page_size": pageSize})
@@ -605,7 +636,11 @@ func (s *Server) adminUsageFilters(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) adminUsageDetail(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.Atoi(r.PathValue("id"))
-	rec, _ := s.o.db.GetUsage(id)
+	rec, err := s.o.db.UsageRequest(int64(id), nil)
+	if err != nil {
+		writeAPIErr(w, errBody(500, "查询调用详情失败", "server_error"))
+		return
+	}
 	if rec == nil {
 		writeJSON(w, 404, errBody(404, "not found", "invalid_request_error").Body)
 		return
@@ -685,6 +720,20 @@ func (s *Server) adminSaveSettings(w http.ResponseWriter, r *http.Request) {
 	for k, v := range body {
 		kv[k] = toStrLoose(v)
 	}
+	if raw, present := kv["model_aliases"]; present {
+		routes, err := s.o.db.ModelRoutes()
+		if err != nil {
+			writeAPIErr(w, errBody(503, "模型配置读取失败", "server_error"))
+			return
+		}
+		aliases := parseModelAliases(raw)
+		for _, route := range routes {
+			if _, exists := aliases[route.Model]; exists {
+				writeAPIErr(w, errBody(409, "别名不能覆盖统一模型调用名称", "configuration_conflict"))
+				return
+			}
+		}
+	}
 	if raw, present := kv["portal_public_url"]; present {
 		raw = strings.TrimSpace(raw)
 		if raw != "" {
@@ -702,6 +751,13 @@ func (s *Server) adminSaveSettings(w http.ResponseWriter, r *http.Request) {
 		var models []string
 		if json.Unmarshal([]byte(raw), &models) != nil || models == nil {
 			writeAPIErr(w, errBody(400, "禁用模型必须是 JSON 字符串数组", "invalid_request_error"))
+			return
+		}
+	}
+	if raw, present := kv["portal_model_policy"]; present {
+		var policy store.DefaultModelPolicy
+		if json.Unmarshal([]byte(raw), &policy) != nil || (policy.Mode != "auto" && policy.Mode != "manual") || policy.Include == nil || policy.Exclude == nil {
+			writeAPIErr(w, errBody(400, "无效默认模型规则", "invalid_request_error"))
 			return
 		}
 	}

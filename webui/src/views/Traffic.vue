@@ -1,25 +1,24 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, watch } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api } from '@/api/client'
-import type { UsageSummary, UsagePoint, UsageRecord, RecordsResponse } from '@/types'
+import type { UsageSummary, UsagePoint, UsageRecord } from '@/types'
 import { toast } from '@/lib/toast'
-import { int, abbr, credits as fmtCredits, dt, latency, pct } from '@/lib/format'
+import { int, abbr, credits as fmtCredits, dt, pct } from '@/lib/format'
 import WPage from '@/components/ui/WPage.vue'
 import WCard from '@/components/ui/WCard.vue'
 import WTabs from '@/components/ui/WTabs.vue'
 import WStat from '@/components/ui/WStat.vue'
-import WTable, { type Column } from '@/components/ui/WTable.vue'
 import WButton from '@/components/ui/WButton.vue'
 import WInput from '@/components/ui/WInput.vue'
 import WSelect from '@/components/ui/WSelect.vue'
-import WLed from '@/components/ui/WLed.vue'
 import WModal from '@/components/ui/WModal.vue'
-import WEmpty from '@/components/ui/WEmpty.vue'
 import WSpinner from '@/components/ui/WSpinner.vue'
 import WIcon from '@/components/ui/WIcon.vue'
 import TrendChart from '@/components/TrendChart.vue'
 import BarList from '@/components/BarList.vue'
+import RequestLogTable from '@/components/RequestLogTable.vue'
+import RequestLogDetail from '@/components/RequestLogDetail.vue'
 import SessionsPanel from '@/components/SessionsPanel.vue'
 
 const route = useRoute()
@@ -81,6 +80,10 @@ const total = ref(0)
 const page = ref(1)
 const pageSize = 20
 const logLoading = ref(false)
+const logError = ref('')
+const detailError = ref('')
+let logVersion=0, detailVersion=0, disposed=false
+onUnmounted(()=>{disposed=true;logVersion++;detailVersion++})
 const filters = ref<{ protocol?: string; model?: string; app_name?: string; status?: string; search?: string }>({})
 const filterOpts = ref<{ protocols: string[]; models: string[]; apps: string[]; apps_history: string[]; statuses: string[] }>({
   protocols: [], models: [], apps: [], apps_history: [], statuses: [],
@@ -123,14 +126,14 @@ async function loadFilters() {
   filterOpts.value = { protocols: f.protocols || [], models: f.models || [], apps: f.apps || [], apps_history: f.apps_history || [], statuses: f.statuses || [] }
 }
 async function loadLogs() {
-  logLoading.value = true
+  const version=++logVersion
+  logLoading.value=true;logError.value=''
   try {
-    const res: RecordsResponse = await api.usageRecent(page.value, pageSize, filters.value)
-    records.value = res.records || []
-    total.value = res.total || 0
-  } finally {
-    logLoading.value = false
-  }
+    const res=await api.usageRecent(page.value,pageSize,{...filters.value})
+    if(disposed || version!==logVersion)return
+    records.value=res.records || [];total.value=res.total || 0
+  } catch(e:any) { if(!disposed && version===logVersion)logError.value=e?.message || '查询调用记录失败' }
+  finally { if(!disposed && version===logVersion)logLoading.value=false }
 }
 function applyFilter() {
   filters.value.search = searchInput.value.trim() || undefined
@@ -147,44 +150,16 @@ function resetFilter() {
 watch(page, loadLogs)
 const totalPages = computed(() => Math.max(1, Math.ceil(total.value / pageSize)))
 
-const logCols: Column[] = [
-  { nowrap: true, key: 'ts', label: '时间', mono: true },
-  { nowrap: true, key: 'model', label: '模型' },
-  { nowrap: true, key: 'protocol', label: '协议' },
-  { nowrap: true, key: 'account_uid', label: '账号', mono: true },
-  { nowrap: true, key: 'tokens', label: 'Tokens（入/出）', align: 'right', mono: true },
-  { nowrap: true, key: 'credits', label: '额度', align: 'right', mono: true },
-  { nowrap: true, key: 'latency_ms', label: '延迟', align: 'right', mono: true },
-  { nowrap: true, key: 'status', label: '状态' },
-  { nowrap: true, key: 'actions', label: '', align: 'right' },
-]
-
 // 详情
 const detailOpen = ref(false)
-function completionLabel(row: { status?: string; diagnostics?: UsageRecord['diagnostics'] }): string {
-  if (row.status !== 'incomplete') return row.status || '未知'
-  const reason = row.diagnostics?.finish_reason
-  if (reason === 'length') return '达到输出或上下文上限'
-  if (reason === 'content_filter') return '上游内容过滤'
-  return '输出未完成（原因未记录）'
-}
-function budgetLabel(limits?: Record<string, number>): string {
-  return limits && Object.keys(limits).length ? Object.entries(limits).map(([k, v]) => `${k}: ${v}`).join(' · ') : '未显式指定'
-}
-function compatibilityLabel(value?: string): string {
-  return ({ original: '原文', identity: '固定身份兼容', client_metadata: '客户端身份与归因精简' } as Record<string, string>)[value ?? ''] ?? '未记录'
-}
 const detail = ref<UsageRecord | null>(null)
 const detailLoading = ref(false)
 async function openDetail(id: number) {
-  detailOpen.value = true
-  detailLoading.value = true
-  detail.value = null
-  try {
-    detail.value = (await api.usageDetail(id)).record
-  } finally {
-    detailLoading.value = false
-  }
+  const version=++detailVersion
+  detailOpen.value=true;detailLoading.value=true;detail.value=null;detailError.value=''
+  try { const result=await api.usageDetail(id);if(!disposed && version===detailVersion)detail.value=result.record }
+  catch(e:any){if(!disposed && version===detailVersion)detailError.value=e?.message || '查询调用详情失败'}
+  finally {if(!disposed && version===detailVersion)detailLoading.value=false}
 }
 
 // 导出 CSV（遍历全部分页）
@@ -192,20 +167,29 @@ const exporting = ref(false)
 async function exportCSV() {
   exporting.value = true
   try {
+    const exportFilters={...filters.value}
     const all: UsageRecord[] = []
     let p = 1
     for (;;) {
-      const res = await api.usageRecent(p, 200, filters.value)
+      const res = await api.usageRecent(p, 100, exportFilters)
       all.push(...(res.records || []))
       if (all.length >= (res.total || 0) || !res.records?.length) break
       p++
     }
-    const head = ['时间', '模型', '协议', '账号', '输入', '输出', '额度', '延迟ms', '状态']
-    const lines = all.map((r) =>
-      [dt(r.ts, 'YYYY-MM-DD HH:mm:ss'), r.model, r.protocol, r.account_uid, r.input_tokens, r.output_tokens, r.credits ?? '', r.latency_ms, r.status]
-        .map((v) => `"${String(v ?? '').replace(/"/g, '""')}"`)
-        .join(','),
-    )
+    const head = ['时间','请求标识','调用模型','实际模型','协议','Key','账号','输入Tokens','输出Tokens','缓存读取Tokens','最终命中消耗','消耗渠道','总耗时ms','排队ms','账号等待ms','首响应ms','上游尝试次数','客户端HTTP状态','结果','结束原因']
+    const cell=(v: unknown) => {
+      let text=String(v ?? '')
+      if(typeof v==='string' && /^[=+@\-\t\r]/.test(text))text="'"+text
+      return '"'+text.replace(/"/g,'""')+'"'
+    }
+    const lines = all.map(r=>{
+      const p=r.diagnostics?.performance, known=r.tokens_known===true || r.tokens_known===1
+      const physical=r.diagnostics?.physical_model || r.model
+      const channel=physical.includes('/')?physical.split('/')[0]:'workbuddy'
+      return [dt(r.ts,'YYYY-MM-DD HH:mm:ss'),p?.request_id,r.diagnostics?.requested_model || r.model,physical,r.protocol,r.app_name,r.account_uid,
+        known?r.input_tokens:null,known?r.output_tokens:null,r.cached_tokens,r.credit_known?r.credits:null,channel,p?.total_ms ?? r.latency_ms,
+        p?.queue_ms,p?.account_wait_ms,p?.first_byte_ms,p?.attempts,p?.http_status,r.status,r.diagnostics?.finish_reason].map(cell).join(',')
+    })
     const blob = new Blob(['﻿' + [head.join(','), ...lines].join('\n')], { type: 'text/csv;charset=utf-8' })
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
@@ -304,46 +288,13 @@ onMounted(() => loadTab(tab.value))
         </div>
       </div>
 
+      <p v-if="logError" class="mb-3 text-small text-fault">{{ logError }}</p>
       <WCard flush>
         <WSpinner v-if="logLoading && !records.length" center label="加载中" />
-        <WTable v-else :columns="logCols" :rows="records" row-key="id" min-width="960px">
-          <template #cell-ts="{ value }">{{ dt(value, 'MM-DD HH:mm:ss') }}</template>
-          <template #cell-model="{ value }"><div class="max-w-48 truncate" :title="value">{{ value }}</div></template>
-          <template #cell-account_uid="{ value, row }"><div class="max-w-36 truncate" :title="acctLabel(value, row.model)">{{ acctLabel(value, row.model) }}</div></template>
-          <template #cell-tokens="{ row }">
-            <div class="text-right leading-tight">
-              <div><span class="text-ink">{{ int(row.input_tokens) }}</span><span class="text-faint"> / {{ int(row.output_tokens) }}</span></div>
-              <!-- 缓存明细：未命中在前（异常醒目，琥珀色），命中灰色小字；
-                   全量未命中整行升级警示；上游未上报则不显示 -->
-              <div v-if="row.cached_tokens != null && (row.cached_tokens < 0 || row.cached_tokens > row.input_tokens)" class="text-micro text-warn" title="上游缓存计数超出输入范围，已排除命中率统计">缓存数据异常 · {{ int(row.cached_tokens) }}</div>
-              <div v-else-if="row.cached_tokens === 0" class="text-micro text-warn" title="上游上报了缓存数据，但本次完全未命中（换号/前缀被打散？）">
-                全量未命中 {{ int(row.input_tokens) }}
-              </div>
-              <div v-else-if="row.cached_tokens != null && row.input_tokens > row.cached_tokens" class="text-micro">
-                <span class="text-warn" title="未命中输入 Tokens">未命中 {{ int(row.input_tokens - row.cached_tokens) }}</span>
-                <span class="text-faint" title="缓存命中 Tokens"> · ⚡命中 {{ int(row.cached_tokens) }}</span>
-              </div>
-              <div v-else-if="row.cached_tokens != null" class="text-micro text-faint" title="全部输入命中缓存">⚡全命中 {{ int(row.cached_tokens) }}</div>
-            </div>
-          </template>
-          <template #cell-credits="{ row }">
-            <span v-if="row.credit_known" class="text-ink">{{ fmtCredits(row.credits) }}</span>
-            <span v-else class="text-faint" title="上游未提供额度数据">—</span>
-          </template>
-          <template #cell-latency_ms="{ value }">{{ latency(value) }}</template>
-          <template #cell-status="{ row }">
-            <span class="inline-flex items-center gap-1.5">
-              <WLed :tone="row.status === 'ok' ? 'live' : row.status === 'error' ? 'fault' : 'muted'" />
-              <span class="text-small">{{ completionLabel(row) }}</span>
-            </span>
-          </template>
-          <template #cell-actions="{ row }">
-            <WButton size="sm" variant="subtle" @click="openDetail(row.id)">详情</WButton>
-          </template>
-          <template #empty><WEmpty title="没有调用记录" hint="调整筛选条件，或等待新的请求进来。" /></template>
-        </WTable>
+        <RequestLogTable v-else :rows="records" :account-label="acctLabel" admin @detail="openDetail" />
       </WCard>
 
+      <p class="mt-3 text-micro text-faint">按网关请求归并重试；Tokens 为最终命中报告值，各次消耗在详情中展示。历史无请求标识记录逐条保留。</p>
       <!-- 分页 -->
       <div v-if="total > pageSize" class="mt-4 flex items-center justify-between text-small text-muted">
         <span>共 <span class="mono text-ink">{{ int(total) }}</span> 条</span>
@@ -358,64 +309,10 @@ onMounted(() => loadTab(tab.value))
     <!-- 记录详情 -->
     <SessionsPanel v-if="tab === 'sessions'" />
 
-    <WModal v-model:open="detailOpen" size="lg" title="调用详情">
+    <WModal v-model:open="detailOpen" size="xl" title="调用详情">
       <WSpinner v-if="detailLoading" label="加载中" />
-      <div v-else-if="detail" class="space-y-4">
-        <div class="grid grid-cols-2 gap-3 sm:grid-cols-4">
-          <div><div class="text-micro text-faint">模型</div><div class="text-small text-ink">{{ detail.model }}</div></div>
-          <div><div class="text-micro text-faint">协议</div><div class="text-small text-ink">{{ detail.protocol }}</div></div>
-          <div><div class="text-micro text-faint">延迟</div><div class="mono text-small text-ink">{{ latency(detail.latency_ms) }}</div></div>
-          <div><div class="text-micro text-faint">状态</div><div class="text-small text-ink">{{ detail.status }}</div></div>
-          <div><div class="text-micro text-faint">输入 Tokens</div><div class="mono text-small text-ink">{{ int(detail.input_tokens) }}</div></div>
-          <div><div class="text-micro text-faint">输出 Tokens</div><div class="mono text-small text-ink">{{ int(detail.output_tokens) }}</div></div>
-          <div v-if="detail.cached_tokens != null">
-            <div class="text-micro text-faint">缓存命中</div>
-            <div class="mono text-small">
-              <span v-if="detail.cached_tokens < 0 || detail.cached_tokens > detail.input_tokens" class="text-warn">缓存数据异常 · 原始值 {{ int(detail.cached_tokens) }}（不计入命中率）</span>
-              <span v-else-if="detail.cached_tokens === 0" class="text-warn">全量未命中 {{ int(detail.input_tokens) }}</span>
-              <span v-else>
-                <span class="text-ink">⚡命中 {{ int(detail.cached_tokens) }}</span>
-                <span v-if="detail.input_tokens > detail.cached_tokens" class="text-warn"> · 未命中 {{ int(detail.input_tokens - detail.cached_tokens) }}</span>
-              </span>
-            </div>
-          </div>
-          <div v-if="detail.reasoning_effort"><div class="text-micro text-faint">推理强度</div><div class="text-small text-ink">{{ detail.reasoning_effort }}</div></div>
-          <div><div class="text-micro text-faint">时间</div><div class="mono text-small text-ink">{{ dt(detail.ts, 'MM-DD HH:mm:ss') }}</div></div>
-        </div>
-        <div v-if="detail.diagnostics" class="rounded-lg border border-line p-3 text-small space-y-1">
-          <div>结束原因：{{ detail.diagnostics.finish_reason || '未收到结束原因' }}</div>
-          <div>客户端输出预算：{{ budgetLabel(detail.diagnostics.requested_output_limits) }}</div>
-          <div>实际发送预算：{{ budgetLabel(detail.diagnostics.effective_output_limits) }}</div>
-          <div>输入处理：{{ compatibilityLabel(detail.diagnostics.compatibility) }}</div>
-          <div v-if="detail.diagnostics.error_kind">故障分类：{{ detail.diagnostics.error_kind === 'local_network' ? '本地网络或 DNS 不可达（未处罚账号）' : detail.diagnostics.error_kind }}</div>
-      <div v-if="detail.diagnostics.performance" class="border-t border-line pt-2 space-y-1">
-        <div class="mono break-all">请求标识：{{ detail.diagnostics.performance.request_id }}</div>
-      <div>整次请求：{{ detail.diagnostics.performance.total_ms }} ms · 上游尝试 {{ detail.diagnostics.performance.attempts }} 次</div>
-      <div>排队 / 账号等待：{{ detail.diagnostics.performance.queue_ms }} / {{ detail.diagnostics.performance.account_wait_ms }} ms</div>
-      <div>首响应：{{ detail.diagnostics.performance.first_byte_ms == null ? '未写出响应' : detail.diagnostics.performance.first_byte_ms + ' ms' }} · 执行：{{ detail.diagnostics.performance.execution_ms == null ? '未发起调用' : detail.diagnostics.performance.execution_ms + ' ms' }}</div>
-      <div v-for="stage in detail.diagnostics.performance.attempt_stages" :key="stage.number">第 {{ stage.number }} 次：{{ stage.headers_finished ? '响应头等待 ' + stage.header_wait_ms + ' ms · 状态 ' + (stage.http_status || '未收到 HTTP 响应') : '未收到响应头' }}</div>
-      <div class="text-micro text-faint">首响应为网关首字节，非模型首个 token。重试记录共享整次请求计时。</div>
-        <div v-if="detail.diagnostics.performance.attempts > (detail.diagnostics.performance.attempt_stages?.length || 0)" class="text-micro text-faint">仅保留前 16 次尝试的阶段记录。</div>
-      </div>
-          <div v-if="detail.status === 'incomplete'" class="text-warn">{{ completionLabel(detail) }}</div>
-        </div>
-        <div v-if="detail.error" class="rounded-lg border border-fault/40 bg-fault/5 p-3">
-          <div class="mb-1 text-micro font-medium text-fault">错误</div>
-          <pre class="mono whitespace-pre-wrap break-all text-small text-fault">{{ detail.error }}</pre>
-        </div>
-        <details v-if="detail.reasoning_content" open>
-          <summary class="cursor-pointer text-small font-medium text-brand">思考链</summary>
-          <pre class="mono mt-2 max-h-60 overflow-auto whitespace-pre-wrap break-all rounded-lg bg-bg/50 p-3 text-micro text-muted">{{ detail.reasoning_content }}</pre>
-        </details>
-        <details v-if="detail.input_content">
-          <summary class="cursor-pointer text-small font-medium text-brand">输入</summary>
-          <pre class="mono mt-2 max-h-60 overflow-auto whitespace-pre-wrap break-all rounded-lg bg-bg/50 p-3 text-micro text-muted">{{ detail.input_content }}</pre>
-        </details>
-        <details v-if="detail.output_content" open>
-          <summary class="cursor-pointer text-small font-medium text-brand">输出</summary>
-          <pre class="mono mt-2 max-h-60 overflow-auto whitespace-pre-wrap break-all rounded-lg bg-bg/50 p-3 text-micro text-muted">{{ detail.output_content }}</pre>
-        </details>
-      </div>
+      <p v-else-if="detailError" class="text-small text-fault">{{ detailError }}</p>
+      <RequestLogDetail v-else-if="detail" :record="detail" :account-label="acctLabel" admin />
       <template #footer><WButton variant="primary" @click="detailOpen = false">关闭</WButton></template>
     </WModal>
   </WPage>

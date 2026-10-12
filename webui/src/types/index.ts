@@ -204,8 +204,12 @@ export interface UsagePoint {
 }
 
 export interface UsageDiagnostics {
+  requested_model?: string
+  physical_model?: string
   performance?: {
     request_id: string
+    http_status?: number
+    response_stream?: boolean
     queue_ms: number
     account_wait_ms: number
     total_ms: number
@@ -213,7 +217,7 @@ export interface UsageDiagnostics {
     execution_ms?: number
     attempts: number
     upstream_429: number
-    attempt_stages?: { number: number; header_wait_ms: number; http_status: number; headers_finished: boolean }[]
+    attempt_stages?: { number: number; header_wait_ms: number; http_status: number; headers_finished: boolean; upstream_request_id?: string }[]
   }
   finish_reason?: string
   requested_output_limits?: Record<string, number>
@@ -224,6 +228,11 @@ export interface UsageDiagnostics {
 }
 
 export interface UsageRecord {
+  user_id?: number | null
+  app_id?: number | null
+  tokens_known?: boolean | number | null
+  logged_attempts?: number
+  attempt_records?: UsageRecord[]
   diagnostics?: UsageDiagnostics | null
   id: number
   ts: number
@@ -250,8 +259,8 @@ export interface UsageRecord {
 
 export interface Overview {
   display_accounts?: AccountInfo[]
-  call_metrics?: { recent?: { request_id: string; attempts: number; http_status: number; attempt_stages?: { number: number; header_wait_ms: number; http_status: number; headers_finished: boolean }[] }[]; requests: number; errors: number; incomplete: number; attempts: number; upstream_429: number; wait_p95_ms: number | null; queue_p95_ms: number | null; account_wait_p95_ms: number | null; execution_p95_ms: number | null; first_byte_p95_ms: number | null; total_p95_ms: number | null }
-  admission?: { waiting_reasons?: Record<string, number>; memory_pressure?: boolean; buffer_reserved_bytes?: number; buffer_budget_bytes?: number; shared_running?: number; shared_capacity?: number; account_running?: Record<string,number>; account_capacity?: number; running: number; queued: number; capacity: number; queue_capacity: number; oldest_wait_ms: number; wait_limit_ms: number; rejected: Record<string,number> }
+  call_metrics?: { recent?: { request_id: string; attempts: number; http_status: number; attempt_stages?: { number: number; header_wait_ms: number; http_status: number; headers_finished: boolean; upstream_request_id?: string }[] }[]; requests: number; errors: number; incomplete: number; attempts: number; upstream_429: number; wait_p95_ms: number | null; queue_p95_ms: number | null; account_wait_p95_ms: number | null; execution_p95_ms: number | null; first_byte_p95_ms: number | null; total_p95_ms: number | null }
+  admission?: { limits_disabled?: boolean; waiting_reasons?: Record<string, number>; memory_pressure?: boolean; buffer_reserved_bytes?: number; buffer_budget_bytes?: number; shared_running?: number; shared_capacity?: number; account_running?: Record<string,number>; account_capacity?: number; running: number; queued: number; capacity: number; queue_capacity: number; oldest_wait_ms: number; wait_limit_ms: number; rejected: Record<string,number> }
   request_body_bytes?: number
   accounts: AccountInfo[]
   /** 预警提示（后端按当前额度状态实时计算，仅用于展示） */
@@ -381,6 +390,8 @@ export interface AppInfo {
   tokens: number
   credits: number
   user_id?: number | null
+  username?: string
+  model_policy?: "follow" | "fixed"
   /** 可用模型白名单（空数组 = 不限制） */
   allowed_models: string[]
 }
@@ -408,3 +419,7 @@ export interface ModelRefreshResult {
   stale: boolean
   message?: string
 }
+
+export interface UpdatePolicy { mode: 'off' | 'check' | 'auto'; every_hours: number; start_hour: number; end_hour: number; allow_republished: boolean }
+export interface UpdateBuild { application: string; version: string; release_build: boolean; repository: string; commit: string; schema: number; os: string; arch: string; build: string }
+export interface UpdateStatus { current: UpdateBuild; deployment: {kind:string;can_install:boolean;reason?:string}; policy:UpdatePolicy;phase:string;message:string;latest?:{tag_name:string;html_url:string;body:string};candidate?:{build:UpdateBuild;digest:string;migration:boolean};last_check?:string;available:boolean;same_version:boolean;timezone:string }

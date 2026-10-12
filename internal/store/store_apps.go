@@ -27,6 +27,8 @@ type App struct {
 	// AllowedModels is the per-key model allowlist (JSON array of model ids);
 	// empty/nil means unrestricted. Parsed for display convenience.
 	AllowedModels []string `json:"allowed_models"`
+	ModelPolicy   string   `json:"model_policy"`
+	Username      string   `json:"username,omitempty"`
 }
 
 func (d *DB) HasEncryptedAppKeys() (bool, error) {
@@ -42,7 +44,7 @@ func (d *DB) HasEncryptedAppKeys() (bool, error) {
 func (d *DB) ListApps() ([]App, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	rows, err := d.db.Query("SELECT id, name, key_prefix, note, enabled, created_at, allowed_models, COALESCE(user_id,0) FROM apps ORDER BY id ASC")
+	rows, err := d.db.Query("SELECT id, name, key_prefix, note, enabled, created_at, allowed_models, COALESCE(user_id,0), model_policy, COALESCE((SELECT username FROM users WHERE users.id=apps.user_id),'') FROM apps ORDER BY id ASC")
 	if err != nil {
 		return nil, err
 	}
@@ -52,7 +54,7 @@ func (d *DB) ListApps() ([]App, error) {
 		var a App
 		var note, allowed sql.NullString
 		var enabled int
-		if err := rows.Scan(&a.ID, &a.Name, &a.KeyPrefix, &note, &enabled, &a.CreatedAt, &allowed, &a.UserID); err != nil {
+		if err := rows.Scan(&a.ID, &a.Name, &a.KeyPrefix, &note, &enabled, &a.CreatedAt, &allowed, &a.UserID, &a.ModelPolicy, &a.Username); err != nil {
 			return nil, err
 		}
 		a.Note = note.String
@@ -88,20 +90,30 @@ func (d *DB) ListApps() ([]App, error) {
 func (d *DB) CreateApp(name, keyHash, keyPrefix, note, keyEnc, allowedJSON string, userID int64) (int64, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	tx, err := d.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
 	var uid any
 	if userID != 0 {
 		uid = userID
 	}
-	res, err := d.db.Exec(
-		"INSERT INTO apps (name, key_hash, key_prefix, note, enabled, created_at, key_enc, user_id, allowed_models) VALUES (?,?,?,?,1,?,?,?,?)",
-		name, keyHash, keyPrefix, note, float64(time.Now().UnixNano())/1e9, keyEnc, uid, allowedJSON)
+	res, err := tx.Exec("INSERT INTO apps (name,key_hash,key_prefix,note,enabled,created_at,key_enc,user_id,allowed_models) VALUES (?,?,?,?,1,?,?,?,?)", name, keyHash, keyPrefix, note, float64(time.Now().UnixNano())/1e9, keyEnc, uid, allowedJSON)
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") {
 			return 0, ErrConflict
 		}
 		return 0, err
 	}
-	return res.LastInsertId()
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+	if err = captureRouteGrants(tx, id, allowedJSON); err != nil {
+		return 0, err
+	}
+	return id, tx.Commit()
 }
 
 // FindAppByKey returns an enabled app matching key_hash, or nil.
@@ -138,18 +150,36 @@ func (d *DB) AllowedModelsOf(appID int64) ([]string, error) {
 
 // SetAppModels replaces an app's model allowlist. An empty list clears the
 // restriction (all models allowed).
-func (d *DB) SetAppModels(appID int64, allowedJSON string) error {
+func (d *DB) SetAppModels(appID int64, allowedJSON string, policies ...string) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	res, err := d.db.Exec("UPDATE apps SET allowed_models = ? WHERE id = ?", allowedJSON, appID)
+	tx, err := d.db.Begin()
 	if err != nil {
 		return err
 	}
-	n, _ := res.RowsAffected()
+	defer tx.Rollback()
+	policy := "fixed"
+	if len(policies) > 0 {
+		policy = policies[0]
+	}
+	if policy != "follow" && policy != "fixed" {
+		return fmt.Errorf("invalid model policy")
+	}
+	res, err := tx.Exec("UPDATE apps SET allowed_models=?,model_policy=? WHERE id=? AND (?='fixed' OR COALESCE(user_id,0)>0)", allowedJSON, policy, appID, policy)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
 	if n == 0 {
 		return fmt.Errorf("应用不存在：%d", appID)
 	}
-	return nil
+	if err = captureRouteGrants(tx, appID, allowedJSON); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // parseAllowedModels decodes the stored JSON array, treating garbage or an
@@ -230,7 +260,7 @@ func (d *DB) DeleteApp(appID int64) (bool, error) {
 func (d *DB) UserApps(userID int64) ([]App, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	rows, err := d.db.Query("SELECT id, name, key_prefix, note, enabled, created_at, allowed_models, COALESCE(user_id,0) FROM apps WHERE user_id=? ORDER BY id ASC", userID)
+	rows, err := d.db.Query("SELECT id, name, key_prefix, note, enabled, created_at, allowed_models, COALESCE(user_id,0), model_policy, COALESCE((SELECT username FROM users WHERE users.id=apps.user_id),'') FROM apps WHERE user_id=? ORDER BY id ASC", userID)
 	if err != nil {
 		return nil, err
 	}
@@ -240,7 +270,7 @@ func (d *DB) UserApps(userID int64) ([]App, error) {
 		var a App
 		var note, allowed sql.NullString
 		var enabled int
-		if err := rows.Scan(&a.ID, &a.Name, &a.KeyPrefix, &note, &enabled, &a.CreatedAt, &allowed, &a.UserID); err != nil {
+		if err := rows.Scan(&a.ID, &a.Name, &a.KeyPrefix, &note, &enabled, &a.CreatedAt, &allowed, &a.UserID, &a.ModelPolicy, &a.Username); err != nil {
 			return nil, err
 		}
 		a.Note = note.String
@@ -320,15 +350,36 @@ func (d *DB) DeleteAppOwned(appID, userID int64) (bool, error) {
 
 // SetAppModelsOwned rebinds a user's own key allowlist (users may only narrow
 // their own keys; the caller validates models against eligibility).
-func (d *DB) SetAppModelsOwned(appID, userID int64, allowedJSON string) (bool, error) {
+func (d *DB) SetAppModelsOwned(appID, userID int64, allowedJSON string, policies ...string) (bool, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	res, err := d.db.Exec("UPDATE apps SET allowed_models=? WHERE id=? AND user_id=?", allowedJSON, appID, userID)
+	tx, err := d.db.Begin()
 	if err != nil {
 		return false, err
 	}
-	n, _ := res.RowsAffected()
-	return n > 0, nil
+	defer tx.Rollback()
+	policy := "fixed"
+	if len(policies) > 0 {
+		policy = policies[0]
+	}
+	if policy != "fixed" && policy != "follow" {
+		return false, fmt.Errorf("invalid model policy")
+	}
+	res, err := tx.Exec("UPDATE apps SET allowed_models=?,model_policy=? WHERE id=? AND user_id=?", allowedJSON, policy, appID, userID)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if n == 0 {
+		return false, nil
+	}
+	if err = captureRouteGrants(tx, appID, allowedJSON); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
 }
 
 // CountUserApps returns how many keys a user owns (portal cap check).
@@ -464,7 +515,14 @@ func (d *DB) CreateAppForUserLimited(userID int64, name, keyHash, keyEnc string,
 	if len(options) > 1 {
 		prefix = options[1]
 	}
-	res, err := tx.Exec("INSERT INTO apps(name,key_hash,key_prefix,note,enabled,created_at,key_enc,user_id,allowed_models) VALUES(?,?,?,'门户 Key',1,?,?,?,?)", name, keyHash, prefix, float64(time.Now().UnixNano())/1e9, keyEnc, userID, allowed)
+	policy := "fixed"
+	if len(options) > 2 {
+		policy = options[2]
+	}
+	if policy != "fixed" && policy != "follow" {
+		return 0, fmt.Errorf("invalid model policy")
+	}
+	res, err := tx.Exec("INSERT INTO apps(name,key_hash,key_prefix,note,enabled,created_at,key_enc,user_id,allowed_models,model_policy) VALUES(?,?,?,'门户 Key',1,?,?,?,?,?)", name, keyHash, prefix, float64(time.Now().UnixNano())/1e9, keyEnc, userID, allowed, policy)
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") {
 			return 0, ErrConflict
@@ -473,6 +531,9 @@ func (d *DB) CreateAppForUserLimited(userID int64, name, keyHash, keyEnc string,
 	}
 	id, err := res.LastInsertId()
 	if err != nil {
+		return 0, err
+	}
+	if err := captureRouteGrants(tx, id, allowed); err != nil {
 		return 0, err
 	}
 	return id, tx.Commit()

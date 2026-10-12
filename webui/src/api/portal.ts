@@ -1,6 +1,7 @@
 export interface PortalUser { id: number; username: string; role: string; status: string; must_change_password?: boolean }
 export interface AdminIdentity { id: number; username: string; role: string; recovery: boolean; must_change_password: boolean }
-export interface PortalInvite { code: string; used_by: number | null; expires_at: number }
+export interface PortalInvite { code: string; used_by: number | null; expires_at: number; max_uses: number; used_count: number; enabled: number; revision: number }
+export interface InviteRedemption { user_id: number; username: string; used_at: number }
 export interface PortalGroup {
   id: number; name: string; provider: string; enabled: boolean; allowed_models: string[] | string
   ready_accounts?: number; usable_models?: number; eligible_users?: number
@@ -13,4 +14,7 @@ export interface PortalOverview {
   contributions?: PortalContribution[]; registration_mode: string
   user_concurrency?: number; user_concurrency_max?: number; user_concurrency_overrides?: Record<string, number>
   default_group_id?: number; default_auto_grant?: boolean
+  model_policy?: { mode: "auto" | "manual"; include: string[]; exclude: string[] }
+  default_models?: string[]
+  user_model_grants?: Record<number, { model: string; account_uids: string[] }[]>
 }

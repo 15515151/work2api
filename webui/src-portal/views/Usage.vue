@@ -1,9 +1,36 @@
 <script setup lang="ts">
 // 用量：今日合计（多 Key 合并）+ 各 Key 明细。日限额为 0 表示未启用该维度。
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, onUnmounted } from 'vue'
 import { api, fmtTokens, type KeyInfo, type Me } from '../api'
 
+import type { UsageRecord } from '../../src/types'
+import RequestLogTable from '../../src/components/RequestLogTable.vue'
+import RequestLogDetail from '../../src/components/RequestLogDetail.vue'
+import WModal from '../../src/components/ui/WModal.vue'
+import WButton from '../../src/components/ui/WButton.vue'
+import WInput from '../../src/components/ui/WInput.vue'
 defineProps<{ me: Me }>()
+const records=ref<UsageRecord[]>([])
+const page=ref(1), total=ref(0), logsLoading=ref(false), logsError=ref('')
+const model=ref(''), protocol=ref(''), status=ref('')
+const detail=ref<UsageRecord|null>(null), detailOpen=ref(false), detailLoading=ref(false), detailError=ref('')
+let version=0, detailVersion=0, disposed=false
+onUnmounted(()=>{disposed=true;version++;detailVersion++})
+async function loadLogs(reset=false) {
+ if(reset)page.value=1
+ const current=++version;logsLoading.value=true;logsError.value=''
+ try { const result=await api.usageRecords(page.value,{model:model.value.trim(),protocol:protocol.value,status:status.value});if(disposed || current!==version)return;records.value=result.records;total.value=result.total }
+ catch(e:any){if(!disposed && current===version)logsError.value=e?.message || '加载调用记录失败'}
+ finally{if(!disposed && current===version)logsLoading.value=false}
+}
+async function openDetail(id:number) {
+ const current=++detailVersion;detailOpen.value=true;detailLoading.value=true;detailError.value='';detail.value=null
+ try{const result=await api.usageRecord(id);if(!disposed && current===detailVersion)detail.value=result.record}
+ catch(e:any){if(!disposed && current===detailVersion)detailError.value=e?.message || '加载详情失败'}
+ finally{if(!disposed && current===detailVersion)detailLoading.value=false}
+}
+function move(next:number){page.value=next;loadLogs()}
+
 
 const loading = ref(true)
 const error = ref('')
@@ -19,7 +46,7 @@ async function load() {
     keys.value = res.keys
   } catch (e: any) { error.value = e?.message || '加载用量失败' } finally { loading.value = false }
 }
-onMounted(load)
+onMounted(()=>{load();loadLogs()})
 
 function quota(cur: number | null, limit: number) {
   return limit > 0 ? `${fmtTokens(cur)} / ${fmtTokens(limit)}` : `${fmtTokens(cur)} · 不限额`
@@ -61,7 +88,7 @@ function quota(cur: number | null, limit: number) {
               <th class="py-2 pr-4 font-medium">状态</th>
               <th class="py-2 pr-4 text-right font-medium">请求数</th>
               <th class="py-2 pr-4 text-right font-medium">Tokens</th>
-              <th class="py-2 text-right font-medium">Credits</th>
+              <th class="py-2 text-right font-medium">渠道积分（不可跨渠道比较）</th>
             </tr>
           </thead>
           <tbody>
@@ -80,5 +107,19 @@ function quota(cur: number | null, limit: number) {
         </table>
       </div>
     </div>
+    <div class="glass rounded-2xl p-5">
+      <h2 class="font-semibold">我的调用记录</h2>
+      <p class="mt-1 text-micro text-faint">只展示本人 Key 的调用，重试合并为一次请求；不保存门户调用的对话正文，不展示其他账号信息。</p>
+      <div class="my-4 flex flex-wrap gap-2">
+       <WInput v-model="model" placeholder="模型 ID（精确匹配）" class="max-w-xs" @enter="loadLogs(true)" />
+       <select v-model="protocol" class="rounded-lg border border-line bg-bg p-2 text-small" aria-label="筛选协议"><option value="">全部协议</option><option value="chat">Chat</option><option value="anthropic">Messages</option><option value="responses">Responses</option></select>
+       <select v-model="status" class="rounded-lg border border-line bg-bg p-2 text-small" aria-label="筛选结果"><option value="">全部结果</option><option value="ok">成功</option><option value="error">失败</option><option value="incomplete">输出未完成</option></select>
+       <WButton :loading="logsLoading" @click="loadLogs(true)">查询 / 刷新</WButton>
+      </div>
+      <p v-if="logsError" class="mb-3 text-small text-fault">{{ logsError }}</p>
+      <RequestLogTable :rows="records" @detail="openDetail" />
+      <div class="mt-4 flex flex-wrap items-center justify-between gap-2 text-small text-muted"><span>共 {{ total }} 次请求</span><div class="flex items-center gap-2"><WButton size="sm" :disabled="logsLoading || page<=1" @click="move(page-1)">上一页</WButton><span>{{ page }} / {{ Math.max(1,Math.ceil(total/20)) }}</span><WButton size="sm" :disabled="logsLoading || page*20>=total" @click="move(page+1)">下一页</WButton></div></div>
+    </div>
+    <WModal v-model:open="detailOpen" size="xl" title="调用详情"><p v-if="detailLoading" class="text-small text-faint">加载中…</p><p v-else-if="detailError" class="text-small text-fault">{{ detailError }}</p><RequestLogDetail v-else-if="detail" :record="detail" /></WModal>
   </div>
 </template>

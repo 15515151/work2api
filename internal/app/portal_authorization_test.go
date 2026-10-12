@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -44,8 +45,9 @@ func TestManagedAdminHTTPPasswordGateAndRoleEpoch(t *testing.T) {
 		return w
 	}
 	ownerCookie := adminLoginCookie(t, s, `{"username":"owner","password":"ownerpassword"}`)
-	if err := s.o.attachPortalScope(&Principal{UserID: ownerID}); err == nil {
-		t.Fatal("owner identity granted portal calling eligibility")
+	ownerPrincipal := &Principal{UserID: ownerID}
+	if err := s.o.attachPortalScope(ownerPrincipal); err != nil || len(ownerPrincipal.PortalModels) != 0 {
+		t.Fatal("owner received unavailable models", err)
 	}
 	w := request("POST", "/admin/portal/users", `{"username":"New-Admin","password":"temporarypass","role":"admin"}`, ownerCookie)
 	if w.Code != 200 {
@@ -339,8 +341,8 @@ func TestPlatformAccountSharingRechecksPrivateDispatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	check := req.Context().Value(portalDispatchCheckKey{}).(func(string, string) *apiError)
-	if err := check(acc.UID, "test-model"); err == nil {
-		t.Fatal("private dispatch survived shared-only conversion")
+	if err := check(acc.UID, "test-model"); err != nil {
+		t.Fatal("legacy sharing mode changed unified pool", err)
 	}
 	userPrincipal := &Principal{UserID: u.ID, AllowedModels: []string{"test-model"}}
 	if err := s.o.attachPortalScope(userPrincipal); err != nil {
@@ -356,8 +358,8 @@ func TestPlatformAccountSharingRechecksPrivateDispatch(t *testing.T) {
 	if err := s.o.attachPortalScope(userPrincipal); err != nil {
 		t.Fatal(err.Body)
 	}
-	if err := s.prepareModel(userPrincipal, map[string]any{"model": "test-model"}); err == nil {
-		t.Fatal("private conversion left shared access")
+	if err := s.prepareModel(userPrincipal, map[string]any{"model": "test-model"}); err != nil {
+		t.Fatal("legacy private mode changed explicit user grant", err)
 	}
 	if _, err := s.o.pickAccountExcludingIn("test-model", "", nil, nil); err != nil {
 		t.Fatal("private conversion did not restore platform access", err)
@@ -367,8 +369,16 @@ func TestPlatformAccountSharingRechecksPrivateDispatch(t *testing.T) {
 func portalAuthorizeFixture(t *testing.T) (*Server, *store.User, int64, string) {
 	t.Helper()
 	s, u := portalFixture(t)
+	acc := s.o.wb.Pool.Get("test-account")
+	s.o.wb.Pool = pool.New(map[string]pool.Credential{"test-account": portalCatalogCredential{acc.Mgr, "model-a,model-b"}, "second-account": portalCatalogCredential{acc.Mgr, "model-b"}}, "")
+	s.o.wb.Catalog = models.NewWithCatalogClient(s.o.wb.Pool, s.o.db, &http.Client{Transport: portalCatalogTransport{}})
+	s.o.wb.Catalog.Refresh()
+	other, err := portalauth.CreateUser(s.o.db, "account-provider", "testpassword", "user")
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, uid := range []string{"test-account", "second-account"} {
-		if _, err := s.o.db.CreateContribution(u.ID, uid, "workbuddy", "codebuddy", "active"); err != nil {
+		if _, err := s.o.db.CreateContribution(other, uid, "workbuddy", "codebuddy", "active"); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -395,6 +405,19 @@ func portalGrant(t *testing.T, s *Server, u *store.User, name, uid string, model
 	if err := s.o.db.SetGroupEnabled(id, true); err != nil {
 		t.Fatal(err)
 	}
+	grants, err := s.o.db.UserModelGrants(u.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	list := append([]string{}, models...)
+	for _, g := range grants {
+		if len(g.AccountUIDs) > 0 && g.AccountUIDs[0] == "*" {
+			list = append(list, g.Model)
+		}
+	}
+	if err := s.o.db.SetUserPublicModels(u.ID, list, nil); err != nil {
+		t.Fatal(err)
+	}
 	return id
 }
 func portalKeyPrincipal(t *testing.T, s *Server, key string) *Principal {
@@ -414,7 +437,7 @@ func TestPortalAuthorizationKeepsPerModelGroupScope(t *testing.T) {
 		if err := s.prepareModel(p, map[string]any{"model": model}); err != nil {
 			t.Fatal(err.Body)
 		}
-		if len(p.AccountScope) != 1 || !p.AccountScope[uid] {
+		if !p.AccountScope[uid] || model == "model-a" && len(p.AccountScope) != 1 {
 			t.Fatalf("%s widened to %+v", model, p.AccountScope)
 		}
 	}
@@ -492,7 +515,8 @@ func TestPortalQueuedRequestRefreshesAfterAdmission(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	if err := s.o.db.RevokeGroup(u.ID, group); err != nil {
+	_ = group
+	if err := s.o.db.SetUserPublicModels(u.ID, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	held.release()
@@ -699,4 +723,25 @@ func TestPortalDispatchRejectsAliasTargetChangeAfterValidation(t *testing.T) {
 	if s.o.wb.UpstreamClient.(*failingUpstream).calls != 0 {
 		t.Fatal("stale model reached upstream")
 	}
+}
+
+type portalCatalogCredential struct {
+	pool.Credential
+	models string
+}
+
+func (c portalCatalogCredential) CatalogHeaders() (map[string]string, error) {
+	return map[string]string{"x-test-models": c.models}, nil
+}
+
+type portalCatalogTransport struct{}
+
+func (portalCatalogTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	ids := strings.Split(r.Header.Get("x-test-models"), ",")
+	items := []map[string]any{}
+	for _, id := range ids {
+		items = append(items, map[string]any{"id": id, "name": id})
+	}
+	body, _ := json.Marshal(map[string]any{"data": map[string]any{"models": items, "agents": []map[string]any{{"name": "cli", "models": ids}}}})
+	return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(string(body))), Request: r}, nil
 }

@@ -73,8 +73,18 @@ async function checkAuth() {
   try {
     // 空 body 的 POST /admin/login 即会话探测：后端校验 cookie/头部，不消耗限速。
     const res = await fetch('/admin/login', { method: 'POST', body: '{}' })
-    const state = await res.json().catch(() => ({}))
+    const state = await res.json().catch(() => null)
     if (epoch !== authEpoch) return
+    if (!state || (typeof state.password_enabled !== 'boolean' && state.no_login !== true)) {
+      authOk.value = false
+      authError.value = state?.error?.message || '无法读取管理登录状态，请重试或检查服务连接'
+      return
+    }
+    if (!res.ok && res.status !== 401) {
+      authOk.value = false
+      authError.value = state.error?.message || `登录状态检查失败（${res.status}）`
+      return
+    }
     passwordEnabled.value = !!state.password_enabled
     loginMode.value = passwordEnabled.value ? 'password' : 'token'
     authOk.value = res.ok
@@ -94,7 +104,7 @@ async function onLogin() {
   const epoch = ++authEpoch
   authError.value = ''
   try {
-    const res = await fetch('/admin/login', {
+    const res = await fetch(loginMode.value === 'token' ? '/admin/login' : '/portal/api/auth/login', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(loginMode.value === 'token' ? { token: t } : { username: adminUsername.value.trim(), password: adminPassword.value }),
@@ -102,6 +112,7 @@ async function onLogin() {
     const data = await res.json().catch(() => ({}))
     if (epoch !== authEpoch) return
     if (res.ok) {
+      if (data.redirect_to === '/portal/') { window.location.assign('/portal/'); return }
       await loadIdentity(epoch)
       if (epoch !== authEpoch) return
       authOk.value = true
@@ -196,7 +207,7 @@ onUnmounted(() => timer && clearInterval(timer))
         <WInput v-model="tokenInput" type="password" placeholder="输入 ADMIN_TOKEN" class="mb-3" @enter="onLogin" />
       </template>
       <button v-if="passwordEnabled" class="mb-3 text-micro text-brand" @click="loginMode = loginMode === 'password' ? 'token' : 'password'; authError = ''">{{ loginMode === 'password' ? '使用 Token 恢复访问' : '使用账号密码登录' }}</button>
-      <p v-if="authError" class="mb-2 text-micro text-fault">{{ authError }}</p>
+      <p v-if="authError" role="alert" class="mb-2 text-micro text-fault">{{ authError }} <button :disabled="authLoading" class="text-brand" @click="checkAuth">重新检查</button></p>
       <WButton variant="primary" block :loading="authLoading" @click="onLogin">
         <WIcon name="keys" :size="16" /> 登录
       </WButton>

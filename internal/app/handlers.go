@@ -137,6 +137,9 @@ var appendLogText = wbruntime.AppendLogText
 var isLocalOverload = wbruntime.IsLocalOverload
 
 func (s *Server) prepareProviderRequest(r *http.Request, payload map[string]any, p *Principal) (*http.Request, func(), error) {
+	if p.RouteModel != "" {
+		return withRequestSessionIdentity(r, payload), func() {}, nil
+	}
 	rt, ok := s.o.runtimes.Resolve(p.EffectiveModel)
 	if !ok {
 		rt = s.o.wb

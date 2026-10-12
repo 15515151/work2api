@@ -1,0 +1,625 @@
+package app
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+	"work2api/internal/config"
+	"work2api/internal/streamwatch"
+
+	"work2api/internal/core/provider"
+	"work2api/internal/store"
+	wbruntime "work2api/internal/workbuddy/runtime"
+)
+
+func physicalModel(id string) string {
+	if !strings.Contains(id, "/") {
+		return "workbuddy/" + id
+	}
+	return id
+}
+
+func (o *Orchestrator) modelRoute(model string) (*store.ModelRoute, error) {
+	if o.db == nil {
+		return nil, nil
+	}
+	routes, err := o.db.ModelRoutes()
+	if err != nil {
+		return nil, err
+	}
+	for _, route := range routes {
+		if route.Model == model {
+			return &route, nil
+		}
+	}
+	return nil, nil
+}
+
+func (s *Server) physicalCatalog() map[string]map[string]any {
+	out := map[string]map[string]any{}
+	for _, entry := range s.o.runtimeModels(context.Background()) {
+		out[physicalModel(str2(entry["id"]))] = entry
+	}
+	return out
+}
+
+func (s *Server) routeCatalog(ctx context.Context) []map[string]any {
+	routes, err := s.o.db.ModelRoutes()
+	if err != nil {
+		return nil
+	}
+	catalog := s.physicalCatalog()
+	out := []map[string]any{}
+	for _, route := range routes {
+		if !route.Enabled {
+			continue
+		}
+		vision := true
+		known := 0
+		contextLimit, outputLimit := 0, 0
+		contextKnown, outputKnown := true, true
+		for _, member := range route.Members {
+			m := catalog[member]
+			if m == nil {
+				continue
+			}
+			known++
+			vision = vision && (m["vision"] == true || m["modality"] == "multimodal")
+			c := firstInt(m, "context_length", "context_window")
+			o := firstInt(m, "max_output_tokens", "max_output")
+			contextKnown = contextKnown && c > 0
+			outputKnown = outputKnown && o > 0
+			if c > 0 && (contextLimit == 0 || c < contextLimit) {
+				contextLimit = c
+			}
+			if o > 0 && (outputLimit == 0 || o < outputLimit) {
+				outputLimit = o
+			}
+		}
+		if known == 0 {
+			continue
+		}
+		if !contextKnown {
+			contextLimit = 0
+		}
+		if !outputKnown {
+			outputLimit = 0
+		}
+		out = append(out, map[string]any{"id": route.Model, "name": route.Name, "provider": "unified", "owned_by": "unified", "object": "model", "vision": vision, "context_length": contextLimit, "max_output_tokens": outputLimit, "members": route.Members, "route_id": route.ID})
+	}
+	return out
+}
+
+func (s *Server) routeCandidates(p *Principal, route store.ModelRoute, payload map[string]any) ([]string, *apiError) {
+	if p == nil {
+		p = &Principal{}
+	}
+	if !route.Enabled {
+		return nil, errBody(503, "统一模型已停用", "model_unavailable")
+	}
+	settings, err := s.o.db.GetSettings()
+	if err != nil {
+		return nil, errBody(503, "模型权限查询失败", "server_error")
+	}
+	if p.UserID > 0 {
+		for _, m := range parseJSONStringArray(settings["portal_disabled_models"]) {
+			if m == route.Model {
+				return nil, errBody(403, "统一模型已禁用", "model_not_allowed")
+			}
+		}
+	}
+	grants := map[string]bool{}
+	if p.AppID > 0 && len(p.AllowedModels) > 0 {
+		grants, err = s.o.db.AppRouteMembers(p.AppID, route.ID)
+		if err != nil {
+			return nil, errBody(503, "统一模型授权查询失败", "server_error")
+		}
+	}
+	logicalAllowed := false
+	for _, m := range p.AllowedModels {
+		if m == route.Model {
+			logicalAllowed = true
+		}
+	}
+	catalog := s.physicalCatalog()
+	out := []string{}
+	for _, member := range route.Members {
+		entry := catalog[member]
+		if entry == nil {
+			continue
+		}
+		resolved := s.o.resolveModel(member)
+		rt, ok := s.o.runtimes.Resolve(resolved)
+		if !ok || !rt.Ready() {
+			continue
+		}
+		keyAllowed := p.UserID > 0 && p.ModelPolicy == "follow" || p.AppID == 0 || p.UserID == 0 && len(p.AllowedModels) == 0 || len(p.AllowedModels) > 0 && modelAllowed(p, member, resolved) && !logicalAllowed
+		// A separately granted physical member remains usable even when another
+		// route member was added after the logical grant was captured.
+		for _, allowed := range p.AllowedModels {
+			if physicalModel(s.o.resolveModel(allowed)) == member && allowed != route.Model {
+				keyAllowed = true
+			}
+		}
+		if logicalAllowed && grants[member] {
+			keyAllowed = true
+		}
+		if !keyAllowed {
+			continue
+		}
+		if p.UserID > 0 {
+			portal, ok := rt.(provider.PortalProvider)
+			if !ok || !portal.SupportsPortal() || !p.PortalModels[resolved] || len(p.ModelScopes[resolved]) == 0 {
+				continue
+			}
+		}
+		if requestHasImages(payload) && entry["vision"] != true && entry["supports_image"] != true && entry["modality"] != "multimodal" {
+			continue
+		}
+		if max := firstInt(entry, "max_output_tokens", "max_output"); max > 0 {
+			if requested := firstInt(payload, "max_tokens", "max_output_tokens", "max_completion_tokens"); requested > max {
+				continue
+			}
+		}
+		out = append(out, member)
+	}
+	return out, nil
+}
+
+func requestHasImages(v any) bool {
+	switch x := v.(type) {
+	case map[string]any:
+		kind, _ := x["type"].(string)
+		if kind == "image" || kind == "image_url" || kind == "input_image" {
+			return true
+		}
+		for key, value := range x {
+			if key == "arguments" || key == "parameters" {
+				continue
+			}
+			if requestHasImages(value) {
+				return true
+			}
+		}
+	case []any:
+		for _, item := range x {
+			if requestHasImages(item) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (s *Server) adminModelRoutes(w http.ResponseWriter, r *http.Request) {
+	routes, err := s.o.db.ModelRoutes()
+	if err != nil {
+		writeAPIErr(w, errBody(503, "配置读取失败", "server_error"))
+		return
+	}
+	catalog := s.physicalCatalog()
+	models := []map[string]any{}
+	for id, entry := range catalog {
+		models = append(models, map[string]any{"id": id, "name": entry["name"], "provider": entry["provider"], "vision": entry["vision"], "context_length": entry["context_length"], "max_output_tokens": entry["max_output_tokens"]})
+	}
+	sort.Slice(models, func(i, j int) bool { return str2(models[i]["id"]) < str2(models[j]["id"]) })
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, 200, map[string]any{"routes": routes, "models": models})
+}
+
+var routeNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$`)
+
+func (s *Server) adminSaveModelRoute(w http.ResponseWriter, r *http.Request) {
+	var route store.ModelRoute
+	d := json.NewDecoder(http.MaxBytesReader(w, r.Body, 128<<10))
+	d.DisallowUnknownFields()
+	if d.Decode(&route) != nil || d.Decode(&struct{}{}) != io.EOF {
+		writeAPIErr(w, errBody(400, "统一模型配置格式错误", "invalid_request_error"))
+		return
+	}
+	route.Model, route.Name = strings.TrimSpace(route.Model), strings.TrimSpace(route.Name)
+	if !routeNamePattern.MatchString(route.Model) || strings.Contains(route.Model, "//") || len([]rune(route.Name)) > 100 || len(route.Members) == 0 {
+		writeAPIErr(w, errBody(400, "请输入有效调用名称，并选择实际模型成员", "invalid_request_error"))
+		return
+	}
+	if route.Name == "" {
+		route.Name = route.Model
+	}
+	if _, ok := s.o.runtimes.ForModel(route.Model); ok || strings.HasPrefix(route.Model, "workbuddy/") || route.Model == "auto" {
+		writeAPIErr(w, errBody(400, "调用名称不能占用渠道命名空间或 auto", "invalid_request_error"))
+		return
+	}
+	catalog := s.physicalCatalog()
+	settings, settingsErr := s.o.db.GetSettings()
+	if settingsErr != nil {
+		writeAPIErr(w, errBody(503, "模型配置读取失败", "server_error"))
+		return
+	}
+	if catalog[physicalModel(route.Model)] != nil || parseModelAliases(settings["model_aliases"])[route.Model] != "" {
+		writeAPIErr(w, errBody(409, "名称与现有模型或别名冲突，请换一个调用名称", "invalid_request_error"))
+		return
+	}
+	existing, err := s.o.modelRoute(route.Model)
+	if err != nil {
+		writeAPIErr(w, errBody(503, "配置读取失败", "server_error"))
+		return
+	}
+	if existing != nil && existing.ID != route.ID {
+		writeAPIErr(w, errBody(409, "统一模型名称已存在", "invalid_request_error"))
+		return
+	}
+	seen := map[string]bool{}
+	for _, m := range route.Members {
+		if m != physicalModel(m) || seen[m] {
+			writeAPIErr(w, errBody(400, "成员须使用带渠道前缀的唯一模型 ID", "invalid_request_error"))
+			return
+		}
+		seen[m] = true
+		// Keep previously configured temporarily unavailable members during edits.
+		retained := false
+		if existing != nil {
+			for _, old := range existing.Members {
+				if old == m {
+					retained = true
+				}
+			}
+		}
+		if catalog[m] == nil && !retained {
+			writeAPIErr(w, errBody(400, "成员不在当前模型目录："+m, "invalid_request_error"))
+			return
+		}
+	}
+	id, err := s.o.db.SaveModelRoute(route)
+	if err != nil {
+		writeAPIErr(w, errBody(409, "保存失败，配置可能已变更，请刷新后重试", "configuration_conflict"))
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "id": id, "message": "已保存；新增成员不会自动扩大已有受限 Key 的授权"})
+}
+
+func (s *Server) adminDeleteModelRoute(w http.ResponseWriter, r *http.Request) {
+	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	revision, _ := strconv.ParseInt(r.URL.Query().Get("revision"), 10, 64)
+	if id <= 0 || revision <= 0 {
+		writeAPIErr(w, errBody(400, "缺少配置版本", "invalid_request_error"))
+		return
+	}
+	if s.o.db.DeleteModelRoute(id, revision) != nil {
+		writeAPIErr(w, errBody(409, "配置已变更，请刷新后重试", "configuration_conflict"))
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true})
+}
+
+type routeBinding struct {
+	Member string
+	At     time.Time
+}
+type routeAffinity struct {
+	mu       sync.Mutex
+	bindings map[string]routeBinding
+}
+
+func (a *routeAffinity) member(key string) string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	b := a.bindings[key]
+	if time.Since(b.At) > 30*time.Minute {
+		return ""
+	}
+	return b.Member
+}
+func (a *routeAffinity) bind(key, member string) {
+	if key == "" {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.bindings == nil {
+		a.bindings = map[string]routeBinding{}
+	}
+	now := time.Now()
+	for k, v := range a.bindings {
+		if now.Sub(v.At) > 30*time.Minute {
+			delete(a.bindings, k)
+		}
+	}
+	if len(a.bindings) >= 2000 {
+		var oldKey string
+		old := now
+		for k, v := range a.bindings {
+			if v.At.Before(old) {
+				oldKey, old = k, v.At
+			}
+		}
+		delete(a.bindings, oldKey)
+	}
+	a.bindings[key] = routeBinding{member, now}
+}
+
+// Error responses are held until a retry decision. Successful streams are
+// forwarded immediately; once their headers/body are sent there is no replay.
+type routeWriter struct {
+	dst       http.ResponseWriter
+	header    http.Header
+	status    int
+	started   bool
+	errorBody bytes.Buffer
+	line      []byte
+	logical   string
+	stream    bool
+	limit     int
+}
+
+func (w *routeWriter) Header() http.Header { return w.header }
+func (w *routeWriter) WriteHeader(status int) {
+	if w.status == 0 {
+		w.status = status
+	}
+}
+func (w *routeWriter) start() {
+	if w.started {
+		return
+	}
+	for k, v := range w.header {
+		w.dst.Header()[k] = append([]string(nil), v...)
+	}
+	w.dst.Header().Del("Content-Length")
+	status := w.status
+	if status == 0 {
+		status = 200
+	}
+	w.dst.WriteHeader(status)
+	w.started = true
+}
+func rewriteRouteModel(data []byte, logical string) []byte {
+	var obj map[string]any
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if decoder.Decode(&obj) != nil {
+		return data
+	}
+	changed := false
+	if _, ok := obj["model"]; ok {
+		obj["model"] = logical
+		changed = true
+	}
+	if response, ok := obj["response"].(map[string]any); ok {
+		if _, ok := response["model"]; ok {
+			response["model"] = logical
+			changed = true
+		}
+	}
+	if !changed {
+		return data
+	}
+	raw, err := json.Marshal(obj)
+	if err != nil {
+		return data
+	}
+	return raw
+}
+func (w *routeWriter) Write(data []byte) (int, error) {
+	if w.status >= 400 {
+		if w.errorBody.Len()+len(data) > 1<<20 {
+			return 0, io.ErrShortBuffer
+		}
+		return w.errorBody.Write(data)
+	}
+	limit := w.limit
+	if w.stream {
+		limit = streamwatch.DefaultMaxLineBytes
+	}
+	if !w.stream && limit > 0 && len(w.line)+len(data) > limit {
+		return 0, fmt.Errorf("统一模型响应超过已配置的响应缓冲上限")
+	}
+	w.start()
+	if !w.stream {
+		w.line = append(w.line, data...)
+		return len(data), nil
+	}
+	w.line = append(w.line, data...)
+	for {
+		i := bytes.IndexByte(w.line, '\n')
+		if i < 0 {
+			if len(w.line) > limit {
+				return 0, fmt.Errorf("SSE单行超过解析上限")
+			}
+			break
+		}
+		if i > limit {
+			return 0, fmt.Errorf("SSE单行超过解析上限")
+		}
+		line := w.line[:i+1]
+		if bytes.HasPrefix(line, []byte("data:")) {
+			raw := bytes.TrimSpace(line[5:])
+			if !bytes.Equal(raw, []byte("[DONE]")) {
+				line = append(append([]byte("data: "), rewriteRouteModel(raw, w.logical)...), '\n')
+			}
+		}
+		if _, err := w.dst.Write(line); err != nil {
+			return 0, err
+		}
+		w.line = w.line[i+1:]
+	}
+	return len(data), nil
+}
+func (w *routeWriter) Flush() {
+	if w.status >= 400 {
+		return
+	}
+	w.start()
+	if f, ok := w.dst.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+func (w *routeWriter) finish() {
+	if !w.started {
+		w.start()
+		_, _ = w.dst.Write(w.errorBody.Bytes())
+	}
+	if len(w.line) > 0 {
+		data := w.line
+		if !w.stream {
+			data = rewriteRouteModel(data, w.logical)
+		}
+		_, _ = w.dst.Write(data)
+		w.line = nil
+	}
+}
+
+// Signed or encrypted provider state must stay on the channel which produced it.
+func routeOpaqueContinuation(payload map[string]any) bool {
+	if id, _ := payload["previous_response_id"].(string); id != "" {
+		return true
+	}
+	var opaque func(any) bool
+	opaque = func(v any) bool {
+		switch x := v.(type) {
+		case map[string]any:
+			if value, _ := x["encrypted_content"].(string); value != "" {
+				return true
+			}
+			if x["type"] == "thinking" || x["type"] == "redacted_thinking" {
+				if value, _ := x["signature"].(string); value != "" {
+					return true
+				}
+				if x["type"] == "redacted_thinking" {
+					return true
+				}
+			}
+			for key, value := range x {
+				if key != "arguments" && key != "parameters" && opaque(value) {
+					return true
+				}
+			}
+		case []any:
+			for _, value := range x {
+				if opaque(value) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	return opaque(payload["input"]) || opaque(payload["messages"])
+}
+
+func cloneRoutePayload(body map[string]any) map[string]any {
+	raw, _ := json.Marshal(body)
+	var out map[string]any
+	_ = json.Unmarshal(raw, &out)
+	return out
+}
+
+func (s *Server) dispatchModelRoute(w http.ResponseWriter, r *http.Request, proto provider.Protocol, payload map[string]any, p *Principal) bool {
+	route, err := s.o.modelRoute(p.RouteModel)
+	if err != nil || route == nil {
+		writeAPIErr(w, errBody(503, "统一模型配置不可用", "model_unavailable"))
+		return true
+	}
+	members, aerr := s.routeCandidates(p, *route, payload)
+	if aerr != nil {
+		writeAPIErr(w, aerr)
+		return true
+	}
+	if len(members) == 0 {
+		writeAPIErr(w, errBody(403, "没有符合当前权限和能力的成员", "model_not_allowed"))
+		return true
+	}
+	key := requestSessionKey(r, p, route.Model, payload)
+	sticky := s.o.routes.member(key)
+	for i, m := range members {
+		if m == sticky {
+			copy(members[1:i+1], members[:i])
+			members[0] = m
+			break
+		}
+	}
+	// Provider-owned server continuation identifiers cannot be replayed to an
+	// arbitrary channel after the sticky member is unavailable.
+	if routeOpaqueContinuation(payload) {
+		if sticky == "" || members[0] != sticky {
+			writeAPIErr(w, errBody(400, "服务端续接需要原渠道会话；请使用实际渠道模型或完整对话历史", "invalid_request_error"))
+			return true
+		}
+		members = members[:1]
+	}
+	if len(members) > 2 {
+		members = members[:2]
+	}
+	for i, member := range members {
+		if r.Context().Err() != nil {
+			return true
+		}
+		current, readErr := s.o.modelRoute(route.Model)
+		if readErr != nil || current == nil {
+			writeAPIErr(w, errBody(503, "统一模型配置不可用", "model_unavailable"))
+			return true
+		}
+		freshMembers, permissionErr := s.routeCandidates(p, *current, payload)
+		if permissionErr != nil {
+			writeAPIErr(w, permissionErr)
+			return true
+		}
+		allowed := false
+		for _, candidate := range freshMembers {
+			allowed = allowed || candidate == member
+		}
+		if !allowed {
+			if i < len(members)-1 {
+				continue
+			}
+			writeAPIErr(w, errBody(403, "成员资格已改变，请重新发起请求", "model_not_allowed"))
+			return true
+		}
+		body := cloneRoutePayload(payload)
+		body["model"] = member
+		attempt := *p
+		attempt.RouteModel = ""
+		attempt.EffectiveModel = s.o.resolveModel(member)
+		if p.UserID > 0 {
+			attempt.AccountScope = p.ModelScopes[attempt.EffectiveModel]
+		}
+		attemptRequest := r.WithContext(context.WithValue(r.Context(), principalContextKey{}, &attempt))
+		req, finish, prepErr := s.prepareProviderRequest(attemptRequest, body, &attempt)
+		if prepErr != nil {
+			status, doc := errToHTTP(prepErr)
+			writeJSON(w, status, doc)
+			return true
+		}
+		if diagnostic := wbruntime.Diagnostic(req.Context()); diagnostic != nil {
+			diagnostic.RequestedModel = route.Model
+			diagnostic.PhysicalModel = member
+		}
+		proxy := &routeWriter{dst: w, header: make(http.Header), logical: route.Model, stream: boolVal(payload["stream"]), limit: positiveOr(int(s.o.cfg.MaxResponseBytes), config.DefaultMaxResponseBytes)}
+		result := &routeAttemptResult{}
+		req = req.WithContext(context.WithValue(req.Context(), routeAttemptResultKey{}, result))
+		s.dispatchRuntimeTo(proxy, req, proto, body, &attempt)
+		finish()
+		if proxy.started || proxy.status < 400 {
+			proxy.finish()
+			if proxy.status < 400 && result.ok {
+				s.o.routes.bind(key, member)
+			}
+			return true
+		}
+		if i == len(members)-1 || proxy.status != 429 && proxy.status < 500 {
+			proxy.finish()
+			return true
+		}
+	}
+	return true
+}
+
+type routeAttemptResultKey struct{}
+type routeAttemptResult struct{ ok bool }

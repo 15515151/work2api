@@ -21,6 +21,7 @@ const router = createRouter({
     { path: '/', redirect: '/overview' },
     { path: '/overview', component: () => import('./views/Overview.vue'), meta: { title: '概览' } },
     { path: '/accounts', component: () => import('./views/Accounts.vue'), meta: { title: '账号' } },
+    { path: '/models/routes', component: () => import('./views/ModelRoutes.vue'), meta: { title: '统一模型' } },
     { path: '/models', component: () => import('./views/Models.vue'), meta: { title: '模型' } },
     { path: '/keys', component: () => import('./views/Keys.vue'), meta: { title: 'API 密钥' } },
     { path: '/traffic', component: () => import('./views/Traffic.vue'), meta: { title: '流量' } },

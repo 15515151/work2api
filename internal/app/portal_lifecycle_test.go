@@ -14,9 +14,11 @@ import (
 	"testing"
 	"time"
 
+	"work2api/internal/core/provider"
 	appcrypto "work2api/internal/crypto"
 	"work2api/internal/portal/portalauth"
 	"work2api/internal/store"
+	"work2api/internal/streamwatch"
 	"work2api/internal/workbuddy/models"
 	"work2api/internal/workbuddy/pool"
 )
@@ -358,5 +360,247 @@ func TestPortalPrivateCredentialsRemainUnchangedAndOwnRevokedRestores(t *testing
 	}
 	if err := s.completePortalContribution(u.ID+1, uid, "codebuddy", res); err == nil {
 		t.Fatal("other owner accepted")
+	}
+}
+
+func TestOptionalContributionFollowAndFixedKeys(t *testing.T) {
+	s, u, _, _ := portalAuthorizeFixture(t)
+	s.o.crypto = appcrypto.NewManager(t.TempDir())
+	s.o.cfg.PortalKeyMaxPerUser = 5
+	setPolicy := func(model string) {
+		t.Helper()
+		raw, _ := json.Marshal(store.DefaultModelPolicy{Mode: "manual", Include: []string{model}, Exclude: []string{}})
+		if e := s.o.db.SaveSettings(map[string]string{"portal_model_policy": string(raw)}); e != nil {
+			t.Fatal(e)
+		}
+	}
+	setPolicy("model-a")
+	contributions, _ := s.o.db.UserContributions(u.ID)
+	if len(contributions) != 0 {
+		t.Fatal("fixture unexpectedly owns credentials")
+	}
+	create := func(policy string) string {
+		t.Helper()
+		w := httptest.NewRecorder()
+		s.portalCreateKey(w, portalRequest(u, "/portal/api/keys", `{"name":"optional-`+policy+`","model_policy":"`+policy+`"}`))
+		if w.Code != 200 {
+			t.Fatal(w.Code, w.Body.String())
+		}
+		var body map[string]any
+		json.Unmarshal(w.Body.Bytes(), &body)
+		key, _ := body["key"].(string)
+		if key == "" {
+			t.Fatal("key missing", body)
+		}
+		return key
+	}
+	follow, fixed := create("follow"), create("fixed")
+	for _, key := range []string{follow, fixed} {
+		if e := s.prepareModel(portalKeyPrincipal(t, s, key), map[string]any{"model": "model-a"}); e != nil {
+			t.Fatal(e.Body)
+		}
+	}
+	setPolicy("model-b")
+	if e := s.prepareModel(portalKeyPrincipal(t, s, follow), map[string]any{"model": "model-b"}); e != nil {
+		t.Fatal("follow ignored updated policy", e.Body)
+	}
+	for _, model := range []string{"model-a", "model-b"} {
+		if e := s.prepareModel(portalKeyPrincipal(t, s, fixed), map[string]any{"model": model}); e == nil {
+			t.Fatal("fixed key widened or ignored current rights", model)
+		}
+	}
+	if e := s.o.db.SaveSettings(map[string]string{"portal_disabled_models": `["model-b"]`}); e != nil {
+		t.Fatal(e)
+	}
+	if e := s.prepareModel(portalKeyPrincipal(t, s, follow), map[string]any{"model": "model-b"}); e == nil {
+		t.Fatal("follow bypassed global disabled model")
+	}
+}
+
+func TestUnifiedLoginSelectsRoleAndClearsPreviousAdminIdentity(t *testing.T) {
+	s, user := portalFixture(t)
+	hash, e := portalauth.HashPassword("ownerpassword")
+	if e != nil {
+		t.Fatal(e)
+	}
+	if _, e = s.o.db.CreateInitialAdmin("owner", hash); e != nil {
+		t.Fatal(e)
+	}
+	w := httptest.NewRecorder()
+	s.portalLogin(w, httptest.NewRequest("POST", "/portal/api/auth/login", strings.NewReader(`{"username":"owner","password":"ownerpassword"}`)))
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"redirect_to":"/admin-ui/"`) {
+		t.Fatal(w.Code, w.Body.String())
+	}
+	var admin *http.Cookie
+	for _, c := range w.Result().Cookies() {
+		if c.Name == cookieName && c.MaxAge > 0 {
+			admin = c
+		}
+	}
+	if admin == nil || !admin.HttpOnly || admin.SameSite != http.SameSiteLaxMode {
+		t.Fatal("admin login cookie missing or unsafe")
+	}
+	request := httptest.NewRequest("GET", "/admin/identity", nil)
+	request.AddCookie(admin)
+	if ok, _ := s.adminAuth(request); !ok {
+		t.Fatal("role login did not grant authenticated admin session")
+	}
+	if _, e := s.portalUser(request); e == nil {
+		t.Fatal("admin session became ordinary portal session")
+	}
+	r := httptest.NewRequest("POST", "/portal/api/auth/login", strings.NewReader(`{"username":"`+user.Username+`","password":"oldpassword"}`))
+	r.AddCookie(admin)
+	w = httptest.NewRecorder()
+	s.portalLogin(w, r)
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"redirect_to":"/portal/"`) {
+		t.Fatal(w.Code, w.Body.String())
+	}
+	if ok, _ := s.adminAuth(request); ok {
+		t.Fatal("ordinary login retained previous administrative identity")
+	}
+	for _, c := range w.Result().Cookies() {
+		if c.Name == cookieName && c.MaxAge > 0 {
+			t.Fatal("ordinary user received privileged session")
+		}
+	}
+}
+
+func TestInviteHTTPControlsAndValidation(t *testing.T) {
+	s, u := portalFixture(t)
+	for _, body := range []string{`{"max_uses":-1}`, `{"max_uses":1.5}`, `{"expires_at":-1}`, `{"expires_at":1}`, `{"valid_days":0}`, `{"valid_days":7,"expires_at":0}`} {
+		w := httptest.NewRecorder()
+		s.adminPortalCreateInvite(w, portalRequest(u, "/admin/portal/invites", body))
+		if w.Code != 400 {
+			t.Fatal("invalid invite accepted", body, w.Code)
+		}
+	}
+	w := httptest.NewRecorder()
+	s.adminPortalCreateInvite(w, portalRequest(u, "/admin/portal/invites", `{"max_uses":2,"expires_at":0}`))
+	if w.Code != 200 {
+		t.Fatal(w.Code, w.Body.String())
+	}
+	var created map[string]any
+	json.Unmarshal(w.Body.Bytes(), &created)
+	code := created["code"].(string)
+	if _, e := s.o.db.CreateInvitedUser("invite-first", "hash", code); e != nil {
+		t.Fatal(e)
+	}
+	w = httptest.NewRecorder()
+	if s.inviteRejected(w, code) {
+		t.Fatal("multi-use code blocked after first redemption", w.Body.String())
+	}
+	r := portalRequest(u, "/admin/portal/invites/"+code, `{"max_uses":2,"expires_at":0,"enabled":false,"revision":1}`)
+	r.SetPathValue("code", code)
+	w = httptest.NewRecorder()
+	s.adminPortalUpdateInvite(w, r)
+	if w.Code != 200 {
+		t.Fatal(w.Code, w.Body.String())
+	}
+	w = httptest.NewRecorder()
+	if !s.inviteRejected(w, code) {
+		t.Fatal("disabled invite remained usable")
+	}
+	r = portalRequest(u, "/admin/portal/invites/"+code+"/history", "")
+	r.SetPathValue("code", code)
+	w = httptest.NewRecorder()
+	s.adminPortalInviteHistory(w, r)
+	if w.Code != 200 || !strings.Contains(w.Body.String(), "invite-first") {
+		t.Fatal("redemption history missing", w.Code, w.Body.String())
+	}
+}
+
+func TestPortalKeyRevealAndLogsAreOwnerOnly(t *testing.T) {
+	s, user := portalFixture(t)
+	s.o.crypto = appcrypto.NewManager(t.TempDir())
+	key := "sk-owner-private-value"
+	enc, err := s.o.crypto.Encrypt(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := s.o.db.CreateApp("owned", s.o.hashKey(key), "sk-owner", "", enc, "[]", user.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reveal := func(appID int64, uid int64) *httptest.ResponseRecorder {
+		r := portalRequest(&store.User{ID: uid}, "/portal/api/keys/key", "")
+		r.Method = "GET"
+		r.SetPathValue("id", fmt.Sprint(appID))
+		w := httptest.NewRecorder()
+		s.portalKey(w, r)
+		return w
+	}
+	for i := 0; i < 2; i++ {
+		w := reveal(id, user.ID)
+		if w.Code != 200 || w.Header().Get("Cache-Control") != "no-store" || !strings.Contains(w.Body.String(), key) {
+			t.Fatal(w.Code, w.Body.String())
+		}
+	}
+	for _, appID := range []int64{id, 999999} {
+		w := reveal(appID, user.ID+1)
+		if w.Code != 404 || strings.Contains(w.Body.String(), key) {
+			t.Fatal("foreign key exposed", w.Code, w.Body.String())
+		}
+	}
+	list := httptest.NewRecorder()
+	s.portalListKeys(list, portalRequest(user, "/portal/api/keys", ""))
+	if strings.Contains(list.Body.String(), key) || strings.Contains(list.Body.String(), "key_enc") {
+		t.Fatal("key list disclosed ciphertext/plaintext")
+	}
+	diag := &store.UsageDiagnostics{RequestedModel: "test", PhysicalModel: "workbuddy/test", Performance: &store.UsagePerformance{RequestID: "0123456789abcdef0123456789abcdef", HTTPStatus: 400, Attempts: 1}}
+	own, err := s.o.db.LogUsageWithID(store.UsageParams{UserID: user.ID, AppID: id, Model: "test", AccountUID: "private-pool-uid", InputContent: "private prompt", OutputContent: "private answer", Error: "Bearer secret", Status: "error", Diagnostics: diag})
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreign, err := s.o.db.LogUsageWithID(store.UsageParams{UserID: user.ID + 1, Model: "foreign-model", Error: "foreign-secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := portalRequest(user, "/portal/api/usage/records", "")
+	r.Method = "GET"
+	w := httptest.NewRecorder()
+	s.portalUsageRecords(w, r)
+	if w.Code != 200 {
+		t.Fatal(w.Code, w.Body.String())
+	}
+	for _, forbidden := range []string{"private-pool-uid", "private prompt", "private answer", "Bearer secret", "foreign-model", "foreign-secret", "account_uid", "input_content"} {
+		if strings.Contains(w.Body.String(), forbidden) {
+			t.Fatal("portal list leaked", forbidden)
+		}
+	}
+	for _, tc := range []struct {
+		id     int64
+		status int
+	}{{own, 200}, {foreign, 404}, {999999, 404}} {
+		r.SetPathValue("id", fmt.Sprint(tc.id))
+		w = httptest.NewRecorder()
+		s.portalUsageRecord(w, r)
+		if w.Code != tc.status {
+			t.Fatal(tc, w.Code, w.Body.String())
+		}
+		if strings.Contains(w.Body.String(), "secret") || strings.Contains(w.Body.String(), "private-") {
+			t.Fatal("portal detail leaked", w.Body.String())
+		}
+	}
+}
+
+func TestRuntimeUsageGetsWholeRequestTiming(t *testing.T) {
+	s, user := portalFixture(t)
+	ctx, timing := streamwatch.WithTiming(context.Background())
+	timing.RequestID = "0123456789abcdef0123456789abcdef"
+	rows := &usageTimingRows{}
+	ctx = context.WithValue(ctx, usageTimingKey{}, rows)
+	streamwatch.StartAttempt(ctx)
+	s.o.logRuntimeUsageDiagnostic(provider.UsageReport{Status: "ok"}, "responses", "trae/test", time.Now(), "key", user.ID, 1, nil, ctx)
+	if len(rows.ids) != 1 {
+		t.Fatal("runtime usage bypassed timing tracker")
+	}
+	s.persistUsageTiming(rows, timing.Snapshot(), 200, true)
+	row, err := s.o.db.GetUsage(int(rows.ids[0]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	diag, ok := row["diagnostics"].(store.UsageDiagnostics)
+	if !ok || diag.Performance == nil || diag.Performance.HTTPStatus != 200 || !diag.Performance.ResponseStream || diag.Performance.RequestID != timing.RequestID {
+		t.Fatal("runtime diagnostic not persisted", row)
 	}
 }

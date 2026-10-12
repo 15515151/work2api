@@ -17,7 +17,10 @@ import (
 	"strings"
 	"time"
 
+	"work2api/internal/core/provider"
+	"work2api/internal/opencode"
 	"work2api/internal/portal/portalauth"
+	"work2api/internal/qoder"
 	"work2api/internal/store"
 	"work2api/internal/trae"
 	"work2api/internal/workbuddy/credentials"
@@ -55,6 +58,7 @@ func (s *Server) mountPortal(mux *http.ServeMux) {
 	mux.HandleFunc("GET /portal/api/me", s.portalMe)
 	mux.HandleFunc("GET /portal/api/models", s.portalModels)
 	mux.HandleFunc("GET /portal/api/keys", s.portalListKeys)
+	mux.HandleFunc("GET /portal/api/keys/{id}/key", s.portalKey)
 	mux.HandleFunc("POST /portal/api/keys", s.portalCreateKey)
 	mux.HandleFunc("POST /portal/api/keys/{id}/toggle", s.portalToggleKey)
 	mux.HandleFunc("POST /portal/api/keys/{id}/models", s.portalSetKeyModels)
@@ -64,10 +68,14 @@ func (s *Server) mountPortal(mux *http.ServeMux) {
 	mux.HandleFunc("POST /portal/api/contributions/poll", s.portalContributionPoll)
 	mux.HandleFunc("POST /portal/api/contributions/cancel", s.portalContributionCancel)
 	mux.HandleFunc("POST /portal/api/providers/trae/oauth/{action}", s.portalTraeOAuth)
+	mux.HandleFunc("POST /portal/api/providers/qoder/oauth/{action}", s.portalQoderOAuth)
+	mux.HandleFunc("POST /portal/api/providers/{name}/contribute", s.portalChannelImport)
 	mux.HandleFunc("POST /portal/api/contributions/{id}/revoke", s.portalRevokeContribution)
 	mux.HandleFunc("POST /portal/api/contributions/{id}/share", s.portalShareContribution)
 	mux.HandleFunc("POST /portal/api/contributions/{id}/models/refresh", s.portalRefreshContributionModels)
 	mux.HandleFunc("GET /portal/api/usage", s.portalUsage)
+	mux.HandleFunc("GET /portal/api/usage/records", s.portalUsageRecords)
+	mux.HandleFunc("GET /portal/api/usage/records/{id}", s.portalUsageRecord)
 	// 管理端（/admin 前缀 → adminGuard 自然生效：会话/令牌 + CSRF）
 	mux.HandleFunc("GET /admin/portal/users", s.adminPortalUsers)
 	mux.HandleFunc("POST /admin/portal/users/{id}/status", s.adminPortalUserStatus)
@@ -75,18 +83,14 @@ func (s *Server) mountPortal(mux *http.ServeMux) {
 	mux.HandleFunc("POST /admin/portal/users/{id}/password", s.adminPortalResetPassword)
 	mux.HandleFunc("GET /admin/portal/invites", s.adminPortalInvites)
 	mux.HandleFunc("POST /admin/portal/invites", s.adminPortalCreateInvite)
+	mux.HandleFunc("POST /admin/portal/invites/{code}", s.adminPortalUpdateInvite)
+	mux.HandleFunc("GET /admin/portal/invites/{code}/history", s.adminPortalInviteHistory)
 	mux.HandleFunc("DELETE /admin/portal/invites/{code}", s.adminPortalRevokeInvite)
-	mux.HandleFunc("GET /admin/portal/groups", s.adminPortalGroups)
-	mux.HandleFunc("POST /admin/portal/groups", s.adminPortalCreateGroup)
-	mux.HandleFunc("POST /admin/portal/groups/{id}/models", s.adminPortalGroupModels)
-	mux.HandleFunc("POST /admin/portal/groups/{id}/enable", s.adminPortalGroupEnable)
-	mux.HandleFunc("POST /admin/portal/groups/{id}/accounts", s.adminPortalGroupAccounts)
-	mux.HandleFunc("POST /admin/portal/groups/{id}/grants", s.adminPortalGroupGrants)
-	mux.HandleFunc("DELETE /admin/portal/groups/{id}", s.adminPortalGroupDelete)
 	mux.HandleFunc("GET /admin/portal/overview", s.adminPortalOverview)
 	mux.HandleFunc("POST /admin/portal/bootstrap", s.adminPortalBootstrap)
-	mux.HandleFunc("POST /admin/portal/default-group", s.adminPortalDefaultGroup)
-	mux.HandleFunc("POST /admin/portal/accounts/{uid}/sharing", s.adminPortalAccountSharing)
+	mux.HandleFunc("POST /admin/portal/model-policy", s.adminPortalModelPolicy)
+	mux.HandleFunc("POST /admin/portal/users/{id}/models", s.adminPortalUserModels)
+
 }
 
 // adminPortalBootstrap creates the first portal admin user. One-time and
@@ -166,7 +170,7 @@ func (s *Server) portalGuard(next http.Handler) http.Handler {
 			return
 		}
 		// 轮询端点单独限流（每用户），防高频打上游。
-		if path == "/portal/api/contributions/poll" || path == "/portal/api/contributions/begin" || strings.HasSuffix(path, "/models/refresh") {
+		if path == "/portal/api/contributions/poll" || path == "/portal/api/contributions/begin" || strings.Contains(path, "/providers/") || strings.HasSuffix(path, "/models/refresh") {
 			s.portalPollMu.Lock()
 			if len(s.portalPollLimiter) >= 1024 {
 				window := time.Now().Unix() / 10
@@ -297,8 +301,12 @@ func (s *Server) inviteRejected(w http.ResponseWriter, code string) bool {
 		return true
 	}
 	if c != nil {
-		if c["used_by"] != nil {
-			writeJSON(w, 400, errBody(400, "邀请码已被使用", "invalid_request_error").Body)
+		if inviteInt(c["enabled"]) == 0 {
+			writeJSON(w, 400, errBody(400, "邀请码已停用", "invalid_request_error").Body)
+			return true
+		}
+		if max := inviteInt(c["max_uses"]); max > 0 && inviteInt(c["used_count"]) >= max {
+			writeJSON(w, 400, errBody(400, "邀请码可用次数已用尽", "invalid_request_error").Body)
 			return true
 		}
 		if exp, _ := c["expires_at"].(float64); exp != 0 && exp <= float64(time.Now().Unix()) {
@@ -331,8 +339,20 @@ func (s *Server) portalLogin(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 401, errBody(401, "用户名或密码错误", "auth_error").Body)
 		return
 	}
+	if store.IsAdminRole(user.Role) {
+		portalauth.Logout(s.o.db, token)
+		s.clearPortalCookie(w, r)
+		value := s.sessions.createForUser(user.ID, user.PasswordHash, user.AuthVersion)
+		http.SetCookie(w, &http.Cookie{Name: cookieName, Value: value, Path: "/", MaxAge: int(sessionTTL.Seconds()), HttpOnly: true, Secure: s.browserCookieSecure(r), SameSite: http.SameSiteLaxMode})
+		writeJSON(w, 200, map[string]any{"ok": true, "user": portalUserView(user), "redirect_to": "/admin-ui/"})
+		return
+	}
+	if previous, e := r.Cookie(cookieName); e == nil {
+		s.sessions.drop(previous.Value)
+		http.SetCookie(w, &http.Cookie{Name: cookieName, Path: "/", MaxAge: -1, HttpOnly: true, Secure: s.browserCookieSecure(r), SameSite: http.SameSiteLaxMode})
+	}
 	s.setPortalCookie(w, r, token)
-	writeJSON(w, 200, map[string]any{"ok": true, "user": portalUserView(user)})
+	writeJSON(w, 200, map[string]any{"ok": true, "user": portalUserView(user), "redirect_to": "/portal/"})
 }
 
 func (s *Server) portalLogout(w http.ResponseWriter, r *http.Request) {
@@ -415,7 +435,7 @@ func (s *Server) portalMe(w http.ResponseWriter, r *http.Request) {
 	user := portalCtx(r)
 	if user.MustChangePassword {
 		writeJSON(w, 200, map[string]any{"user": portalUserView(user), "eligible": false,
-			"eligible_accounts": 0, "groups_enabled": 0, "available_models": []string{}, "own_models": []string{}, "shared_models": []string{}})
+			"eligible_accounts": 0, "groups_enabled": 0, "available_models": []string{}, "own_models": []string{}, "shared_models": []string{}, "default_models": []string{}})
 		return
 	}
 	accounts, err := s.o.db.OwnedAccountUIDs(user.ID)
@@ -423,12 +443,6 @@ func (s *Server) portalMe(w http.ResponseWriter, r *http.Request) {
 		writeAPIErr(w, errBody(503, "账号查询失败", "server_error"))
 		return
 	}
-	groups, err := s.o.db.GrantedGroups(user.ID)
-	if err != nil {
-		writeAPIErr(w, errBody(503, "共享权限查询失败", "server_error"))
-		return
-	}
-	enabledGroups := 0
 	p := &Principal{UserID: user.ID}
 	if aerr := s.o.attachPortalScope(p); aerr != nil && aerr.Status >= 500 {
 		writeAPIErr(w, aerr)
@@ -439,12 +453,6 @@ func (s *Server) portalMe(w http.ResponseWriter, r *http.Request) {
 		if !available[model] {
 			delete(p.SharedModels, model)
 		}
-	}
-	for _, g := range groups {
-		if !g.Enabled || strings.TrimSpace(g.AllowedModels) == "" {
-			continue
-		}
-		enabledGroups++
 	}
 	models := make([]string, 0, len(available))
 	for m := range available {
@@ -457,7 +465,7 @@ func (s *Server) portalMe(w http.ResponseWriter, r *http.Request) {
 		"eligible_accounts": len(accounts),
 		"own_models":        sortedPortalModels(p.OwnedModels),
 		"shared_models":     sortedPortalModels(p.SharedModels),
-		"groups_enabled":    enabledGroups,
+		"default_models":    sortedPortalModels(p.SharedModels),
 		"available_models":  models,
 	})
 }
@@ -483,9 +491,8 @@ func (s *Server) portalListKeys(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"keys": apps})
 }
 
-// portalCreateKey issues a user-owned key. Portal keys never default to
-// unrestricted: with no explicit allowlist they are narrowed to the current
-// permission set (HANDOFF §7), and explicit models must be a subset of it.
+// User keys follow current rights by default, or keep a fixed subset.
+// Neither mode bypasses current account ownership or global model disable.
 func (s *Server) portalCreateKey(w http.ResponseWriter, r *http.Request) {
 	user := portalCtx(r)
 	if !s.o.cfg.PortalEnabled {
@@ -502,6 +509,21 @@ func (s *Server) portalCreateKey(w http.ResponseWriter, r *http.Request) {
 	if len(name) > 64 {
 		writeJSON(w, 400, errBody(400, "Key 名称过长（≤64 字符）", "invalid_request_error").Body)
 		return
+	}
+	policy, _ := body["model_policy"].(string)
+	if policy == "" {
+		if _, ok := body["allowed_models"]; ok {
+			policy = "fixed"
+		} else {
+			policy = "follow"
+		}
+	}
+	if policy != "follow" && policy != "fixed" {
+		writeAPIErr(w, errBody(400, "无效模型权限模式", "invalid_request_error"))
+		return
+	}
+	if policy == "follow" {
+		body["allowed_models"] = []any{}
 	}
 	available := s.portalAvailableModels(user.ID)
 	allowedJSON := "[]"
@@ -521,8 +543,8 @@ func (s *Server) portalCreateKey(w http.ResponseWriter, r *http.Request) {
 			if m = strings.TrimSpace(m); m == "" {
 				continue
 			}
-			if !available[m] {
-				writeJSON(w, 403, errBody(403, "模型 "+m+" 不在共享范围内", "model_not_allowed").Body)
+			if !available[m] && !available[s.o.resolveModel(m)] {
+				writeJSON(w, 403, errBody(403, "模型 "+m+" 不在当前权限范围内", "model_not_allowed").Body)
 				return
 			}
 			req = append(req, m)
@@ -555,7 +577,7 @@ func (s *Server) portalCreateKey(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 500, errBody(500, "Key 创建失败", "server_error").Body)
 		return
 	}
-	id, err := s.o.db.CreateAppForUserLimited(user.ID, name, s.o.hashKey(key), enc, s.o.cfg.PortalKeyMaxPerUser, allowedJSON, key[:min(10, len(key))]+"…")
+	id, err := s.o.db.CreateAppForUserLimited(user.ID, name, s.o.hashKey(key), enc, s.o.cfg.PortalKeyMaxPerUser, allowedJSON, key[:min(10, len(key))]+"…", policy)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyLimit) {
 			writeJSON(w, 403, errBody(403, "Key 数量已达上限", "forbidden").Body)
@@ -568,11 +590,11 @@ func (s *Server) portalCreateKey(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, errBody(400, err.Error(), "invalid_request_error").Body)
 		return
 	}
-	writeJSON(w, 200, map[string]any{"id": id, "key": key, "ok": true})
+	writeJSON(w, 200, map[string]any{"id": id, "key": key, "ok": true, "model_policy": policy})
 }
 
 // portalAvailableModels reuses dispatch authorization to expose only models
-// backed by an active contribution and an enabled group, excluding disabled models.
+// backed by current default, personal or explicit rights, excluding disabled models.
 func (s *Server) portalAvailableModels(userID int64) map[string]bool {
 	p := &Principal{UserID: userID}
 	if s.o.attachPortalScope(p) != nil {
@@ -585,25 +607,22 @@ func (s *Server) portalAvailableModels(userID int64) map[string]bool {
 // model scope. A model existing only on someone else's site is not usable.
 func (o *Orchestrator) portalCatalogPermissions(p *Principal) map[string]bool {
 	allowed := map[string]bool{}
-	for _, entry := range o.wb.Catalog.ListCached() {
-		id := str2(entry["id"])
-		if !p.PortalModels[id] {
-			continue
-		}
-		for uid := range o.modelEntryAccountUIDs(entry) {
-			if p.ModelScopes[id][uid] {
-				allowed[id] = true
-				break
-			}
+	for m := range p.PortalModels {
+		if len(p.ModelScopes[m]) > 0 {
+			allowed[m] = true
 		}
 	}
-	if o.runtimes != nil {
-		if rt, ok := o.runtimes.ByName("trae"); ok {
-			for _, entry := range rt.Models(context.Background()) {
-				ids, _ := entry.Extra["account_uids"].([]string)
-				for _, uid := range ids {
-					if p.PortalModels[entry.ID] && p.ModelScopes[entry.ID][uid] {
-						allowed[entry.ID] = true
+	if routes, err := o.db.ModelRoutes(); err == nil {
+		settings, _ := o.db.GetSettings()
+		disabled := map[string]bool{}
+		for _, m := range parseJSONStringArray(settings["portal_disabled_models"]) {
+			disabled[m] = true
+		}
+		for _, route := range routes {
+			if route.Enabled && !disabled[route.Model] {
+				for _, m := range route.Members {
+					if allowed[o.resolveModel(m)] {
+						allowed[route.Model] = true
 						break
 					}
 				}
@@ -627,13 +646,23 @@ func (s *Server) portalModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	visible := s.o.portalCatalogPermissions(p)
-	for _, model := range s.o.runtimeModels(r.Context()) {
+	for _, model := range append(s.o.runtimeModels(r.Context()), s.routeCatalog(r.Context())...) {
 		id := str2(model["id"])
-		if !visible[id] {
+		if !visible[id] && !visible[s.o.resolveModel(id)] {
 			continue
 		}
-		item := map[string]any{"id": id, "own_account": p.OwnedModels[id], "shared_pool": p.SharedModels[id]}
-		for _, field := range []string{"name", "context_length", "max_input_tokens", "max_output_tokens", "vision", "vision_verified", "reasoning", "is_reasoning", "input_modalities", "output_modalities", "supportsToolCall", "tool_call", "tool_response_multimodal", "structured_output", "native_protocol", "thinking_control", "capability_source", "pricing_source", "pricing_unit", "pricing_tier", "pricing_known", "input_cost", "output_cost", "price_factor", "catalog_stale"} {
+		item := map[string]any{"id": id, "own_account": p.OwnedModels[s.o.resolveModel(id)], "default_access": p.SharedModels[s.o.resolveModel(id)]}
+		if route, _ := s.o.modelRoute(id); route != nil {
+			own, shared := false, false
+			for _, member := range route.Members {
+				resolved := s.o.resolveModel(member)
+				own = own || p.OwnedModels[resolved]
+				shared = shared || p.SharedModels[resolved]
+			}
+			item["own_account"], item["default_access"] = own, shared
+		}
+
+		for _, field := range []string{"provider", "description", "modality", "supports_image", "credits", "credits_by_region", "tags", "cache_read_cost", "cache_write_cost", "tier", "catalog_source", "pricing_stale", "name", "context_length", "max_input_tokens", "max_output_tokens", "vision", "vision_verified", "reasoning", "is_reasoning", "input_modalities", "output_modalities", "supportsToolCall", "tool_call", "tool_response_multimodal", "structured_output", "native_protocol", "thinking_control", "capability_source", "pricing_source", "pricing_unit", "pricing_tier", "pricing_known", "input_cost", "output_cost", "price_factor", "catalog_stale"} {
 			if value, ok := model[field]; ok {
 				item[field] = value
 			}
@@ -663,6 +692,17 @@ func (s *Server) portalSetKeyModels(w http.ResponseWriter, r *http.Request) {
 	user := portalCtx(r)
 	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	body, _ := readJSON(r)
+	policy, _ := body["model_policy"].(string)
+	if policy == "" {
+		policy = "fixed"
+	}
+	if policy != "follow" && policy != "fixed" {
+		writeAPIErr(w, errBody(400, "无效模型权限模式", "invalid_request_error"))
+		return
+	}
+	if policy == "follow" {
+		body["allowed_models"] = []any{}
+	}
 	arr, valid := body["allowed_models"].([]any)
 	if !valid {
 		writeAPIErr(w, errBody(400, "allowed_models 必须为字符串数组", "invalid_request_error"))
@@ -675,8 +715,8 @@ func (s *Server) portalSetKeyModels(w http.ResponseWriter, r *http.Request) {
 		if m = strings.TrimSpace(m); m == "" {
 			continue
 		}
-		if !available[m] {
-			writeJSON(w, 403, errBody(403, "模型 "+m+" 不在共享范围内", "model_not_allowed").Body)
+		if !available[m] && !available[s.o.resolveModel(m)] {
+			writeJSON(w, 403, errBody(403, "模型 "+m+" 不在当前权限范围内", "model_not_allowed").Body)
 			return
 		}
 		req = append(req, m)
@@ -686,7 +726,7 @@ func (s *Server) portalSetKeyModels(w http.ResponseWriter, r *http.Request) {
 		b, _ := json.Marshal(req)
 		allowedJSON = string(b)
 	}
-	ok, err := s.o.db.SetAppModelsOwned(id, user.ID, allowedJSON)
+	ok, err := s.o.db.SetAppModelsOwned(id, user.ID, allowedJSON, policy)
 	if err != nil {
 		writeJSON(w, 500, errBody(500, "操作失败", "server_error").Body)
 		return
@@ -695,7 +735,7 @@ func (s *Server) portalSetKeyModels(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 404, errBody(404, "Key 不存在", "invalid_request_error").Body)
 		return
 	}
-	writeJSON(w, 200, map[string]any{"ok": true, "allowed_models": req})
+	writeJSON(w, 200, map[string]any{"ok": true, "allowed_models": req, "model_policy": policy})
 }
 
 func (s *Server) portalDeleteKey(w http.ResponseWriter, r *http.Request) {
@@ -746,7 +786,7 @@ func (s *Server) portalContributionBegin(w http.ResponseWriter, r *http.Request)
 	}
 	accepted, _ := body["accepted"].(bool)
 	if !accepted {
-		writeJSON(w, 400, errBody(400, "请先阅读并同意共享范围说明", "invalid_request_error").Body)
+		writeJSON(w, 400, errBody(400, "请先阅读并同意贡献账号使用范围", "invalid_request_error").Body)
 		return
 	}
 	site = strings.ToLower(strings.TrimSpace(site))
@@ -990,7 +1030,7 @@ func (s *Server) completePortalContribution(userID int64, uid, site string, res 
 	mgr := credentials.NewManager(path)
 	s.o.wb.Pool.AddAccountDisabled(uid, mgr)
 	s.o.setManager(uid, mgr)
-	if err := s.o.db.ActivateContributionWithGroups(id, userID); err != nil {
+	if err := s.o.db.ActivateContribution(id, userID); err != nil {
 		return errors.New("贡献资格登记失败，请重试")
 	}
 	s.o.wb.Pool.SetEnabled(uid, true, "")
@@ -1067,6 +1107,19 @@ func (s *Server) portalRevokeContribution(w http.ResponseWriter, r *http.Request
 }
 
 func (s *Server) contributionCatalogStatus(uid string) string {
+	if strings.HasPrefix(uid, "qoder:") || strings.HasPrefix(uid, "opencode:") {
+		for _, name := range []string{"qoder", "opencode"} {
+			if rt, ok := s.o.runtimes.ByName(name); ok {
+				for _, m := range rt.Models(context.Background()) {
+					ids, _ := m.Extra["account_uids"].([]string)
+					if slices.Contains(ids, uid) {
+						return "ready"
+					}
+				}
+			}
+		}
+		return "pending"
+	}
 	if strings.HasPrefix(uid, "trae-") {
 		if rt, ok := s.o.runtimes.ByName("trae"); ok {
 			for _, entry := range rt.Models(context.Background()) {
@@ -1108,7 +1161,19 @@ func (s *Server) portalRefreshContributionModels(w http.ResponseWriter, r *http.
 		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 		defer cancel()
 		verified := false
-		if c.Provider == "trae" {
+		if c.Provider == "qoder" {
+			if rt, ok := s.o.runtimes.ByName("qoder"); ok {
+				if channel, ok := rt.(*qoder.Runtime); ok {
+					verified = channel.RefreshOwnedAccount(ctx, strings.TrimPrefix(c.AccountUID, "qoder:")) == nil
+				}
+			}
+		} else if c.Provider == "opencode" {
+			if rt, ok := s.o.runtimes.ByName("opencode"); ok {
+				if channel, ok := rt.(*opencode.Runtime); ok {
+					verified = channel.RefreshModels(ctx) == nil
+				}
+			}
+		} else if c.Provider == "trae" {
 			if rt, ok := s.o.runtimes.ByName("trae"); ok {
 				if t, ok := rt.(*trae.Runtime); ok {
 					verified = t.RefreshAccount(ctx, c.AccountUID) == nil
@@ -1225,7 +1290,7 @@ func localMidnightUnix() int64 {
 // --- 管理端（/admin/portal/*，经 adminGuard） ---
 
 // adminPortalOverview is the admin console's single fetch: users + invites +
-// groups + account counts, so the WebUI portal panel stays one request.
+// model policies + contribution counts in one management response.
 func (s *Server) adminPortalOverview(w http.ResponseWriter, r *http.Request) {
 	users, err := s.o.db.ListUsers()
 	if err != nil {
@@ -1233,11 +1298,6 @@ func (s *Server) adminPortalOverview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	invites, err := s.o.db.ListInviteCodes()
-	if err != nil {
-		writeJSON(w, 500, errBody(500, "查询失败", "server_error").Body)
-		return
-	}
-	groups, err := s.portalGroupViews()
 	if err != nil {
 		writeJSON(w, 500, errBody(500, "查询失败", "server_error").Body)
 		return
@@ -1253,22 +1313,14 @@ func (s *Server) adminPortalOverview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	accounts := []map[string]any{}
-	modes, err := s.o.db.PlatformSharingModes()
-	if err != nil {
-		writeAPIErr(w, errBody(503, "账号使用范围查询失败", "server_error"))
-		return
-	}
 	owners := map[string]store.Contribution{}
 	for _, c := range contributions {
 		owners[c.AccountUID] = c
 	}
 	for _, a := range rawAccounts {
 		uid := str2(a["uid"])
-		mode := modes[uid]
-		if mode == "" {
-			mode = "private"
-		}
-		row := map[string]any{"uid": uid, "alias": a["alias"], "nickname": a["nickname"], "provider": a["provider"], "profile": a["profile"], "enabled": a["enabled"], "sharing_mode": mode, "owner_kind": "platform"}
+
+		row := map[string]any{"uid": uid, "alias": a["alias"], "nickname": a["nickname"], "provider": a["provider"], "profile": a["profile"], "enabled": a["enabled"], "sharing_mode": "public", "owner_kind": "platform"}
 		if c, ok := owners[uid]; ok {
 			row["owner_kind"] = "user"
 			row["contribution_user_id"] = c.UserID
@@ -1280,12 +1332,48 @@ func (s *Server) adminPortalOverview(w http.ResponseWriter, r *http.Request) {
 		}
 		accounts = append(accounts, row)
 	}
+	for _, name := range []string{"qoder", "opencode"} {
+		rt, ok := s.o.runtimes.ByName(name)
+		if !ok {
+			continue
+		}
+		ar, ok := rt.(provider.AdminRuntime)
+		if !ok {
+			continue
+		}
+		for _, a := range ar.AdminData(r.Context()).Accounts {
+			uid := str2(a["id"])
+			if name == "opencode" && a["credential"] != true {
+				continue
+			}
+			if name == "qoder" {
+				uid = "qoder:" + uid
+			}
+			row := map[string]any{"uid": uid, "provider": name, "nickname": a["label"], "enabled": a["enabled"], "owner_kind": "platform"}
+			if c, ok := owners[uid]; ok {
+				row["owner_kind"] = "user"
+				row["contribution_user_id"] = c.UserID
+				row["status"] = c.Status
+			}
+			accounts = append(accounts, row)
+		}
+	}
 	settings, err := s.o.db.GetSettings()
 	if err != nil {
-		writeAPIErr(w, errBody(503, "默认共享池查询失败", "server_error"))
+		writeAPIErr(w, errBody(503, "默认模型规则查询失败", "server_error"))
 		return
 	}
-	writeJSON(w, 200, map[string]any{"users": users, "invites": invites, "groups": groups, "contributions": contributions, "accounts": accounts, "account_count": len(accounts), "registration_mode": s.o.cfg.PortalRegistrationMode, "user_concurrency": s.portalUserLimit(0), "user_concurrency_max": s.modelsAdmission.sharedCapacity, "user_concurrency_overrides": portalConcurrencyOverrides(settings), "default_group_id": intOf(settings["portal_default_group"]), "default_auto_grant": settings["portal_default_auto_grant"] == "1"})
+	grants := map[int64][]store.ModelGrant{}
+	for _, u := range users {
+		g, e := s.o.db.UserModelGrants(u.ID)
+		if e != nil {
+			writeAPIErr(w, errBody(503, "用户权限查询失败", "server_error"))
+			return
+		}
+		grants[u.ID] = g
+	}
+	defaults, _ := s.o.defaultModelAccess(settings)
+	writeJSON(w, 200, map[string]any{"users": users, "invites": invites, "groups": []any{}, "contributions": contributions, "accounts": accounts, "account_count": len(accounts), "model_policy": store.DefaultPolicy(settings), "default_models": sortedPortalModels(defaults), "user_model_grants": grants, "registration_mode": s.o.cfg.PortalRegistrationMode, "user_concurrency": s.portalUserLimit(0), "user_concurrency_max": s.modelsAdmission.sharedCapacity, "user_concurrency_overrides": portalConcurrencyOverrides(settings), "default_group_id": intOf(settings["portal_default_group"]), "default_auto_grant": settings["portal_default_auto_grant"] == "1"})
 }
 
 func (s *Server) adminPortalDefaultGroup(w http.ResponseWriter, r *http.Request) {
@@ -1469,7 +1557,7 @@ func (s *Server) adminPortalRevokeInvite(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if !ok {
-		writeJSON(w, 404, errBody(404, "邀请码不存在或已使用", "invalid_request_error").Body)
+		writeJSON(w, 404, errBody(404, "邀请码不存在", "invalid_request_error").Body)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true})
@@ -1483,6 +1571,9 @@ func portalConcurrencyOverrides(settings map[string]string) map[string]int {
 
 // portalUserLimit applies the user override within the static shared hard cap.
 func (s *Server) portalUserLimit(id int64) int {
+	if s.o.cfg.ModelLimitsDisabled {
+		return 0
+	}
 	limit := positiveOr(s.o.cfg.PortalUserConcurrency, 4)
 	if settings, err := s.o.db.GetSettings(); err == nil {
 		if n := portalConcurrencyOverrides(settings)[strconv.FormatInt(id, 10)]; id > 0 && n > 0 {
@@ -1497,6 +1588,10 @@ func (s *Server) portalUserLimit(id int64) int {
 }
 
 func (s *Server) adminPortalUserConcurrency(w http.ResponseWriter, r *http.Request) {
+	if s.o.cfg.ModelLimitsDisabled {
+		writeAPIErr(w, errBody(410, "本地模型并发限制已移除", "feature_removed"))
+		return
+	}
 	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	user, err := s.o.db.GetUser(id)
 	if err != nil || user == nil {
@@ -1570,21 +1665,18 @@ func (s *Server) adminPortalInvites(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) adminPortalCreateInvite(w http.ResponseWriter, r *http.Request) {
-	body, _ := readJSON(r)
-	days := 7.0
-	if d, ok := body["valid_days"].(float64); ok && d > 0 && d <= 365 {
-		days = d
-	}
-	code := genInviteCode()
-	expires := float64(0)
-	if days > 0 {
-		expires = float64(time.Now().Unix()) + days*86400
-	}
-	if err := s.o.db.CreateInviteCode(code, expires); err != nil {
-		writeJSON(w, 500, errBody(500, "保存失败", "server_error").Body)
+	body, e := readJSON(r)
+	maxUses, expires, ok := inviteSettings(body, true)
+	if e != nil || !ok {
+		writeAPIErr(w, errBody(400, "请输入有效使用次数和到期时间", "invalid_request_error"))
 		return
 	}
-	writeJSON(w, 200, map[string]any{"code": code, "expires_at": expires})
+	code := genInviteCode()
+	if e = s.o.db.CreateInviteCode(code, expires, maxUses); e != nil {
+		writeAPIErr(w, errBody(503, "保存失败", "server_error"))
+		return
+	}
+	writeJSON(w, 200, map[string]any{"code": code, "expires_at": expires, "max_uses": maxUses, "used_count": 0, "enabled": 1, "revision": 1})
 }
 
 // genInviteCode: 10 chars from Crockford-ish base32 (no 0/O/1/I confusables).

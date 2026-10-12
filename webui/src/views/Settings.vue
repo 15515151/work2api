@@ -3,6 +3,7 @@ import { ref, reactive, onMounted, computed } from 'vue'
 import { api } from '@/api/client'
 import type { Settings, ProviderSummary } from '@/types'
 import { toast } from '@/lib/toast'
+import UpdateManager from '@/components/UpdateManager.vue'
 import WPage from '@/components/ui/WPage.vue'
 import WCard from '@/components/ui/WCard.vue'
 import WButton from '@/components/ui/WButton.vue'
@@ -125,6 +126,7 @@ onMounted(load)
 
 <template>
   <WPage title="设置" sub="自动签到、额度刷新、模型缓存、保活与额度预警的全局配置。">
+    <UpdateManager class="mb-4" />
     <template #actions>
       <WButton variant="primary" :disabled="loading || loadFailed" :loading="saving" @click="save"><span>保存设置</span></WButton>
     </template>

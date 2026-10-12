@@ -292,3 +292,122 @@ func TestProviderAccountCollisionDoesNotTransferOwnership(t *testing.T) {
 		t.Fatal("same-provider update failed", err)
 	}
 }
+
+func TestModelRouteGrantsFreezeAndDeletionRevokes(t *testing.T) {
+	db, err := New(filepath.Join(t.TempDir(), "routes.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	route := ModelRoute{Model: "my-model", Name: "Mine", Enabled: true, Members: []string{"workbuddy/a"}}
+	id, err := db.SaveModelRoute(route)
+	if err != nil {
+		t.Fatal(err)
+	}
+	app, err := db.CreateApp("route-key", "fixture-hash", "", "", "", `["my-model"]`, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	routes, err := db.ModelRoutes()
+	if err != nil || len(routes) != 1 {
+		t.Fatal(routes, err)
+	}
+	routes[0].Members[0] = "mutated"
+	again, _ := db.ModelRoutes()
+	if again[0].Members[0] != "workbuddy/a" {
+		t.Fatal("cache alias modified persisted configuration")
+	}
+	route.ID = id
+	route.Revision = 1
+	route.Members = append(route.Members, "trae/b")
+	if _, err = db.SaveModelRoute(route); err != nil {
+		t.Fatal(err)
+	}
+	grants, _ := db.AppRouteMembers(app, id)
+	if !grants["workbuddy/a"] || grants["trae/b"] {
+		t.Fatal("route edit expanded key authorization", grants)
+	}
+	if _, err = db.SaveModelRoute(route); err == nil {
+		t.Fatal("stale configuration overwrote current revision")
+	}
+	if err = db.SetAppModels(app, `["my-model"]`); err != nil {
+		t.Fatal(err)
+	}
+	grants, _ = db.AppRouteMembers(app, id)
+	if !grants["trae/b"] {
+		t.Fatal("explicit permission save did not refresh grant")
+	}
+	if err = db.DeleteModelRoute(id, 2); err != nil {
+		t.Fatal(err)
+	}
+	route.ID = 0
+	route.Revision = 0
+	newID, err := db.SaveModelRoute(route)
+	if err != nil {
+		t.Fatal(err)
+	}
+	grants, _ = db.AppRouteMembers(app, newID)
+	if len(grants) != 0 {
+		t.Fatal("same-name recreation resurrected authorization", grants)
+	}
+}
+
+func TestRequestLogsGroupRetriesAndEnforceOwnership(t *testing.T) {
+	db, err := New(filepath.Join(t.TempDir(), "requests.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	requestID := "0123456789abcdef0123456789abcdef"
+	insert := func(user, app int64, status string) int64 {
+		t.Helper()
+		id, err := db.LogUsageWithID(UsageParams{UserID: user, AppID: app, Model: "workbuddy/test", Status: status, Diagnostics: &UsageDiagnostics{RequestedModel: "unified/test", PhysicalModel: "workbuddy/test", Performance: &UsagePerformance{RequestID: requestID}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	first := insert(1, 2, "error")
+	last := insert(1, 2, "ok")
+	foreign := insert(3, 4, "ok")
+	otherKey := insert(1, 5, "error")
+	legacy, err := db.LogUsageWithID(UsageParams{UserID: 1, AppID: 2, Model: "legacy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.db.Exec("UPDATE usage_logs SET diagnostics='invalid json' WHERE id=?", legacy); err != nil {
+		t.Fatal(err)
+	}
+	user := int64(1)
+	list, total, err := db.UsageRequests(&user, 20, 0, "", "", nil, "", "")
+	if err != nil || total != 3 || len(list) != 3 {
+		t.Fatalf("groups=%v total=%d err=%v", list, total, err)
+	}
+	if list[2]["id"] != last || list[2]["logged_attempts"] != int64(2) {
+		t.Fatal("retry not grouped", list)
+	}
+	for _, id := range []int64{last, first} {
+		row, err := db.UsageRequest(id, &user)
+		if err != nil {
+			t.Fatal(err)
+		}
+		attempts := row["attempt_records"].([]map[string]any)
+		if len(attempts) != 2 || attempts[0]["id"] != first || attempts[1]["id"] != last {
+			t.Fatal("foreign key/user leaked", attempts)
+		}
+	}
+	if row, err := db.UsageRequest(foreign, &user); err != nil || row != nil {
+		t.Fatal("foreign record accessible", row, err)
+	}
+	if row, err := db.UsageRequest(otherKey, &user); err != nil || len(row["attempt_records"].([]map[string]any)) != 1 {
+		t.Fatal(row, err)
+	}
+	list, total, err = db.UsageRequests(&user, 1, 1, "", "", nil, "", "")
+	if err != nil || total != 3 || len(list) != 1 || list[0]["id"] != otherKey {
+		t.Fatal("pagination", list, total, err)
+	}
+	list, total, err = db.UsageRequests(&user, 20, 0, "", "unified/test", nil, "ok", "")
+	if err != nil || total != 1 || list[0]["id"] != last {
+		t.Fatal("failed retry leaked into status filter", list, total, err)
+	}
+}

@@ -45,6 +45,7 @@ type Principal struct {
 	AppName       string
 	AppID         int64
 	AllowedModels []string
+	ModelPolicy   string
 	UserID        int64
 	AccountScope  map[string]bool
 	PortalModels  map[string]bool
@@ -54,6 +55,7 @@ type Principal struct {
 	// EffectiveModel is the resolved model name after prepareModel (empty
 	// before). Keeps queue accounting and post-wait model authorization aligned.
 	EffectiveModel string
+	RouteModel     string // logical route; channel/account permissions remain physical
 	quota          *portalQuotaReservation
 }
 
@@ -69,6 +71,7 @@ type Orchestrator struct {
 	backup       backupState
 	sessions     *sessionRouter
 	observations provider.SessionObservations
+	routes       routeAffinity
 }
 
 type cdEntry = wbruntime.CooldownEntry
@@ -174,7 +177,8 @@ func (o *Orchestrator) checkAPIKey(authorization, xAPIKey string) (*Principal, *
 	if err != nil {
 		return nil, errBody(503, "密钥权限查询失败", "server_error")
 	}
-	p := &Principal{AppName: name, AppID: id, AllowedModels: allowed, UserID: userID}
+	policy, _ := app["model_policy"].(string)
+	p := &Principal{AppName: name, AppID: id, AllowedModels: allowed, UserID: userID, ModelPolicy: policy}
 	if userID > 0 {
 		if aerr := o.attachPortalScope(p); aerr != nil {
 			return nil, aerr
@@ -184,130 +188,85 @@ func (o *Orchestrator) checkAPIKey(authorization, xAPIKey string) (*Principal, *
 }
 
 // attachPortalScope computes the scheduling scope and permission model set for
-// a portal user's key (HANDOFF §6/§7). Called on every authenticated request:
-// personal ownership and shared-group permissions are read from SQLite.
-// Withdrawal and disabled groups take effect without permission caching.
+// a user key. Defaults, personal ownership and explicit grants are read on
+// every authenticated request. Withdrawal and global model disable take effect
+// without an authorization cache.
 func (o *Orchestrator) attachPortalScope(p *Principal) *apiError {
 	if !o.cfg.PortalEnabled {
-		return errBody(403, "共享服务已关闭", "portal_disabled")
+		return errBody(403, "用户服务已关闭", "portal_disabled")
 	}
 	user, err := o.db.GetUser(p.UserID)
-	if err != nil || user == nil || user.Status != "active" {
+	if err != nil {
+		return errBody(503, "账号查询失败", "server_error")
+	}
+	if user == nil || user.Status != "active" {
 		return errBody(403, "账号不可用，请联系管理员", "portal_user_disabled")
 	}
 	if user.MustChangePassword {
 		return errBody(403, "请先修改临时密码", "password_change_required")
 	}
-	eligible, err := o.db.ActiveContributionUIDs(p.UserID)
-	if err != nil {
-		return errBody(500, "资格查询失败", "server_error")
-	}
-	// 资格为空必须拒绝，不能转换成"不受限制"的 Principal（HANDOFF §7）。
 	owned, err := o.db.OwnedAccountUIDs(p.UserID)
 	if err != nil {
 		return errBody(503, "本人账号查询失败", "server_error")
 	}
-	if len(owned) == 0 {
-		return errBody(403, "请先添加并验证你的 WorkBuddy 账号", "portal_no_eligibility")
+	excluded, err := o.db.PrivatePoolExcludedUIDs()
+	if err != nil {
+		return errBody(503, "账号范围查询失败", "server_error")
 	}
-	// Eligibility interacts with the group scope: an account that left all
-	// enabled groups or whose contribution was revoked drops out here.
-	p.AccountScope = map[string]bool{}
-	p.ModelScopes = map[string]map[string]bool{}
-	p.OwnedModels = map[string]bool{}
-	p.SharedModels = map[string]bool{}
-	models := map[string]bool{}
 	settings, err := o.db.GetSettings()
 	if err != nil {
 		return errBody(503, "模型权限查询失败", "server_error")
 	}
-	aliases := parseModelAliases(settings["model_aliases"])
-	resolve := func(m string) string {
-		if target, ok := aliases[m]; ok {
-			return strings.TrimPrefix(target, "workbuddy/")
-		}
-		return strings.TrimPrefix(m, "workbuddy/")
+	grants, err := o.db.UserModelGrants(p.UserID)
+	if err != nil {
+		return errBody(503, "模型授权查询失败", "server_error")
 	}
+	defaults, catalog := o.defaultModelAccess(settings)
 	disabled := map[string]bool{}
 	for _, m := range parseJSONStringArray(settings["portal_disabled_models"]) {
-		disabled[m] = true
-		disabled[resolve(m)] = true
+		disabled[o.resolveModel(m)] = true
 	}
-	// Personal rights derive from the owner's verified account and the actual
-	// catalog, independently of shared-group membership. Never widen to a site
-	// or another user's account when an explicit UID scope exists.
-	for _, entry := range o.wb.Catalog.ListCached() {
-		m := str2(entry["id"])
-		if m == "" || m == "auto" || strings.Contains(m, "/") || disabled[m] {
+	p.AccountScope = map[string]bool{}
+	p.ModelScopes = map[string]map[string]bool{}
+	p.OwnedModels = map[string]bool{}
+	p.SharedModels = map[string]bool{}
+	p.PortalModels = map[string]bool{}
+	for model, uids := range catalog {
+		if disabled[model] {
 			continue
 		}
-		uids := o.modelEntryAccountUIDs(entry)
+		scope := map[string]bool{}
 		for uid := range uids {
-			if !owned[uid] {
-				continue
+			if owned[uid] {
+				scope[uid] = true
+				p.OwnedModels[model] = true
 			}
-			if p.ModelScopes[m] == nil {
-				p.ModelScopes[m] = map[string]bool{}
+			if defaults[model] && !excluded[uid] {
+				scope[uid] = true
+				p.SharedModels[model] = true
 			}
-			p.ModelScopes[m][uid] = true
-			models[m], p.OwnedModels[m] = true, true
 		}
-	}
-	grants, err := o.db.GrantedGroups(p.UserID)
-	if err != nil {
-		return errBody(500, "资格查询失败", "server_error")
-	}
-	if rt, ok := o.runtimes.ByName("trae"); ok {
-		for _, entry := range rt.Models(context.Background()) {
-			if disabled[entry.ID] {
+		for _, g := range grants {
+			if o.resolveModel(g.Model) != model {
 				continue
 			}
-			uids, _ := entry.Extra["account_uids"].([]string)
-			for _, uid := range uids {
-				if owned[uid] {
-					if p.ModelScopes[entry.ID] == nil {
-						p.ModelScopes[entry.ID] = map[string]bool{}
+			for _, uid := range g.AccountUIDs {
+				if uid == "*" {
+					for id := range uids {
+						if !excluded[id] {
+							scope[id] = true
+						}
 					}
-					p.ModelScopes[entry.ID][uid] = true
-					models[entry.ID] = true
-					p.OwnedModels[entry.ID] = true
+				} else if uids[uid] && !excluded[uid] {
+					scope[uid] = true
 				}
 			}
 		}
-	}
-	for _, g := range grants {
-		if len(eligible) == 0 || !g.Enabled || (g.Provider != "workbuddy" && g.Provider != "trae") {
-			continue
-		}
-		// 未配置共享模型范围的分组保持关闭（HANDOFF §2）：空串 = 未配置。
-		if strings.TrimSpace(g.AllowedModels) == "" {
-			continue
-		}
-		uids, err := o.db.GroupAccountUIDsWithActiveContribution(g.ID)
-		if err != nil {
-			return errBody(503, "共享账户查询失败", "server_error")
-		}
-		if len(uids) == 0 {
-			continue
-		}
-		for _, m := range parseJSONStringArray(g.AllowedModels) {
-			resolved := resolve(m)
-			if disabled[m] || disabled[resolved] || resolved == "auto" || (strings.Contains(resolved, "/") && !strings.HasPrefix(resolved, "trae/")) || (g.Provider == "trae") != strings.HasPrefix(resolved, "trae/") {
-				continue
-			}
-			models[resolved] = true
-			p.SharedModels[resolved] = true
-			if p.ModelScopes[resolved] == nil {
-				p.ModelScopes[resolved] = map[string]bool{}
-			}
-			for _, uid := range uids {
-				p.ModelScopes[resolved][uid] = true
-			}
+		if len(scope) > 0 {
+			p.ModelScopes[model] = scope
+			p.PortalModels[model] = true
 		}
 	}
-	// 管理员禁用模型从允许集中扣除：disabled_reason 标记的账号只是账号级冷却；
-	// 模型禁用由管理端 settings 维护的 portal_disabled_models 列表承担。
-	p.PortalModels = models
 	return nil
 }
 
@@ -341,7 +300,7 @@ func (s *Server) authorizeModel(principal *Principal, requestedModel string) *ap
 			model = "auto"
 		}
 		if !s.portalModelAllowed(principal, model, s.o.resolveModel(model)) {
-			return errBody(403, "该模型不在共享范围或当前资格不允许（模型："+model+"）", "model_not_allowed")
+			return errBody(403, "该模型不在当前用户或 Key 的调用范围（模型："+model+"）", "model_not_allowed")
 		}
 		return nil
 	}
@@ -358,16 +317,22 @@ func (s *Server) authorizeModel(principal *Principal, requestedModel string) *ap
 	return errBody(403, "该 API 密钥未被授权使用模型 "+model+"（可在 WebUI「API 密钥」中调整可用模型）", "model_not_allowed")
 }
 
-// portalModelAllowed applies HANDOFF §7: 分组 ∩ 资格 ∩ Key 白名单 − 禁用.
-// PortalModels already carries group∩eligibility−disabled; the key allowlist
-// narrows further. Deny by default: a portal principal with no PortalModels
-// permits nothing.
+// PortalModels is the current default/personal/explicit union minus disabled
+// models. Follow keys use that set; fixed keys additionally narrow it. An empty
+// fixed allowlist or an empty current permission set permits nothing.
 func (s *Server) portalModelAllowed(principal *Principal, model, resolved string) bool {
+	if route, err := s.o.modelRoute(model); err == nil && route != nil {
+		members, aerr := s.routeCandidates(principal, *route, nil)
+		return aerr == nil && len(members) > 0
+	}
 	if principal == nil || principal.PortalModels == nil {
 		return false
 	}
-	if !principal.PortalModels[resolved] || resolved == "auto" || (strings.Contains(resolved, "/") && !strings.HasPrefix(resolved, "trae/")) {
+	if !principal.PortalModels[resolved] || resolved == "auto" {
 		return false
+	}
+	if principal.ModelPolicy == "follow" {
+		return true
 	}
 	if len(principal.AllowedModels) == 0 {
 		return false
@@ -440,6 +405,19 @@ func (s *Server) prepareModel(principal *Principal, payload map[string]any) *api
 		}
 	}
 	payload["model"] = model
+	if route, err := s.o.modelRoute(model); err != nil {
+		return errBody(503, "统一模型配置暂不可用", "server_error")
+	} else if route != nil {
+		members, aerr := s.routeCandidates(principal, *route, payload)
+		if aerr != nil {
+			return aerr
+		}
+		if len(members) == 0 {
+			return errBody(403, "统一模型没有符合权限和请求能力的可用成员", "model_not_allowed")
+		}
+		principal.RouteModel, principal.EffectiveModel = model, model
+		return nil
+	}
 	principal.EffectiveModel = s.o.resolveModel(model)
 	if aerr := s.authorizeModel(principal, model); aerr != nil {
 		return aerr
@@ -543,7 +521,7 @@ func (o *Orchestrator) invocationContext(ctx context.Context) context.Context {
 					return err
 				}
 			}
-			if ref.Provider != "workbuddy" && ref.Provider != "trae" {
+			if call.Caller.UserID > 0 && ref.Provider != "workbuddy" && ref.Provider != "trae" && ref.Provider != "qoder" && ref.Provider != "opencode" {
 				return errBody(403, "当前账号渠道不支持共享调用", "permission_error")
 			}
 			if err := ctx.Err(); err != nil {

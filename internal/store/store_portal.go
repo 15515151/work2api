@@ -16,7 +16,7 @@ import (
 // Status enums are plain strings for readability in SQL and admin tooling:
 //   - users.status: active / disabled
 //   - contributions.status: verifying / active / private / unavailable / invalid / revoked
-//   - invite_codes: single-use; used_at IS NULL means unconsumed.
+//   - invite_codes: bounded or unlimited redemptions, expiry and enable state.
 
 var ErrConflict = errors.New("资源冲突")
 var ErrKeyLimit = errors.New("Key 数量已达上限")
@@ -305,39 +305,35 @@ type InviteCode struct {
 	CreatedAt float64  `json:"created_at"`
 }
 
-func (d *DB) CreateInviteCode(code string, expiresAt float64) error {
+func (d *DB) CreateInviteCode(code string, expiresAt float64, limits ...int64) error {
+	maxUses := int64(1)
+	if len(limits) > 0 {
+		maxUses = limits[0]
+	}
+	if maxUses < 0 {
+		return fmt.Errorf("invalid invite limit")
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	_, err := d.db.Exec("INSERT INTO invite_codes (code, expires_at, created_at) VALUES (?,?,?)",
-		code, expiresAt, float64(time.Now().UnixNano())/1e9)
+	_, err := d.db.Exec("INSERT INTO invite_codes (code, expires_at, created_at,max_uses) VALUES (?,?,?,?)",
+		code, expiresAt, float64(time.Now().UnixNano())/1e9, maxUses)
 	if err != nil && strings.Contains(err.Error(), "UNIQUE") {
 		return ErrConflict
 	}
 	return err
 }
 
-// ConsumeInviteCode atomically marks an unconsumed, unexpired code as used by
-// userID. Returns false when the code is unknown/used/expired. The UPDATE's
-// WHERE clause makes concurrent registrations consume each code exactly once.
+// ConsumeInviteCode atomically spends one available slot and records the user.
+// Enabled state, expiry and remaining allowance are rechecked in the transaction.
 func (d *DB) ConsumeInviteCode(code string, userID int64) (bool, error) {
-	now := float64(time.Now().UnixNano()) / 1e9
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	res, err := d.db.Exec(
-		"UPDATE invite_codes SET used_by=?, used_at=? WHERE code=? AND used_by IS NULL AND (expires_at=0 OR expires_at>?)",
-		userID, now, code, now)
-	if err != nil {
-		return false, err
-	}
-	n, err := res.RowsAffected()
-	return n > 0, err
+	return d.consumeInviteCode(code, userID)
 }
 
 // ListInviteCodes returns codes newest first (admin view).
 func (d *DB) ListInviteCodes() ([]map[string]any, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	rows, err := d.db.Query("SELECT code, used_by, used_at, expires_at, created_at FROM invite_codes ORDER BY created_at DESC")
+	rows, err := d.db.Query("SELECT " + inviteColumns + " FROM invite_codes ORDER BY created_at DESC")
 	if err != nil {
 		return nil, err
 	}
@@ -454,7 +450,7 @@ func (d *DB) HasActiveContribution(userID int64) (bool, error) {
 func (d *DB) OwnedAccountUIDs(userID int64) (map[string]bool, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	rows, err := d.db.Query("SELECT account_uid FROM contributions WHERE user_id=? AND provider IN ('workbuddy','trae') AND status IN ('active','private')", userID)
+	rows, err := d.db.Query("SELECT account_uid FROM contributions WHERE user_id=? AND provider IN ('workbuddy','trae','qoder','opencode') AND status IN ('active','private')", userID)
 	if err != nil {
 		return nil, err
 	}
@@ -475,7 +471,7 @@ func (d *DB) OwnedAccountUIDs(userID int64) (map[string]bool, error) {
 func (d *DB) PrivatePoolExcludedUIDs() (map[string]bool, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	rows, err := d.db.Query("SELECT account_uid FROM contributions UNION SELECT account_uid FROM platform_account_sharing WHERE mode='shared'")
+	rows, err := d.db.Query("SELECT account_uid FROM contributions WHERE status<>'active'")
 	if err != nil {
 		return nil, err
 	}
@@ -776,7 +772,7 @@ func (d *DB) GrantedGroups(userID int64) ([]ResourceGroup, error) {
 	rows, err := d.db.Query(
 		`SELECT rg.id,rg.name,rg.provider,rg.allowed_models,rg.enabled,rg.created_at FROM resource_groups rg
  WHERE (EXISTS(SELECT 1 FROM user_group_grants g WHERE g.group_id=rg.id AND g.user_id=?)
- OR (rg.provider IN ('workbuddy','trae') AND rg.id=CAST((SELECT value FROM settings WHERE key='portal_default_group') AS INTEGER)
+ OR (rg.provider IN ('workbuddy','trae','qoder','opencode') AND rg.id=CAST((SELECT value FROM settings WHERE key='portal_default_group') AS INTEGER)
  AND (SELECT value FROM settings WHERE key='portal_default_auto_grant')='1'
  AND EXISTS(SELECT 1 FROM contributions WHERE user_id=? AND provider=rg.provider AND status='active')))
  AND NOT EXISTS(SELECT 1 FROM user_group_denials deny WHERE deny.user_id=? AND deny.group_id=rg.id) ORDER BY rg.id`, userID, userID, userID)
@@ -916,7 +912,7 @@ func (d *DB) groupAccountUIDs(groupID int64, active bool) ([]string, error) {
 		q = `SELECT ga.account_uid FROM group_accounts ga JOIN resource_groups rg ON rg.id=ga.group_id
  WHERE ga.group_id=? AND rg.enabled=1 AND
  (EXISTS(SELECT 1 FROM contributions c WHERE c.account_uid=ga.account_uid AND c.status='active' AND c.provider=rg.provider)
- OR (rg.provider IN ('workbuddy','trae') AND NOT EXISTS(SELECT 1 FROM contributions c WHERE c.account_uid=ga.account_uid)
+ OR (rg.provider IN ('workbuddy','trae','qoder','opencode') AND NOT EXISTS(SELECT 1 FROM contributions c WHERE c.account_uid=ga.account_uid)
  AND EXISTS(SELECT 1 FROM platform_account_sharing ps JOIN accounts a ON a.uid=ps.account_uid WHERE ps.account_uid=ga.account_uid AND ps.mode IN ('shared','both') AND a.provider=rg.provider)))
  ORDER BY ga.account_uid`
 	}
@@ -938,7 +934,7 @@ func (d *DB) groupAccountUIDs(groupID int64, active bool) ([]string, error) {
 func (d *DB) RevokeInviteCode(code string) (bool, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	res, err := d.db.Exec("DELETE FROM invite_codes WHERE code=? AND used_by IS NULL", code)
+	res, err := d.db.Exec("UPDATE invite_codes SET enabled=0,revision=revision+1 WHERE code=?", code)
 	if err != nil {
 		return false, err
 	}
@@ -1101,7 +1097,7 @@ func (d *DB) SetPlatformAccountSharing(uid, mode string, groupIDs []int64) error
 	}
 	defer tx.Rollback()
 	var valid bool
-	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM accounts a WHERE a.uid=? AND a.provider IN ('workbuddy','trae') AND NOT EXISTS(SELECT 1 FROM contributions c WHERE c.account_uid=a.uid))`, uid).Scan(&valid); err != nil {
+	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM accounts a WHERE a.uid=? AND a.provider IN ('workbuddy','trae','qoder','opencode') AND NOT EXISTS(SELECT 1 FROM contributions c WHERE c.account_uid=a.uid))`, uid).Scan(&valid); err != nil {
 		return err
 	}
 	if !valid {
@@ -1142,7 +1138,7 @@ func (d *DB) SetDefaultPortalGroup(id int64, autoGrant bool) error {
 	defer tx.Rollback()
 	if id > 0 {
 		var valid bool
-		if err := tx.QueryRow("SELECT EXISTS(SELECT 1 FROM resource_groups WHERE id=? AND provider IN ('workbuddy','trae'))", id).Scan(&valid); err != nil {
+		if err := tx.QueryRow("SELECT EXISTS(SELECT 1 FROM resource_groups WHERE id=? AND provider IN ('workbuddy','trae','qoder','opencode'))", id).Scan(&valid); err != nil {
 			return err
 		}
 		if !valid {
@@ -1180,7 +1176,7 @@ func (d *DB) CreateInvitedUser(username, passwordHash, code string) (int64, erro
 	defer tx.Rollback()
 	now := float64(time.Now().UnixNano()) / 1e9
 	var valid bool
-	if err := tx.QueryRow("SELECT EXISTS(SELECT 1 FROM invite_codes WHERE code=? AND used_by IS NULL AND (expires_at=0 OR expires_at>?))", code, now).Scan(&valid); err != nil {
+	if err := tx.QueryRow("SELECT EXISTS(SELECT 1 FROM invite_codes WHERE code=? AND enabled=1 AND (max_uses=0 OR used_count<max_uses) AND (expires_at=0 OR expires_at>?))", code, now).Scan(&valid); err != nil {
 		return 0, err
 	}
 	if !valid {
@@ -1197,15 +1193,11 @@ func (d *DB) CreateInvitedUser(username, passwordHash, code string) (int64, erro
 	if err != nil {
 		return 0, err
 	}
-	res, err = tx.Exec("UPDATE invite_codes SET used_by=?,used_at=? WHERE code=? AND used_by IS NULL AND (expires_at=0 OR expires_at>?)", id, now, code, now)
+	ok, err := consumeInvite(tx, code, id, now)
 	if err != nil {
 		return 0, err
 	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return 0, err
-	}
-	if n != 1 {
+	if !ok {
 		return 0, ErrInvalidInvite
 	}
 	if err := tx.Commit(); err != nil {
@@ -1218,7 +1210,7 @@ func (d *DB) CreateInvitedUser(username, passwordHash, code string) (int64, erro
 func (d *DB) FindInviteCode(code string) (map[string]any, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	rows, err := d.db.Query("SELECT code,used_by,used_at,expires_at,created_at FROM invite_codes WHERE code=?", code)
+	rows, err := d.db.Query("SELECT "+inviteColumns+" FROM invite_codes WHERE code=?", code)
 	if err != nil {
 		return nil, err
 	}

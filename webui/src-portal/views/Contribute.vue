@@ -1,16 +1,20 @@
 <script setup lang="ts">
 // 贡献账号：WorkBuddy 扫码（设备授权流程）。弹出授权链接，用户在新窗口
-// 打开登录后这里轮询；完成即获得资格。也可随时撤回（立即停止共享调度）。
-import { ref, onMounted, onUnmounted } from 'vue'
+// 打开登录后这里轮询；完成即获得资格。也可随时撤回（立即撤回贡献调度）。
+import { ref, watch, onMounted, onUnmounted } from 'vue'
 import { api, PortalAPIError, fmtTime, type ContributionInfo, type Me } from '../api'
 import { toast } from '../../src/lib/toast'
 import WButton from '../../src/components/ui/WButton.vue'
+import WInput from '../../src/components/ui/WInput.vue'
 
 defineProps<{ me: Me }>()
 const emit = defineEmits<{ refresh: [] }>()
 
 const list = ref<ContributionInfo[]>([])
 const loading = ref(true)
+const loadError = ref('')
+const rowBusy = ref(new Set<number>())
+let loadVersion = 0
 const accepted = ref(false)
 const begining = ref(false)
 const authUrl = ref('')
@@ -23,17 +27,25 @@ let timer: ReturnType<typeof setTimeout> | null = null
 let disposed = false
 const cancelling = ref(false)
 	const channel=ref('workbuddy')
+const qoderRegion=ref('cn'), qoderMethod=ref('oauth'), opencodeTier=ref('zen'), credential=ref('')
+watch(channel, () => { credential.value = ''; accepted.value = false; callbackURL.value = '' })
+const importing=ref(false)
+async function importCredential(){if(importing.value||!accepted.value||!credential.value.trim()||disposed)return;importing.value=true;try{await api.importContribution(channel.value as 'qoder'|'opencode',credential.value.trim(),channel.value==='qoder'?{region:qoderRegion.value}:{tier:opencodeTier.value},accepted.value);credential.value='';if(disposed)return;await load();emit('refresh');toast.success('个人凭据已贡献')}catch(e:any){toast.error(e.message)}finally{importing.value=false}}
 	const workbuddySite=ref<'cn' | 'intl' | 'intl-codebuddy'>('cn')
 	const product=ref('cn')
 	const taskChannel=ref('workbuddy')
 	const callbackURL=ref('')
 	const callbackBusy=ref(false)
-	function cancelTask(id:string){return taskChannel.value==='trae'?api.traeCancel(id):api.contributionCancel(id)}
+	function cancelTask(id:string){return taskChannel.value==='trae'?api.traeCancel(id):taskChannel.value==='qoder'?api.qoderCancel(id):api.contributionCancel(id)}
 	async function completeCallback(){if(callbackBusy.value)return;callbackBusy.value=true;try{await api.traeComplete(taskId.value,callbackURL.value.trim());callbackURL.value='';toast.success('回调已提交')}catch(e:any){toast.error(e.message)}finally{callbackBusy.value=false}}
 
 async function load() {
+  const version = ++loadVersion
   loading.value = true
-  try { list.value = (await api.contributions()).contributions } catch (e: any) { toast.error(e?.message || '加载贡献失败') } finally { loading.value = false }
+  loadError.value = ''
+  try { const result = await api.contributions(); if (!disposed && version === loadVersion) list.value = result.contributions }
+  catch (e: any) { if (!disposed && version === loadVersion) loadError.value = e?.message || '加载贡献失败' }
+  finally { if (!disposed && version === loadVersion) loading.value = false }
 }
 onMounted(() => { load() })
 onUnmounted(() => { disposed = true; stopPoll(); if (taskId.value) void cancelTask(taskId.value).catch(() => {}) })
@@ -44,7 +56,7 @@ async function begin() {
   pollStatus.value = ''
   try {
     taskChannel.value=channel.value
-    const res = channel.value==='trae' ? await api.traeBegin(product.value,accepted.value) : await api.contributionBegin(workbuddySite.value, accepted.value)
+    const res = channel.value==='trae' ? await api.traeBegin(product.value,accepted.value) : channel.value==='qoder' ? await api.qoderBegin(qoderRegion.value,accepted.value) : await api.contributionBegin(workbuddySite.value, accepted.value)
     if (disposed) { void cancelTask(res.task_id).catch(() => {}); return }
     authUrl.value = res.auth_url
     taskId.value = res.task_id
@@ -63,7 +75,7 @@ async function poll() {
   if (!id || disposed || cancelling.value) return
   if (Date.now() >= expiresAt) { void cancelTask(id).catch(() => {}); taskId.value = authUrl.value = ''; toast.error('登录会话已过期，请重新发起'); return }
   try {
-    const res = taskChannel.value==='trae' ? await api.traePoll(id) : await api.contributionPoll(id)
+    const res = taskChannel.value==='trae' ? await api.traePoll(id) : taskChannel.value==='qoder' ? await api.qoderPoll(id) : await api.contributionPoll(id)
     if (disposed || id !== taskId.value || cancelling.value) return
     retries = 0
     pollError.value = ''
@@ -108,30 +120,35 @@ async function cancelPoll() {
 }
 
 async function revoke(c: ContributionInfo) {
-  if (!confirm('停止共享后，该账号仅供你本人使用。其他用户正在执行的请求可以完成，后续请求不能再选中该账号。确定停止共享？')) return
+  if (rowBusy.value.has(c.id) || refreshing.value === c.id) return
+  if (!confirm('撤回贡献后，该账号仅供你本人使用。其他用户正在执行的请求可以完成，后续请求不能再选中该账号。确定撤回贡献？')) return
+  rowBusy.value.add(c.id)
   try {
     await api.revokeContribution(c.id)
+    if (disposed) return
     await load()
     emit('refresh')
-    toast.success('已停止共享，本人仍可使用该账号')
-  } catch (e: any) { toast.error(e?.message || '撤回失败') }
+    toast.success('已撤回贡献，本人仍可使用该账号')
+  } catch (e: any) { if (!disposed) toast.error(e?.message || '撤回失败') } finally { rowBusy.value.delete(c.id) }
 }
 
 const refreshing = ref<number | null>(null)
 async function refreshModels(c: ContributionInfo) {
- if (refreshing.value !== null) return
+ if (refreshing.value !== null || rowBusy.value.has(c.id)) return
  refreshing.value = c.id
  try { await api.refreshContributionModels(c.id); await load(); emit('refresh'); toast.success('模型目录已验证') }
  catch (e: any) { toast.error(e.message) }
  finally { refreshing.value = null }
 }
 const statusText: Record<string, string> = {
-  active: '共享中', private: '仅本人使用', revoked: '已撤回，需重新验证', unavailable: '暂不可用', invalid: '已失效', verifying: '验证中',
+  active: '已贡献', private: '仅本人使用', revoked: '已撤回，需重新验证', unavailable: '暂不可用', invalid: '已失效', verifying: '验证中',
 }
 async function share(c: ContributionInfo) {
-  if (!confirm('恢复共享后，获授权用户可使用此账号并消耗它的额度。你仍保留本人使用权，账号原有停用和冷却状态不会被清除。确认恢复共享？')) return
-  try { await api.shareContribution(c.id); await load(); emit('refresh'); toast.success('已恢复共享') }
-  catch (e: any) { toast.error(e?.message || '恢复共享失败') }
+  if (rowBusy.value.has(c.id) || refreshing.value === c.id) return
+  if (!confirm('重新贡献后，获授权用户可使用此账号并消耗它的额度。你仍保留本人使用权，账号原有停用和冷却状态不会被清除。确认重新贡献？')) return
+  rowBusy.value.add(c.id)
+  try { await api.shareContribution(c.id); if (disposed) return; await load(); emit('refresh'); toast.success('已重新贡献') }
+  catch (e: any) { if (!disposed) toast.error(e?.message || '重新贡献失败') } finally { rowBusy.value.delete(c.id) }
 }
 </script>
 
@@ -140,20 +157,23 @@ async function share(c: ContributionInfo) {
     <div class="glass rounded-2xl p-6">
       <h1 class="text-base font-semibold">我的账号</h1>
 		<div class="mt-3 flex flex-wrap gap-2">
-        <select v-model="channel" aria-label="账号渠道" :disabled="!!taskId || begining" class="rounded-lg border border-line bg-bg p-2 text-small"><option value="workbuddy">WorkBuddy</option><option value="trae">Trae</option></select>
-        <select v-if="channel==='workbuddy'" v-model="workbuddySite" aria-label="登录站点" :disabled="!!taskId || begining" class="rounded-lg border border-line bg-bg p-2 text-small"><option value="cn">国内 CodeBuddy</option><option value="intl">国际 WorkBuddy</option><option value="intl-codebuddy">国际 CodeBuddy</option></select>
-        <select v-else v-model="product" aria-label="Trae 产品" :disabled="!!taskId || begining" class="rounded-lg border border-line bg-bg p-2 text-small"><option value="cn">国内 IDE</option><option value="solo">国内 Work/SOLO</option></select>
+        <select v-model="channel" aria-label="账号渠道" :disabled="!!taskId || begining || importing" class="rounded-lg border border-line bg-bg p-2 text-small"><option value="workbuddy">WorkBuddy</option><option value="trae">Trae</option><option value="qoder">Qoder</option><option value="opencode">OpenCode</option></select>
+        <select v-if="channel==='workbuddy'" v-model="workbuddySite" aria-label="登录站点" :disabled="!!taskId || begining || importing" class="rounded-lg border border-line bg-bg p-2 text-small"><option value="cn">国内 CodeBuddy</option><option value="intl">国际 WorkBuddy</option><option value="intl-codebuddy">国际 CodeBuddy</option></select>
+        <select v-if="channel==='trae'" v-model="product" aria-label="Trae 产品" :disabled="!!taskId || begining || importing" class="rounded-lg border border-line bg-bg p-2 text-small"><option value="cn">国内 IDE</option><option value="solo">国内 Work/SOLO</option></select>
+        <template v-if="channel==='qoder'"><select v-model="qoderRegion" aria-label="Qoder 区域" :disabled="!!taskId || begining || importing" class="rounded-lg border border-line bg-bg p-2 text-small"><option value="cn">国内</option><option value="global">国际</option></select><select v-model="qoderMethod" aria-label="Qoder 授权方式" :disabled="!!taskId || begining || importing" class="rounded-lg border border-line bg-bg p-2 text-small"><option value="oauth">扫码授权</option><option value="pat">个人 PAT</option></select></template>
+        <select v-if="channel==='opencode'" v-model="opencodeTier" aria-label="OpenCode 密钥类型" :disabled="importing" class="rounded-lg border border-line bg-bg p-2 text-small"><option value="zen">Zen API Key</option><option value="go">Go API Key</option></select>
       </div>
       <p class="mt-1 text-micro text-faint">
-        扫码添加并共享账号后，你无需共享分组授权即可调用本人账号。其他用户只能通过获授权的共享池使用它，调用消耗该账号额度。
-        你可以随时停止共享，账号会保留为仅本人使用。服务器会保存授权凭据；共享记录和凭据也会保留，用于本人调用及重新授权。
+        贡献可选。添加个人账号后可调用本人支持的模型；贡献账号进入统一池，其他用户可按默认或管理员授权范围调用，并可能消耗账号额度。
+        你可以随时撤回贡献，账号会保留为仅本人使用。服务器会保存授权凭据；共享记录和凭据也会保留，用于本人调用及重新授权。
       </p>
       <label class="mt-4 flex cursor-pointer items-start gap-2 text-small text-muted">
         <input v-model="accepted" type="checkbox" class="mt-0.5" />
-        <span>我已了解：贡献的账号会进入共享分组供其他具备资格的用户调用，且我可在本页随时撤回。</span>
+        <span>我已了解：贡献的账号会进入统一账号池供获授权用户调用，且我可在本页随时撤回。</span>
       </label>
+      <div v-if="channel==='opencode' || (channel==='qoder' && qoderMethod==='pat')" class="mt-4 space-y-3"><WInput v-model="credential" type="password" autocomplete="off" :placeholder="channel==='qoder' ? 'Qoder 个人 PAT' : 'OpenCode 个人 API Key'" /><p v-if="channel==='opencode'" class="text-micro text-faint">匿名 public 入口是系统资源，不能作为个人贡献。</p><WButton variant="primary" :disabled="!accepted || !credential.trim() || !!taskId" :loading="importing" @click="importCredential">验证凭据并贡献</WButton></div>
       <div class="mt-4 flex flex-wrap gap-2">
-        <WButton variant="primary" :disabled="!accepted || !!taskId || cancelling" :loading="begining" @click="begin">扫码登录并贡献</WButton>
+        <WButton v-if="channel!=='opencode' && !(channel==='qoder' && qoderMethod==='pat')" variant="primary" :disabled="!accepted || !!taskId || cancelling" :loading="begining" @click="begin">扫码登录并贡献</WButton>
         <WButton v-if="taskId" variant="subtle" :loading="cancelling" @click="cancelPoll">取消</WButton>
       </div>
       <div v-if="taskId" class="mt-4 rounded-xl border border-route/40 bg-route/8 p-4">
@@ -169,20 +189,21 @@ async function share(c: ContributionInfo) {
     </div>
 
     <div class="glass rounded-2xl p-6">
-      <h2 class="text-base font-semibold">我的账号与共享状态</h2>
+      <h2 class="text-base font-semibold">我的账号与贡献状态</h2>
       <div v-if="loading" class="mt-4 text-small text-faint">加载中…</div>
+      <div v-else-if="loadError" role="alert" class="mt-4 text-small text-fault">{{ loadError }} <button class="text-brand" @click="load">重试</button></div>
       <div v-else-if="!list.length" class="mt-4 text-small text-faint">还没有贡献记录。</div>
       <div v-else class="mt-4 space-y-3">
         <div v-for="c in list" :key="c.id" class="flex flex-wrap items-center gap-3 rounded-xl border border-line bg-elevated/40 p-4">
           <span class="h-2 w-2 rounded-full" :class="c.status === 'active' ? 'bg-live' : 'bg-faint'" />
-          <code class="mono text-small">{{ c.account }}</code>
+          <span class="text-micro text-muted">{{ c.provider }}</span><code class="mono text-small">{{ c.account }}</code>
           <span class="rounded-md bg-bg/60 px-2 py-0.5 text-micro text-muted">{{ statusText[c.status] || c.status }}</span>
           <span v-if="c.catalog_status !== 'ready'" class="text-micro text-faint">{{ c.catalog_status === 'unavailable' ? '账号暂不可用，请联系管理员' : '模型待验证' }}</span>
-          <WButton v-if="c.catalog_status === 'pending' && ['active', 'private'].includes(c.status)" size="sm" variant="subtle" :loading="refreshing === c.id" :disabled="refreshing !== null" @click="refreshModels(c)">验证模型</WButton>
+          <WButton v-if="c.catalog_status === 'pending' && ['active', 'private'].includes(c.status)" size="sm" variant="subtle" :loading="refreshing === c.id" :disabled="refreshing !== null || rowBusy.has(c.id)" @click="refreshModels(c)">验证模型</WButton>
           <span class="mono ml-auto text-micro text-faint">{{ fmtTime(c.created_at) }}</span>
-          <WButton v-if="c.status === 'active'" size="sm" variant="subtle" @click="revoke(c)">停止共享</WButton>
-          <WButton v-if="c.status === 'private'" size="sm" variant="subtle" @click="share(c)">恢复共享</WButton>
-          <span v-if="c.status === 'revoked'" class="text-micro text-faint">重新验证：在上方扫码同一账号并授权。</span>
+          <WButton v-if="c.status === 'active'" size="sm" variant="subtle" :loading="rowBusy.has(c.id)" :disabled="refreshing === c.id" @click="revoke(c)">撤回贡献</WButton>
+          <WButton v-if="c.status === 'private'" size="sm" variant="subtle" :loading="rowBusy.has(c.id)" :disabled="refreshing === c.id" @click="share(c)">重新贡献</WButton>
+          <span v-if="c.status === 'revoked'" class="text-micro text-faint">重新验证：在上方使用对应渠道的授权或个人凭据添加方式。</span>
         </div>
       </div>
     </div>

@@ -97,12 +97,12 @@ func TestAgentCapacityDefaultsFollowRequestSize(t *testing.T) {
 	previousRoot := config.PackageRoot
 	config.PackageRoot = t.TempDir()
 	t.Cleanup(func() { config.PackageRoot = previousRoot })
-	for _, key := range []string{"MAX_REQUEST_BYTES", "REQUEST_BODY_BUDGET", "MODEL_BUFFER_BUDGET_BYTES", "MODEL_MEMORY_GUARD", "MAX_RESPONSE_BYTES", "MAX_CONCURRENT_REQUESTS"} {
+	for _, key := range []string{"MAX_REQUEST_BYTES", "REQUEST_BODY_BUDGET", "MODEL_BUFFER_BUDGET_BYTES", "MODEL_MEMORY_GUARD", "MAX_RESPONSE_BYTES", "MAX_CONCURRENT_REQUESTS", "MAX_JSON_ITEMS", "MAX_JSON_DEPTH"} {
 		t.Setenv(key, "")
 		_ = os.Unsetenv(key)
 	}
 	cfg := config.Load(nil)
-	if cfg.MaxRequestBytes != 64<<20 || cfg.RequestBodyBudget != 256<<20 || cfg.ModelMemoryGuard {
+	if cfg.MaxRequestBytes != 256<<20 || cfg.MaxResponseBytes != 128<<20 || cfg.RequestBodyBudget != 0 || cfg.MaxJSONItems != 0 || cfg.MaxJSONDepth != 0 || cfg.ModelMemoryGuard {
 		t.Fatal("ordinary Agent requests retain restrictive defaults")
 	}
 	if cfg.ModelBufferBudgetBytes != 4*cfg.MaxResponseBytes*int64(cfg.MaxConcurrentRequests) {
@@ -110,8 +110,8 @@ func TestAgentCapacityDefaultsFollowRequestSize(t *testing.T) {
 	}
 	t.Setenv("MAX_REQUEST_BYTES", "134217728")
 	cfg = config.Load(nil)
-	if cfg.RequestBodyBudget != 384<<20 {
-		t.Fatal("body budget did not follow increased single-request limit")
+	if cfg.RequestBodyBudget != 0 {
+		t.Fatal("implicit body quota was restored")
 	}
 	t.Setenv("REQUEST_BODY_BUDGET", "33554432")
 	t.Setenv("MODEL_BUFFER_BUDGET_BYTES", "67108864")

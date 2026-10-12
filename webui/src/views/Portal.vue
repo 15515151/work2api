@@ -1,142 +1,73 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
 import { api } from '@/api/client'
-import type { PortalOverview, PortalGroup, PortalAccount, PortalInvite } from '@/api/portal'
+import type { PortalOverview, PortalInvite, InviteRedemption } from '@/api/portal'
 import { toast } from '@/lib/toast'
 import WButton from '@/components/ui/WButton.vue'
 import WInput from '@/components/ui/WInput.vue'
 import IdentityManager from '@/components/IdentityManager.vue'
+import ModelAccessPicker from '@/components/ModelAccessPicker.vue'
+import InvitationForm from '@/components/InvitationForm.vue'
+import WModal from '@/components/ui/WModal.vue'
 import { fmtTime } from '../../src-portal/api'
 
 const data = ref<PortalOverview>({ users: [], invites: [], groups: [], accounts: [], contributions: [], registration_mode: '' })
-const loading = ref(true)
-const loaded = ref(false)
-const busy = ref(false)
-const error = ref('')
-const bootstrapName = ref('')
-const bootstrapPass = ref('')
-const inviteDays = ref('7')
-const publicURL = ref('')
-const savedPublicURL = ref('')
-const newGroup = ref('')
-	const newGroupProvider = ref('workbuddy')
+const loading = ref(true), loaded = ref(false), busy = ref(false), error = ref('')
+const bootstrapName = ref(''), bootstrapPass = ref('')
+const inviteModal = ref(false), editingInvite = ref<PortalInvite | null>(null)
+const history = ref<InviteRedemption[]>([]), historyOffset = ref(-1), historyLoading = ref(false), historyError = ref('')
+let historyVersion = 0
+const publicURL = ref(''), savedPublicURL = ref('')
+const models = ref<string[]>([]), modelNames = ref<Record<string,string>>({})
+const policy = ref<{mode:'auto'|'manual';include:string[];exclude:string[]}>({mode:'auto',include:[],exclude:[]})
 const disabledModels = ref<string[]>([])
-const groupModelSearch = ref('')
-const disabledModelSearch = ref('')
-const editingAccountUID = ref('')
-const defaultGroup = ref('0')
-const defaultAuto = ref(false)
-const sharingDrafts = ref<Record<string, { mode: string; groups: number[] }>>({})
-const models = ref<string[]>([])
-const modelNames = ref<Record<string, string>>({})
-const groupDrafts = ref<Record<number, string[]>>({})
-const accountDrafts = ref<Record<number, string>>({})
-const userDrafts = ref<Record<number, string>>({})
-const adminsExist = computed(() => data.value.users.some(u => ['admin', 'owner'].includes(u.role)))
-function parseModels(value: string[] | string): string[] {
-  if (Array.isArray(value)) return value
-  try { const parsed: unknown = JSON.parse(value || '[]'); return Array.isArray(parsed) ? parsed.filter((m): m is string => typeof m === 'string') : [] } catch { return [] }
-}
-function accountsOf(g: PortalGroup) { return g.accounts || g.account_uids || [] }
-function grantsOf(g: PortalGroup) { return g.grants || g.user_ids || [] }
-function isPublicModel(model: string) { return model !== 'auto' && model !== 'workbuddy/auto' }
-function matchesModel(m: string, query: string) { return `${m} ${modelNames.value[m] || ''}`.toLowerCase().includes(query.trim().toLowerCase()) }
-function pickerModels(g: PortalGroup) { return [...new Set([...models.value, ...parseModels(g.allowed_models)])].filter(isPublicModel).filter(m => (m.startsWith('trae/') ? 'trae' : 'workbuddy') === g.provider).sort().filter(m => matchesModel(m, groupModelSearch.value)) }
-const disabledOptions = computed(() => [...new Set([...models.value, ...disabledModels.value])].sort().filter(m => matchesModel(m, disabledModelSearch.value)))
-function accountLabel(a: PortalAccount) { return a.alias?.trim() || a.nickname?.trim() || a.uid }
-function accountLabelByUID(uid: string) { const a = data.value.accounts?.find(a => a.uid === uid); return a ? accountLabel(a) : uid }
-function scopeLabel(a: PortalAccount) {
-  if (a.owner_kind === 'user') return a.status === 'active' ? '本人可用 · 已共享' : a.status === 'private' ? '仅本人使用' : '需重新验证'
-  return a.sharing_mode === 'shared' ? '仅共享池' : a.sharing_mode === 'both' ? '私人池与共享池共用' : '仅管理员私人池'
-}
-function editSharing(a: PortalAccount) {
-  if (editingAccountUID.value === a.uid) { editingAccountUID.value = ''; return }
-  sharingDrafts.value[a.uid] = { mode: a.sharing_mode || 'private', groups: data.value.groups.filter(g => accountsOf(g).includes(a.uid)).map(g => g.id) }
-  editingAccountUID.value = a.uid
-}
-function username(id: number) { return data.value.users.find(u => u.id === id)?.username || `用户 ${id}` }
-const sharedAccounts = computed(() => (data.value.accounts || []).filter(a => {
-  const c = data.value.contributions?.find(c => c.account_uid === a.uid)
-  return ['workbuddy','trae'].includes(a.provider) && (c?.status === 'active' || ['shared', 'both'].includes(a.sharing_mode || ''))
-}))
+const userDrafts = ref<Record<number,string[]>>({})
+const adminsExist = computed(() => data.value.users.some(u => ['admin','owner'].includes(u.role)))
+function parseModels(raw: unknown): string[] { if (Array.isArray(raw)) return raw.filter((v):v is string=>typeof v==='string');try {return parseModels(JSON.parse(String(raw || '[]')))}catch{return []} }
+function username(id:number) {return data.value.users.find(u=>u.id===id)?.username || `用户 ${id}`}
+function scopedGrants(id:number) {return (data.value.user_model_grants?.[id] || []).filter(g=>!g.account_uids.includes('*'))}
+let loadVersion = 0
 async function load() {
-  loading.value = true
-  error.value = ''
-  try {
-    const [overview, catalog, settings] = await Promise.all([api.portalOverview(), api.modelCatalog(), api.getSettings()])
-    data.value = { ...overview, users: overview.users || [], invites: overview.invites || [], groups: overview.groups || [] }
-    models.value = catalog.models.filter(m => ['workbuddy','trae'].includes(m.provider || m.owned_by || '') && isPublicModel(m.id)).map(m => m.id)
-    modelNames.value = Object.fromEntries(catalog.models.map(m => [m.id, m.name || m.id]))
-    const disabled = settings.portal_disabled_models
-    publicURL.value = savedPublicURL.value = settings.portal_public_url || ''
-    disabledModels.value = parseModels(typeof disabled === 'string' || Array.isArray(disabled) ? disabled as string | string[] : [])
-    defaultGroup.value = String(data.value.default_group_id || 0)
-    defaultAuto.value = !!data.value.default_auto_grant
-    for (const a of data.value.accounts || []) sharingDrafts.value[a.uid] = { mode: a.sharing_mode || 'private', groups: data.value.groups.filter(g => accountsOf(g).includes(a.uid)).map(g => g.id) }
-    for (const g of data.value.groups) groupDrafts.value[g.id] = parseModels(g.allowed_models).filter(isPublicModel)
-    loaded.value = true
-  } catch (e: any) { error.value = e?.response?.data?.error?.message || e?.message || '加载失败' }
-  finally { loading.value = false }
+ const version = ++loadVersion
+ loading.value=true;error.value=''
+ try {
+  const [overview,catalog,settings]=await Promise.all([api.portalOverview(),api.modelCatalog(),api.getSettings()])
+  if (version !== loadVersion) return
+  data.value={...overview,users:overview.users||[],invites:overview.invites||[],groups:[]}
+  models.value=catalog.models.map(m=>m.id).filter(m=>m!=='auto'&&m!=='workbuddy/auto')
+  modelNames.value=Object.fromEntries(catalog.models.map(m=>[m.id,m.name||m.id]))
+  policy.value=overview.model_policy || {mode:'auto',include:[],exclude:[]}
+  disabledModels.value=parseModels(settings.portal_disabled_models)
+  publicURL.value=savedPublicURL.value=settings.portal_public_url||''
+  userDrafts.value=Object.fromEntries(data.value.users.map(u=>[u.id,(overview.user_model_grants?.[u.id]||[]).filter(g=>g.account_uids.includes('*')).map(g=>g.model)]))
+  loaded.value=true
+ }catch(e:any){if(version===loadVersion)error.value=e?.response?.data?.error?.message||e?.message||'加载失败'}finally{if(version===loadVersion)loading.value=false}
 }
 onMounted(load)
-async function mutate(action: () => Promise<unknown>, message: string) {
-  if (busy.value) return
-  busy.value = true
-  try { await action(); toast.success(message); await load() }
-  catch (e: any) { error.value = e?.response?.data?.error?.message || e?.message || '操作失败' }
-  finally { busy.value = false }
+async function mutate(action:()=>Promise<unknown>,message:string) {if(busy.value)return;busy.value=true;try{await action();toast.success(message);await load()}catch(e:any){error.value=e?.response?.data?.error?.message||e?.message||'操作失败'}finally{busy.value=false}}
+async function bootstrap() {if(!bootstrapName.value.trim()||!bootstrapPass.value)return toast.error('请填写管理员用户名和密码');await mutate(async()=>{await api.portalWrite('bootstrap',{username:bootstrapName.value.trim(),password:bootstrapPass.value});bootstrapPass.value='';window.location.reload()},'超级管理员已初始化')}
+async function savePolicy() {await mutate(()=>api.portalWrite('model-policy',policy.value),'默认模型规则已保存')}
+async function saveUser(id:number,remove_scoped:string[]=[]) {await mutate(()=>api.portalWrite(`users/${id}/models`,{models:userDrafts.value[id]||[],remove_scoped}),'用户额外授权已更新')}
+async function removeScoped(id:number,model:string) {if(!confirm(`移除 ${model} 的历史账号范围授权？本人和默认模型权限继续保留。`))return;await saveUser(id,[model])}
+type InviteSettings = {max_uses:number;expires_at:number;enabled:boolean}
+async function createInvite(settings: InviteSettings) { await mutate(() => api.portalWrite('invites', settings), '邀请码已创建') }
+function inviteAvailable(invite: PortalInvite) { return !!invite.enabled && (invite.max_uses === 0 || invite.used_count < invite.max_uses) && (!invite.expires_at || invite.expires_at > Date.now()/1000) }
+function inviteStatus(invite: PortalInvite) { if (!invite.enabled) return '已停用'; if (invite.expires_at && invite.expires_at <= Date.now()/1000) return '已过期'; if (invite.max_uses && invite.used_count >= invite.max_uses) return '次数用尽'; return '可使用' }
+async function inviteHistory(more = false) {
+ const item = editingInvite.value; if (!item || historyLoading.value) return
+ const version = ++historyVersion; historyLoading.value=true;historyError.value=''
+ try { const result=await api.portalInviteHistory(item.code, more ? historyOffset.value : 0); if (version!==historyVersion || editingInvite.value?.code!==item.code) return; history.value=more ? [...new Map([...history.value,...result.records].map(record=>[record.user_id,record])).values()] : result.records; historyOffset.value=result.next_offset }
+ catch(e:any) { if(version===historyVersion)historyError.value=e?.response?.data?.error?.message || '使用记录加载失败' }
+ finally { if(version===historyVersion)historyLoading.value=false }
 }
-async function bootstrap() {
-  if (!bootstrapName.value.trim() || !bootstrapPass.value) return toast.error('请填写管理员用户名和密码')
-  await mutate(async () => { await api.portalWrite('bootstrap', { username: bootstrapName.value.trim(), password: bootstrapPass.value }); bootstrapPass.value = ''; window.location.reload() }, '超级管理员账号已初始化')
-}
-async function removeGroup(g: PortalGroup) {
-  if (!confirm(`删除分组「${g.name}」及其授权？`)) return
-  await mutate(() => api.portalDelete(`groups/${g.id}`), '分组已删除')
-}
-function setModel(g: PortalGroup, model: string, checked: boolean) {
-  const selected = groupDrafts.value[g.id] || []
-  groupDrafts.value[g.id] = checked ? [...new Set([...selected, model])] : selected.filter(m => m !== model)
-}
-function selectVisibleModels(g: PortalGroup) { groupDrafts.value[g.id] = [...new Set([...(groupDrafts.value[g.id] || []), ...pickerModels(g)])] }
-function disableVisibleModels() { disabledModels.value = [...new Set([...disabledModels.value, ...disabledOptions.value])] }
-async function saveDisabled() {
-  const selected = [...new Set(disabledModels.value)]
-  await mutate(() => api.saveSettings({ portal_disabled_models: JSON.stringify(selected) }), '全局禁用模型已更新')
-}
-function toggleDisabled(model: string, checked: boolean) {
-  disabledModels.value = checked ? [...new Set([...disabledModels.value, model])] : disabledModels.value.filter(m => m !== model)
-}
-function togglePool(a: PortalAccount, id: number, checked: boolean) {
-  const draft = sharingDrafts.value[a.uid]
-  draft.groups = checked ? [...new Set([...draft.groups, id])] : draft.groups.filter(n => n !== id)
-}
-async function saveSharing(a: PortalAccount) {
-  const draft = sharingDrafts.value[a.uid]
-  const ids = draft.mode === 'private' ? [] : draft.groups
-  if (draft.mode !== 'private' && !ids.length) return toast.error('请至少选择一个共享池')
-  const labels: Record<string, string> = { private: '仅管理员私人池', shared: '仅共享池', both: '私人池和共享池共用' }
-  const pools = data.value.groups.filter(g => ids.includes(g.id)).map(g => `${g.name}${g.enabled ? '' : '（未启用）'}`).join('、')
-  if (!confirm(`将「${accountLabel(a)}」改为${labels[draft.mode]}${pools ? `，目标池：${pools}` : ''}？\n仅共享池会停止历史私人 Key 使用此账号；移出共享池会撤销对应共享访问。账号启停、额度和凭据保持原状。`)) return
-  await mutate(async () => { await api.portalWrite(`accounts/${encodeURIComponent(a.uid)}/sharing`, { mode: draft.mode, group_ids: ids }); editingAccountUID.value = '' }, '账号使用范围已更新')
-}
-async function saveDefault() {
-  if (!confirm('保存默认池后，有效共享贡献账号会加入该池；勾选自动授权时，有效贡献者无需逐个授权。停用的池和空模型范围仍不提供调用权限。')) return
-  await mutate(() => api.portalWrite('default-group', { group_id: Number(defaultGroup.value), auto_grant: defaultAuto.value }), '默认共享池已更新')
-}
-async function createInvite() {
-  const days = Number(inviteDays.value)
-  if (!Number.isFinite(days) || days < 1 || days > 365) return toast.error('有效天数需为 1–365')
-  await mutate(() => api.portalWrite('invites', { valid_days: days }), '邀请码已创建')
-}
-function inviteAvailable(invite: PortalInvite) {
-  return !invite.used_by && (!invite.expires_at || invite.expires_at > Date.now() / 1000)
-}
+function editInvite(invite: PortalInvite) { error.value=''; historyVersion++;historyLoading.value=false;editingInvite.value={...invite};history.value=[];historyOffset.value=-1;historyError.value='';inviteModal.value=true;void inviteHistory() }
+async function saveInvite(settings: InviteSettings) { const item=editingInvite.value;if(!item)return;await mutate(async()=>{await api.portalWrite(`invites/${encodeURIComponent(item.code)}`, {...settings,revision:item.revision});inviteModal.value=false}, '邀请码配置已保存') }
+async function toggleInvite(invite: PortalInvite) { await mutate(() => api.portalWrite(`invites/${encodeURIComponent(invite.code)}`, {max_uses:invite.max_uses,expires_at:invite.expires_at,enabled:!invite.enabled,revision:invite.revision}), invite.enabled ? '邀请码已停用，使用记录保留' : '邀请码已启用') }
 async function savePublicURL() {
   await mutate(() => api.saveSettings({ portal_public_url: publicURL.value.trim() }), '公网门户地址已保存')
 }
 async function copyInvite(invite: PortalInvite, link = false) {
-  if (!inviteAvailable(invite)) return toast.error('邀请码已使用或过期')
+  if (!inviteAvailable(invite)) return toast.error('邀请码已停用、过期或次数用尽')
   let text = invite.code
   if (link) {
     if (!savedPublicURL.value || publicURL.value.trim() !== savedPublicURL.value) return toast.error('请先保存公网门户地址')
@@ -150,75 +81,44 @@ async function copyInvite(invite: PortalInvite, link = false) {
 </script>
 
 <template>
-  <div class="mx-auto max-w-[1320px] space-y-5 p-4 md:p-6">
-    <div class="flex items-center justify-between"><div><h1 class="text-lg font-semibold">门户管理</h1><p class="mt-1 text-small text-faint">注册方式：{{ data.registration_mode || '未知' }} · 管理共享资格与模型范围</p></div><WButton :loading="loading" :disabled="busy" @click="load">刷新</WButton></div>
-    <p v-if="error" class="rounded-lg border border-fault/30 p-3 text-small text-fault">{{ error }}</p>
+ <div class="mx-auto max-w-[1320px] space-y-5 p-4 md:p-6">
+  <div class="flex flex-wrap items-center justify-between gap-3"><div><h1 class="text-lg font-semibold">用户与访问权限</h1><p class="mt-1 text-small text-faint">注册方式：{{ data.registration_mode || '未知' }} · 贡献可选，账号和 Key 统一管理</p></div><WButton :loading="loading" :disabled="busy || loading || !loaded" @click="load">刷新</WButton></div>
+  <p v-if="error" role="alert" class="rounded-lg border border-fault/30 p-3 text-small text-fault">{{ error }}</p>
+  <section v-if="loaded && !adminsExist" class="glass rounded-xl p-5 space-y-3"><h2 class="font-semibold">初始化超级管理员</h2><WInput v-model="bootstrapName" placeholder="管理员用户名" /><WInput v-model="bootstrapPass" type="password" placeholder="8–72 字节密码" /><WButton :loading="busy" @click="bootstrap">初始化</WButton></section>
+  <IdentityManager v-if="loaded" :users="data.users" :max-concurrency="data.user_concurrency_max || 4" :overrides="data.user_concurrency_overrides" @refresh="load" />
+  <section class="glass rounded-xl p-5 space-y-4">
+   <h2 class="font-semibold">默认开放模型</h2>
+   <p class="text-small leading-relaxed text-muted">所有用户均可创建 Key，无需贡献账号。自动模式按明确的免费来源发现模型；授权后仍沿用正常账号命中策略，可能消耗其他账号额度，并不保证每次调用免费。撤回的贡献账号仅本人可用。</p>
+   <select v-model="policy.mode" :disabled="busy || loading || !loaded" aria-label="默认模型模式" class="rounded-lg border border-line bg-bg p-2 text-small"><option value="auto">自动发现免费来源＋手工增删</option><option value="manual">仅手工维护列表</option></select>
+   <p class="text-micro text-faint">当前默认范围：{{ data.default_models?.length || 0 }} 个模型。自动发现的新模型对现有用户生效，固定范围 Key 仍需手动选择。</p>
+   <details class="rounded-lg border border-line p-3"><summary class="cursor-pointer text-small">{{ policy.mode === 'auto' ? '额外开放模型' : '手工开放模型' }}（{{ policy.include.length }}）</summary><ModelAccessPicker v-model="policy.include" :options="models" :names="modelNames" :disabled="busy || loading || !loaded" class="mt-3" /></details>
+   <details class="rounded-lg border border-line p-3"><summary class="cursor-pointer text-small">排除默认模型（{{ policy.exclude.length }}）</summary><p class="mt-2 text-micro text-faint">排除只影响默认权限；本人账号或额外授权仍可调用。需要禁止所有用户调用时，使用下方全局禁用。</p><ModelAccessPicker v-model="policy.exclude" :options="models" :names="modelNames" :disabled="busy || loading || !loaded" class="mt-3" /></details>
+   <WButton :disabled="busy || loading || !loaded" @click="savePolicy">保存默认规则</WButton>
+  </section>
+  <section class="glass rounded-xl p-5 space-y-3"><h2 class="font-semibold">用户额外授权</h2><p class="text-small text-faint">在默认模型和本人账号之外增加模型权限。新的额外授权使用正常公共账号调度；迁移的旧授权保留原账号范围。</p>
+   <details v-for="u in data.users.filter(u=>u.role==='user')" :key="u.id" class="rounded-lg border border-line p-3"><summary class="cursor-pointer text-small">{{ u.username }} · 额外授权 {{ userDrafts[u.id]?.length || 0 }} · 历史范围 {{ scopedGrants(u.id).length }}</summary>
+    <div v-for="g in scopedGrants(u.id)" :key="g.model" class="mt-3 flex flex-wrap items-center gap-2 text-small"><code class="break-all">{{ g.model }}</code><span class="text-faint">原 {{ g.account_uids.length }} 个账号范围</span><WButton size="sm" :disabled="busy || loading || !loaded" @click="removeScoped(u.id,g.model)">移除历史授权</WButton></div>
+    <ModelAccessPicker v-model="userDrafts[u.id]" :options="models.filter(m=>!scopedGrants(u.id).some(g=>g.model===m))" :names="modelNames" :disabled="busy || loading || !loaded" class="mt-3" /><WButton size="sm" :disabled="busy || loading || !loaded" class="mt-3" @click="saveUser(u.id)">保存额外授权</WButton>
+   </details><p v-if="!data.users.some(u=>u.role==='user')" class="text-small text-faint">暂无普通用户。</p>
+  </section>
+  <section class="glass rounded-xl p-5 space-y-3"><h2 class="font-semibold">全局禁用用户模型</h2><p class="text-small text-faint">对默认权限、本人账号、额外授权和现有用户 Key 均生效。管理员 Key 保持其原有配置。</p><ModelAccessPicker v-model="disabledModels" :options="models" :names="modelNames" :disabled="busy || loading || !loaded" /><WButton :disabled="busy || loading || !loaded" @click="mutate(()=>api.saveSettings({portal_disabled_models:JSON.stringify(disabledModels)}),'禁用规则已保存')">保存禁用规则</WButton></section>
     <section class="glass rounded-xl p-5 space-y-3">
-      <h2 class="font-semibold">共享接入范围</h2>
-      <p class="text-small text-muted">WorkBuddy、Trae 支持共享和本人调用，各池只使用对应渠道账号。Qoder、OpenCode 当前支持管理员私人调用。</p>
-      <p class="text-micro text-faint">初次配置：创建一个池并选择模型 → 指定默认池和准入规则 → 在下方勾选要共享的平台账号。用户自己的账号无需池授权即可本人使用。</p>
-    </section>
-    <section class="glass rounded-xl p-5 space-y-3">
-      <h2 class="font-semibold">默认共享池</h2>
-      <p class="text-small text-faint">新贡献只加入这个池，自定义池不会自动混入新账号。选择默认池时，已有有效共享贡献也会加入。自动资格只对有效贡献者生效，撤回或停用后实时失效。</p>
-      <select v-model="defaultGroup" :disabled="busy" class="w-full rounded-lg border border-line bg-bg p-2 text-small"><option value="0">不指定默认池</option><option v-for="g in data.groups" :key="g.id" :value="String(g.id)">{{ g.name }}{{ g.enabled ? '' : '（未启用）' }}</option></select>
-      <label class="flex items-start gap-2 text-small"><input v-model="defaultAuto" type="checkbox" :disabled="busy || defaultGroup === '0'" class="mt-1" /><span>有有效共享贡献的用户自动获得默认池资格，无需逐个授权</span></label>
-      <WButton :disabled="busy || !loaded" @click="saveDefault">保存默认池规则</WButton>
-    </section>
-    <section class="glass rounded-xl p-5 space-y-3">
-      <h2 class="font-semibold">账号使用范围 <span class="text-micro font-normal text-faint">{{ data.accounts?.length || 0 }} 个账号</span></h2>
-      <p class="text-small text-faint">平台账号可以私人、共享或同时使用。用户上传账号始终归原用户所有，共享状态由本人决定；此处不会转移归属或重新启用停用账号。</p>
-      <p v-if="!data.accounts?.length" class="text-small text-faint">暂无可管理账号，请先在账号管理页添加。</p>
-      <article v-for="a in data.accounts" :key="a.uid" class="border-t border-line py-2">
-        <div class="flex flex-wrap items-center gap-x-3 gap-y-1 text-small">
-          <strong class="min-w-0 break-all" :title="a.uid">{{ accountLabel(a) }}</strong>
-          <span class="text-micro text-faint">{{ a.provider }} · {{ a.enabled ? '启用' : '停用' }} · {{ a.owner_kind === 'user' ? username(a.contribution_user_id || 0) + ' 所有' : '平台所有' }}</span>
-          <span class="text-micro text-muted">{{ scopeLabel(a) }}</span>
-          <WButton v-if="a.owner_kind !== 'user' && ['workbuddy','trae'].includes(a.provider)" size="sm" class="ml-auto" :disabled="busy" :aria-expanded="editingAccountUID === a.uid" @click="editSharing(a)">{{ editingAccountUID === a.uid ? '收起' : '修改范围' }}</WButton>
-        </div>
-        <div v-if="editingAccountUID === a.uid && a.owner_kind !== 'user' && ['workbuddy','trae'].includes(a.provider) && sharingDrafts[a.uid]" class="mt-3 space-y-3 rounded-lg border border-line p-3">
-          <select v-model="sharingDrafts[a.uid].mode" :disabled="busy" class="w-full rounded-lg border border-line bg-bg p-2 text-small"><option value="private">仅管理员私人池</option><option value="shared">仅共享池</option><option value="both">私人池与共享池共用</option></select>
-          <div v-if="sharingDrafts[a.uid].mode !== 'private'" class="flex flex-wrap gap-3"><label v-for="g in data.groups.filter(g => g.provider === a.provider)" :key="g.id" class="flex items-center gap-2 text-small"><input type="checkbox" :checked="sharingDrafts[a.uid].groups.includes(g.id)" :disabled="busy" @change="togglePool(a, g.id, ($event.target as HTMLInputElement).checked)" />{{ g.name }}{{ g.enabled ? '' : '（未启用）' }}</label><span v-if="!data.groups.length" class="text-small text-warn">请先创建共享池。</span></div>
-          <WButton size="sm" :disabled="busy" @click="saveSharing(a)">预览并保存使用范围</WButton>
-        </div>
-      </article>
-    </section>
-    <div v-if="loaded && !adminsExist" class="glass rounded-xl p-5 space-y-3">
-      <h2 class="font-semibold">初始化超级管理员账号</h2><p class="text-small text-faint">通过私有入口的管理 Token 登录后设置密码；Token 保留用于恢复管理访问。</p>
-      <WInput v-model="bootstrapName" placeholder="管理员用户名" /><WInput v-model="bootstrapPass" type="password" placeholder="8–72 字节密码" /><WButton variant="primary" :loading="busy" @click="bootstrap">初始化</WButton>
-    </div>
-    <IdentityManager v-if="loaded" :users="data.users" :max-concurrency="data.user_concurrency_max || 4" :overrides="data.user_concurrency_overrides" @refresh="load" />
-    <section class="glass rounded-xl p-5 space-y-3">
-      <h2 class="font-semibold">邀请码</h2><div class="flex gap-2"><WInput v-model="inviteDays" placeholder="有效天数（1–365）" /><WButton :disabled="busy" @click="createInvite">生成邀请码</WButton></div>
+      <h2 class="font-semibold">邀请码</h2><InvitationForm :disabled="busy || loading || !loaded" @save="createInvite" />
       <label for="portal-public-url" class="block text-small text-muted">公网门户地址</label>
-      <div class="flex flex-wrap gap-2"><WInput id="portal-public-url" v-model="publicURL" placeholder="https://portal.example.com/" class="min-w-0 flex-1" /><WButton :disabled="busy" @click="savePublicURL">保存地址</WButton></div>
-      <p class="text-micro text-faint">邀请链接使用此地址；通过管理隧道访问时也不会复制出 localhost。每个邀请码只能使用一次。</p>
+      <div class="flex flex-wrap gap-2"><WInput id="portal-public-url" v-model="publicURL" placeholder="https://portal.example.com/" class="min-w-0 flex-1" /><WButton :disabled="busy || loading || !loaded" @click="savePublicURL">保存地址</WButton></div>
+      <p class="text-micro text-faint">邀请链接使用此地址，避免复制出管理员当前访问的本机地址。可配置使用次数与到期时间；不限次数、永不过期需要明确选择。</p>
       <p v-if="!data.invites.length" class="text-small text-faint">暂无邀请码。</p>
-      <div v-for="invite in data.invites" :key="invite.code" class="flex flex-wrap items-center gap-3 border-t border-line py-2 text-small"><code>{{ invite.code }}</code><span class="text-faint">{{ invite.used_by ? `已由 ${username(invite.used_by)} 使用` : !inviteAvailable(invite) ? '已过期' : '未使用' }} · {{ invite.expires_at ? fmtTime(invite.expires_at) : '长期有效' }}</span><WButton size="sm" :disabled="busy || !inviteAvailable(invite)" @click="copyInvite(invite)">复制邀请码</WButton><WButton size="sm" :disabled="busy || !inviteAvailable(invite) || !savedPublicURL || publicURL.trim() !== savedPublicURL" @click="copyInvite(invite, true)">复制邀请链接</WButton><WButton v-if="!invite.used_by" size="sm" variant="danger" :disabled="busy" @click="mutate(() => api.portalDelete(`invites/${encodeURIComponent(invite.code)}`), '邀请码已撤销')">撤销</WButton></div>
+      <div v-for="invite in data.invites" :key="invite.code" class="space-y-2 border-t border-line py-3 text-small">
+       <div class="flex flex-wrap items-center gap-3"><code>{{ invite.code }}</code><span :class="inviteAvailable(invite) ? 'text-live' : 'text-faint'">{{ inviteStatus(invite) }}</span><span class="text-faint">已用 {{ invite.used_count }} / {{ invite.max_uses || '不限' }} 次<span v-if="invite.max_uses"> · 剩余 {{ Math.max(0, invite.max_uses - invite.used_count) }} 次</span></span><span class="text-faint">{{ invite.expires_at ? '到期 ' + fmtTime(invite.expires_at) : '永不过期' }}</span></div>
+       <div class="flex flex-wrap gap-2"><WButton size="sm" :disabled="busy || loading || !inviteAvailable(invite)" @click="copyInvite(invite)">复制邀请码</WButton><WButton size="sm" :disabled="busy || loading || !inviteAvailable(invite) || !savedPublicURL || publicURL.trim() !== savedPublicURL" @click="copyInvite(invite, true)">复制邀请链接</WButton><WButton size="sm" :disabled="busy || loading" @click="editInvite(invite)">编辑与使用记录</WButton><WButton size="sm" :variant="invite.enabled ? 'danger' : 'subtle'" :disabled="busy || loading" @click="toggleInvite(invite)">{{ invite.enabled ? '停用' : '启用' }}</WButton></div>
+      </div>
     </section>
-    <section class="glass rounded-xl p-5 space-y-3">
-      <h2 class="font-semibold">共享池分组</h2>
-      <p class="text-small text-muted">一个分组是一套共享池权限：用哪些贡献账号、允许哪些模型、授权给哪些用户。例如「基础组」可以让指定用户通过池内账号调用两种基础模型。</p>
-      <p class="text-small text-faint">默认池可以自动授权有效贡献者；自定义池用于指定账号、模型和用户。私人平台账号请先在「账号使用范围」转为共享或共用，再加入池。本人账号使用权不依赖分组。</p>
-      <div class="flex flex-wrap gap-2"><select v-model="newGroupProvider" class="rounded-lg border border-line bg-bg px-2 text-small"><option value="workbuddy">WorkBuddy</option><option value="trae">Trae</option></select><WInput v-model="newGroup" placeholder="分组名称" /><WButton :disabled="busy || !newGroup.trim()" @click="mutate(async () => { await api.portalWrite('groups', { name: newGroup.trim(), provider:newGroupProvider }); newGroup = '' }, '分组已创建')">创建分组</WButton></div>
-      <p v-if="!data.groups.length" class="text-small text-faint">请先创建共享池，再勾选并保存允许的模型。模型目录不依赖池内账号；没有账号的池暂时无法提供调用。</p>
-      <WInput v-else v-model="groupModelSearch" placeholder="搜索共享池模型名称或 ID，例如 deepseek" />
-      <article v-for="g in data.groups" :key="g.id" class="rounded-lg border border-line p-4 space-y-3">
-        <div class="flex flex-wrap items-center gap-3"><h3 class="font-semibold">{{ g.name }}</h3><span class="text-micro text-faint">{{ g.provider }} · {{ g.enabled ? '启用' : '停用' }}</span><WButton size="sm" :disabled="busy" @click="mutate(() => api.portalWrite(`groups/${g.id}/enable`, { enabled: !g.enabled }), '分组状态已更新')">{{ g.enabled ? '停用' : '启用' }}</WButton><WButton size="sm" variant="danger" :disabled="busy" @click="removeGroup(g)">删除</WButton></div>
-        <p class="text-small">这个共享池允许的模型 <span class="text-micro text-faint">匹配 {{ pickerModels(g).length }} 项 · 已选 {{ groupDrafts[g.id]?.length || 0 }} 项（含搜索隐藏项）</span></p>
-        <div class="flex flex-wrap gap-2"><WButton size="sm" :disabled="busy || !pickerModels(g).length" @click="selectVisibleModels(g)">选中当前结果</WButton><WButton size="sm" :disabled="busy" @click="groupDrafts[g.id] = []">清空范围</WButton></div>
-        <p class="text-micro text-faint">未选模型时，本组拒绝全部调用。选择并保存后才授权；选中当前结果仅包含当前目录，不会自动放行未来新增模型。本人账号仍按本人权限和 Key 范围调用。</p>
-        <div class="flex max-h-64 flex-wrap gap-3 overflow-y-auto"><label v-for="model in pickerModels(g)" :key="model" class="flex items-center gap-1 text-micro"><input type="checkbox" :checked="groupDrafts[g.id]?.includes(model)" :disabled="busy" @change="setModel(g, model, ($event.target as HTMLInputElement).checked)" /><span class="break-all" :title="modelNames[model] || model">{{ model }}</span></label></div>
-        <p v-if="!pickerModels(g).length" class="text-small text-faint">{{ groupModelSearch.trim() ? '没有匹配模型，请调整搜索词。' : '目录暂无可选模型，请在模型管理页刷新目录后重新加载。' }}</p>
-        <WButton size="sm" :disabled="busy" @click="mutate(() => api.portalWrite(`groups/${g.id}/models`, { allowed_models: groupDrafts[g.id] || [] }), '模型范围已保存')">保存模型范围</WButton>
-        <p class="text-small">共享账号</p><div v-for="uid in accountsOf(g)" :key="uid" class="flex flex-wrap items-center gap-2 text-micro"><span :title="uid">{{ accountLabelByUID(uid) }}</span><WButton size="sm" :disabled="busy" @click="mutate(() => api.portalWrite(`groups/${g.id}/accounts`, { action: 'remove', account_uid: uid }), '账号已移出')">移出</WButton></div>
-        <div class="flex gap-2"><select v-model="accountDrafts[g.id]" class="min-w-0 flex-1 rounded-lg border border-line bg-bg px-2 text-small"><option value="">选择可共享账号</option><option v-for="a in sharedAccounts.filter(a => a.provider === g.provider && !accountsOf(g).includes(a.uid))" :key="a.uid" :value="a.uid">{{ accountLabel(a) }}</option></select><WButton size="sm" :disabled="busy || !accountDrafts[g.id]" @click="mutate(() => api.portalWrite(`groups/${g.id}/accounts`, { action: 'add', account_uid: accountDrafts[g.id] }), '账号已加入')">加入</WButton></div>
-        <p class="text-micro text-faint">当前就绪账号 {{ g.ready_accounts || 0 }} · 可用授权模型 {{ g.usable_models || 0 }} · 实际具备共享资格用户 {{ g.eligible_users || 0 }}{{ !g.enabled ? ' · 池未启用' : !g.usable_models ? ' · 请配置模型并检查账号状态或刷新目录' : '' }}</p>
-        <p class="text-small">获授权用户</p><div v-for="id in grantsOf(g)" :key="id" class="flex items-center gap-2 text-small"><span>{{ username(id) }}</span><WButton size="sm" :disabled="busy" @click="mutate(() => api.portalWrite(`groups/${g.id}/grants`, { action: 'revoke', user_id: id }), '授权已撤销')">撤销授权</WButton></div>
-        <div class="flex gap-2"><select v-model="userDrafts[g.id]" class="min-w-0 flex-1 rounded-lg border border-line bg-bg px-2 text-small"><option value="">选择用户</option><option v-for="u in data.users.filter(u => u.status === 'active' && !grantsOf(g).includes(u.id))" :key="u.id" :value="String(u.id)">{{ u.username }}</option></select><WButton size="sm" :disabled="busy || !userDrafts[g.id]" @click="mutate(() => api.portalWrite(`groups/${g.id}/grants`, { action: 'grant', user_id: Number(userDrafts[g.id]) }), '授权已授予')">授权</WButton></div>
-      </article>
-    </section>
-    <section class="glass rounded-xl p-5 space-y-3"><h2 class="font-semibold">全局禁用用户模型</h2><p class="text-small text-faint">勾选即禁用，保存后对用户本人账号、共享池及存量用户 Key 生效；管理员历史私人 Key 不受影响。暂时退出目录的禁用项也会保留。</p><WInput v-model="disabledModelSearch" placeholder="搜索模型名称或 ID" /><WButton size="sm" :disabled="busy || !disabledOptions.length" @click="disableVisibleModels">勾选禁用当前结果</WButton><div class="flex flex-wrap gap-3"><label v-for="model in disabledOptions" :key="model" class="flex items-center gap-2 rounded-lg border border-line p-2 text-micro"><input type="checkbox" :checked="disabledModels.includes(model)" :disabled="busy" @change="toggleDisabled(model, ($event.target as HTMLInputElement).checked)" /><span class="break-all">{{ modelNames[model] || model }} · {{ model }}{{ models.includes(model) ? '' : '（当前不在目录）' }}</span></label></div><p v-if="!disabledOptions.length" class="text-small text-faint">暂无匹配模型。可在模型管理页刷新上游目录。</p><WButton :disabled="busy || !loaded" @click="saveDisabled">保存禁用模型（{{ disabledModels.length }} 项）</WButton></section>
-    <section class="glass rounded-xl p-5 space-y-3"><h2 class="font-semibold">贡献状态</h2><p v-if="!data.contributions?.length" class="text-small text-faint">暂无贡献。</p><div v-for="c in data.contributions" :key="c.id" class="flex flex-wrap gap-3 border-t border-line py-2 text-small"><span>{{ username(c.user_id) }}</span><span :title="c.account_uid">{{ accountLabelByUID(c.account_uid) }}</span><span class="text-faint">{{ c.status }}</span></div></section>
-  </div>
+
+  <section class="glass rounded-xl p-5 space-y-3"><h2 class="font-semibold">贡献账号</h2><p class="text-small text-faint">账号统一显示在账号管理页，用户 Key 统一显示在 API 密钥页。撤回贡献不影响默认模型权限。</p><p v-if="!data.contributions?.length" class="text-small text-faint">暂无贡献。</p><div v-for="c in data.contributions" :key="c.id" class="flex flex-wrap gap-3 border-t border-line py-2 text-small"><span>{{ username(c.user_id) }}</span><code class="break-all">{{ c.account_uid }}</code><span class="text-faint">{{ c.status === 'active' ? '已贡献' : c.status === 'private' ? '仅本人使用' : c.status }}</span></div></section>
+  <WModal v-model:open="inviteModal" :title="'邀请码 ' + (editingInvite?.code || '')" :dismissible="!busy" size="lg">
+   <div v-if="editingInvite" class="space-y-5"><p v-if="error" role="alert" class="text-small text-fault">{{ error }}</p><InvitationForm :key="editingInvite.code + ':' + editingInvite.revision" :initial="editingInvite" :disabled="busy" @save="saveInvite" />
+    <section class="space-y-2 border-t border-line pt-4"><h3 class="font-semibold">使用记录</h3><p class="text-micro text-faint">注册成功才消耗次数，停用或到期不会影响已有用户。</p><p v-if="historyError" role="alert" class="text-small text-fault">{{ historyError }} <button class="text-brand" @click="inviteHistory()">重试</button></p><p v-if="historyLoading" class="text-small text-faint">读取中…</p><p v-else-if="!historyError && !history.length" class="text-small text-faint">暂无使用记录。</p><div v-for="record in history" :key="record.user_id" class="flex flex-wrap justify-between gap-2 text-small"><span>{{ record.username || '用户 ' + record.user_id }}</span><span class="text-faint">{{ fmtTime(record.used_at) }}</span></div><WButton v-if="historyOffset >= 0" size="sm" :disabled="historyLoading" @click="inviteHistory(true)">加载更多</WButton></section>
+   </div>
+  </WModal>
+ </div>
 </template>

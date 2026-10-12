@@ -803,6 +803,7 @@ async function saveConfig() {
           <template #cell-account="{ row }">
             <div class="w-44">
               <div class="truncate font-medium text-ink" :title="label(row)">{{ label(row) }}</div>
+			  <div v-if="row.raw.owner_username" class="mt-1 truncate text-micro text-muted" :title="'归属用户：' + row.raw.owner_username">{{ row.raw.owner_username }} · {{ row.raw.contribution_status === 'active' ? '已贡献' : row.raw.contribution_status === 'private' ? '仅本人' : '待验证' }}</div>
               <div v-if="row.provider === 'trae'" class="mt-1 whitespace-nowrap text-micro text-faint">{{ (row.raw.products || [row.raw.product]).map((p: string) => p === 'solo' ? 'Work/SOLO' : 'IDE').join(' / ') }}</div>
               <div class="mt-1 flex items-center gap-2 whitespace-nowrap text-micro text-faint"><span class="mono truncate" :title="row.id">{{ row.id.length > 14 ? row.id.slice(0, 12) + '…' : row.id }}</span><span v-if="row.raw.source" class="shrink-0">{{ ({local:'桌面',project:'导入',native:'网关'} as Record<string,string>)[row.raw.source] || row.raw.source }}</span></div>
             </div>

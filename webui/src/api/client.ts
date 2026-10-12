@@ -88,7 +88,19 @@ export function setUserToken(token: string) {
   else localStorage.removeItem('workbuddy_user_token')
 }
 
+export interface ModelRoute { id: number; model: string; name: string; enabled: boolean; members: string[]; revision: number }
+export interface RouteMember { id: string; name?: string; provider: string; vision?: boolean; context_length?: number; max_output_tokens?: number }
+
 export const api = {
+ updateStatus: () => http.get<unknown, import('@/types').UpdateStatus>('/admin/update'),
+ updateCheck: () => http.post<unknown, import('@/types').UpdateStatus>('/admin/update/check'),
+ updateDownload: () => http.post('/admin/update/download'),
+ updateInstall: (allow_migration: boolean, expected_digest: string) => http.post('/admin/update/install', {allow_migration,expected_digest}),
+ updatePolicy: (policy: import('@/types').UpdatePolicy) => http.post('/admin/update/policy',policy),
+ modelRoutes: () => http.get<unknown, { routes: ModelRoute[]; models: RouteMember[] }>('/admin/model-routes'),
+ saveModelRoute: (route: ModelRoute) => http.post<unknown, { ok: boolean }>('/admin/model-routes', route),
+ deleteModelRoute: (route: ModelRoute) => http.delete(`/admin/model-routes/${route.id}?revision=${route.revision}`),
+  portalInviteHistory: (code: string, offset = 0) => http.get<unknown, {records: import('./portal').InviteRedemption[]; next_offset: number}>(`/admin/portal/invites/${encodeURIComponent(code)}/history`, {params:{offset}}),
   portalOverview: () => http.get<unknown, import('./portal').PortalOverview>('/admin/portal/overview'),
   adminIdentity: () => http.get<unknown, { identity: import('./portal').AdminIdentity; owner_exists: boolean }>('/admin/identity'),
   adminReauth: (body: { password?: string; token?: string }) => http.post('/admin/identity/reauth', body),
@@ -130,7 +142,7 @@ export const api = {
     ),
   // 服务端分页：page/page_size + 筛选条件，返回 records + total（总数驱动分页器）
   usageRecent: (page = 1, pageSize = 20, filters: { protocol?: string; model?: string; app_name?: string; status?: string; search?: string } = {}) => {
-    const p = new URLSearchParams({ page: String(page), page_size: String(pageSize), light: '1' })
+    const p = new URLSearchParams({ page: String(page), page_size: String(pageSize), light: '1', group: 'request' })
     if (filters.protocol) p.set('protocol', filters.protocol)
     if (filters.model) p.set('model', filters.model)
     // app_name 允许空字符串（筛"未记录应用"的旧记录），用 != null 判断而非真值
@@ -246,9 +258,9 @@ export const api = {
   appKey: (id: number) =>
     http.get<unknown, { ok: boolean; key: string | null; unavailable?: boolean; message?: string }>(`/admin/apps/${id}/key`),
   toggleApp: (id: number) => http.post<unknown, { ok: boolean; enabled: boolean }>(`/admin/apps/${id}/toggle`),
-  setAppModels: (id: number, allowedModels: string[] | null) =>
+  setAppModels: (id: number, allowedModels: string[] | null, model_policy: "follow" | "fixed" = "fixed") =>
     http.post<unknown, { ok: boolean; allowed_models: string[]; warnings: string[] }>(
-      `/admin/apps/${id}/models`, { allowed_models: allowedModels }),
+      `/admin/apps/${id}/models`, { allowed_models: allowedModels,model_policy }),
   deleteApp: (id: number) => http.delete<unknown, { ok: boolean }>(`/admin/apps/${id}`),
 
   // ---------- 管理员登录（HttpOnly 会话 cookie） ----------

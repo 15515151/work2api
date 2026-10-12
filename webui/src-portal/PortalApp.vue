@@ -78,7 +78,8 @@ async function submit() {
   error.value = ''
   try {
     if (showLogin.value) {
-      await api.login(username.value.trim(), password.value)
+      const result = await api.login(username.value.trim(), password.value)
+      if (result.redirect_to === "/admin-ui/") { window.location.assign(result.redirect_to); return }
     } else {
       await api.register(username.value.trim(), password.value, invite.value.trim())
     }
@@ -149,10 +150,10 @@ onUnmounted(() => { disposed = true; window.removeEventListener('focus', refresh
         <h1 class="mb-1 text-base font-semibold text-ink">{{ showLogin ? '登录' : '注册' }}</h1>
         <p class="mb-5 text-micro text-faint">
           {{ showLogin
-            ? '使用门户账号登录，管理你的 API 密钥与用量。'
+            ? '登录后根据账号身份进入管理台或用户门户。'
             : mode === 'invite'
-              ? '注册需要管理员发放的邀请码，每个邀请码只能使用一次。'
-              : '当前开放注册，注册后需贡献账号并获得资格才能调用。' }}
+              ? '注册需要有效邀请码，可用次数与有效期由管理员设置。'
+              : '当前开放注册，注册后可创建 Key 使用默认开放模型，账号贡献可选。' }}
         </p>
 
         <label class="mb-1.5 block text-small text-muted">用户名</label>

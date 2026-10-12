@@ -10,6 +10,7 @@ import WCard from '@/components/ui/WCard.vue'
 import WTable, { type Column } from '@/components/ui/WTable.vue'
 import WButton from '@/components/ui/WButton.vue'
 import WInput from '@/components/ui/WInput.vue'
+import ModelSelectionActions from '@/components/ModelSelectionActions.vue'
 import WModal from '@/components/ui/WModal.vue'
 import WTag from '@/components/ui/WTag.vue'
 import WToggle from '@/components/ui/WToggle.vue'
@@ -23,6 +24,7 @@ const loading = ref(true)
 const cols: Column[] = [
   { key: 'id', label: 'ID', mono: true, nowrap: true },
   { key: 'name', label: '名称' },
+  { key: 'username', label: '归属', nowrap: true },
   { key: 'key_prefix', label: '密钥', mono: true, nowrap: true },
   { key: 'allowed_models', label: '可用模型' },
   { key: 'requests', nowrap: true, label: '请求数', align: 'right', mono: true },
@@ -98,6 +100,7 @@ async function remove(app: any) {
 // 越权请求在网关入口直接 403。别名条目按其原样保存（网关按别名/实名双重匹配）。
 const modelsOpen = ref(false)
 const modelsTarget = ref<AppInfo | null>(null)
+const modelPolicy = ref<"follow" | "fixed">("fixed")
 const selected = ref<Set<string>>(new Set())
 const modelSearch = ref('')
 const savingModels = ref(false)
@@ -118,6 +121,7 @@ const filteredModels = computed(() => {
 
 async function openModels(app: any) {
   modelsTarget.value = app
+  modelPolicy.value = app.model_policy || "fixed"
   selected.value = new Set(app.allowed_models || [])
   unrestricted.value = !app.user_id && selected.value.size === 0
   modelSearch.value = ''
@@ -146,9 +150,9 @@ async function saveModels() {
   try {
     // 仅明确开启「不限制」时发送 null，空选择不能隐式解除限制。
     const list = unrestricted.value ? [] : [...selected.value].sort()
-    const res = await api.setAppModels(target.id, target.user_id ? list : list.length ? list : null)
+    const res = await api.setAppModels(target.id, target.user_id ? list : list.length ? list : null, target.user_id ? modelPolicy.value : "fixed")
     if (res.warnings?.length) toast.info(res.warnings[0])
-    toast.success(list.length ? `已限定 ${list.length} 个模型` : target.user_id ? '该用户 Key 已拒绝全部模型' : '已恢复不限制')
+    toast.success(target.user_id && modelPolicy.value === 'follow' ? '已跟随当前用户权限' : list.length ? `已限定 ${list.length} 个模型` : target.user_id ? '该用户 Key 已拒绝全部模型' : '已恢复不限制')
     modelsOpen.value = false
     await load()
   } finally {
@@ -158,6 +162,7 @@ async function saveModels() {
 
 function modelCell(app: any) {
   const list = app.allowed_models || []
+  if (app.user_id && app.model_policy === "follow") return "跟随当前用户权限"
   if (!list.length) return app.user_id > 0 ? '拒绝全部模型' : '全部模型'
   if (list.length <= 3) return list.join('、')
   return `${list[0]}、${list[1]} 等 ${list.length} 个`
@@ -183,6 +188,7 @@ onMounted(load)
         <template #cell-key_prefix="{ value }">
           <span class="text-muted">{{ value }}…</span>
         </template>
+        <template #cell-username="{ row }"><span class="text-small">{{ row.username || '管理员' }}</span></template>
         <template #cell-allowed_models="{ row }">
           <button
             type="button"
@@ -257,9 +263,12 @@ onMounted(load)
     <WModal v-model:open="modelsOpen" title="可用模型">
       <p class="mb-3 text-small text-muted">
         为「{{ modelsTarget?.name }}」限定可调用的模型；白名单外的请求会被网关拒绝（403）。
-        <span class="text-faint">{{ modelsTarget?.user_id ? '用户 Key 空选择拒绝全部模型，并始终受共享资格限制。' : '仅开启「不限制模型」才允许全部模型。' }}</span>
+        <span class="text-faint">{{ modelsTarget?.user_id ? '用户 Key 空选择拒绝全部模型，并始终受当前用户权限限制。' : '仅开启「不限制模型」才允许全部模型。' }}</span>
       </p>
+      <label v-if="modelsTarget?.user_id" class="mb-3 flex items-center gap-2 text-small">权限模式<select v-model="modelPolicy" class="rounded-lg border border-line bg-bg p-2"><option value="follow">跟随当前用户权限</option><option value="fixed">固定模型范围</option></select></label>
       <label v-if="!modelsTarget?.user_id" class="mb-3 flex items-center gap-2 text-small"><WToggle v-model="unrestricted" /> 不限制模型</label>
+      <p v-if="modelsTarget?.user_id && modelPolicy === 'follow'" class="mb-3 text-small text-muted">调用范围随默认开放规则、本人账号和额外授权更新；管理员禁用即时生效。</p>
+      <template v-else>
       <WInput v-model="modelSearch" placeholder="搜索模型…" class="mb-2.5" />
       <div class="max-h-72 space-y-1 overflow-y-auto rounded-lg border border-line p-2">
         <WSpinner v-if="loadingModels" center label="加载模型目录" />
@@ -282,10 +291,8 @@ onMounted(load)
           没有匹配「{{ modelSearch }}」的模型
         </p>
       </div>
-      <div class="mt-2 flex items-center justify-between text-micro text-faint">
-        <span>已选 {{ selected.size }} 个</span>
-        <button class="transition-colors hover:text-brand" @click="selected = new Set(); unrestricted = false">清空选择</button>
-      </div>
+<ModelSelectionActions class="mt-3" :selected="[...selected]" :results="filteredModels.map(m => m.id)" :selectable="allModels.map(m => m.id)" :disabled="loadingModels || savingModels" @update:selected="selected = new Set($event); unrestricted = false" />
+      </template>
       <template #footer>
         <WButton variant="subtle" @click="modelsOpen = false">取消</WButton>
         <WButton variant="primary" :loading="savingModels" @click="saveModels">保存</WButton>

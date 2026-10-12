@@ -221,8 +221,8 @@ func TestPlatformSharingConversionAndDefaultQualification(t *testing.T) {
 		t.Fatal(err)
 	}
 	excluded, _ = db.PrivatePoolExcludedUIDs()
-	if !excluded["platform"] {
-		t.Fatal("shared-only entered private pool")
+	if excluded["platform"] {
+		t.Fatal("legacy group mode excluded public platform account")
 	}
 	if err := db.SetPlatformAccountSharing("platform", "private", nil); err != nil {
 		t.Fatal(err)
@@ -933,5 +933,210 @@ func TestAtomicInvitedRegistration(t *testing.T) {
 	invite, err = db.FindInviteCode("FRESH")
 	if err != nil || invite == nil || invite["used_by"] != nil {
 		t.Fatalf("duplicate consumed invite=%+v %v", invite, err)
+	}
+}
+
+func TestPortalV21MigrationPreservesExactLegacyScopes(t *testing.T) {
+	db := mustDB(t)
+	user, _ := db.CreateUser("legacy-user", "hash", "user")
+	other, _ := db.CreateUser("no-contribution-user", "hash", "user")
+	if _, e := db.CreateContribution(user, "account-one", "workbuddy", "cn", "active"); e != nil {
+		t.Fatal(e)
+	}
+	group, _ := db.CreateResourceGroup("legacy-paid", "workbuddy", `["paid-model"]`)
+	db.SetGroupEnabled(group, true)
+	db.AddGroupAccount(group, "account-one")
+	db.GrantGroup(user, group)
+	db.GrantGroup(other, group)
+	app, _ := db.CreateApp("legacy-key", "hash-key", "", "", "", `["paid-model"]`, user)
+	tx, e := db.db.Begin()
+	if e != nil {
+		t.Fatal(e)
+	}
+	if e = migratePortalAccess(tx, 20); e != nil {
+		tx.Rollback()
+		t.Fatal(e)
+	}
+	if e = tx.Commit(); e != nil {
+		t.Fatal(e)
+	}
+	grants, e := db.UserModelGrants(user)
+	if e != nil || len(grants) != 1 || grants[0].Model != "paid-model" || len(grants[0].AccountUIDs) != 1 || grants[0].AccountUIDs[0] != "account-one" {
+		t.Fatal("legacy scope widened or lost", grants, e)
+	}
+	if g, _ := db.UserModelGrants(other); len(g) != 0 {
+		t.Fatal("migration invented contribution rights", g)
+	}
+	row, e := db.UserAppOwned(app, user)
+	if e != nil || row["model_policy"] != "fixed" {
+		t.Fatal("legacy key no longer fixed", row, e)
+	}
+	if e = db.SetUserPublicModels(user, []string{"other-model"}, nil); e != nil {
+		t.Fatal(e)
+	}
+	grants, _ = db.UserModelGrants(user)
+	if len(grants) != 2 {
+		t.Fatal("saving new grants lost legacy scope", grants)
+	}
+	if e = db.SetUserPublicModels(user, nil, []string{"paid-model"}); e != nil {
+		t.Fatal(e)
+	}
+	if grants, _ = db.UserModelGrants(user); len(grants) != 0 {
+		t.Fatal("explicit grant removal failed", grants)
+	}
+}
+
+func TestFourChannelWithdrawalRetainsOnlyOwnerRights(t *testing.T) {
+	db := mustDB(t)
+	user, _ := db.CreateUser("four-channel-owner", "hash", "user")
+	for _, name := range []string{"workbuddy", "trae", "qoder", "opencode"} {
+		uid := name + ":credential"
+		id, e := db.CreateContribution(user, uid, name, "cn", "verifying")
+		if e != nil {
+			t.Fatal(e)
+		}
+		if e = db.ActivateContribution(id, user); e != nil {
+			t.Fatal(e)
+		}
+		if c, e := db.UserContributions(user); e != nil || len(c) == 0 {
+			t.Fatal("active contributions cannot be read", e)
+		}
+		if ok, e := db.WithdrawContribution(id, user, "user"); e != nil || !ok {
+			t.Fatal(e)
+		}
+		owned, e := db.OwnedAccountUIDs(user)
+		if e != nil || !owned[uid] {
+			t.Fatal("withdrawal lost owner rights", name, e)
+		}
+		excluded, e := db.PrivatePoolExcludedUIDs()
+		if e != nil || !excluded[uid] {
+			t.Fatal("withdrawal still public", name, e)
+		}
+	}
+}
+
+func TestMultiUseInviteRegistrationAndManagement(t *testing.T) {
+	db := mustDB(t)
+	if e := db.CreateInviteCode("MULTI", 0, 3); e != nil {
+		t.Fatal(e)
+	}
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	wins := 0
+	for i := 0; i < 24; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, e := db.CreateInvitedUser(fmt.Sprintf("multi-%d", i), "hash", "MULTI")
+			if e == nil {
+				mu.Lock()
+				wins++
+				mu.Unlock()
+			} else if !errors.Is(e, ErrInvalidInvite) {
+				t.Error(e)
+			}
+		}(i)
+	}
+	wg.Wait()
+	if wins != 3 {
+		t.Fatal("quota overspent", wins)
+	}
+	item, e := db.FindInviteCode("MULTI")
+	if e != nil || item["used_count"] != int64(3) {
+		t.Fatal(item, e)
+	}
+	records, e := db.InviteRedemptions("MULTI")
+	if e != nil || len(records) != 3 {
+		t.Fatal(records, e)
+	}
+	if e = db.UpdateInviteCode("MULTI", 2, 0, true, 1); !errors.Is(e, ErrConflict) {
+		t.Fatal("lower than used allowed", e)
+	}
+	if e = db.UpdateInviteCode("MULTI", 5, 0, false, 1); e != nil {
+		t.Fatal(e)
+	}
+	if _, e = db.CreateInvitedUser("disabled-invite-user", "hash", "MULTI"); !errors.Is(e, ErrInvalidInvite) {
+		t.Fatal("disabled invite accepted", e)
+	}
+	if e = db.UpdateInviteCode("MULTI", 5, 0, true, 1); !errors.Is(e, ErrConflict) {
+		t.Fatal("stale edit accepted", e)
+	}
+	if e = db.UpdateInviteCode("MULTI", 5, 0, true, 2); e != nil {
+		t.Fatal(e)
+	}
+	if _, e = db.CreateInvitedUser("enabled-invite-user", "hash", "MULTI"); e != nil {
+		t.Fatal(e)
+	}
+	if _, e = db.CreateInvitedUser("enabled-invite-user", "hash", "MULTI"); !errors.Is(e, ErrConflict) {
+		t.Fatal(e)
+	}
+	item, _ = db.FindInviteCode("MULTI")
+	if item["used_count"] != int64(4) {
+		t.Fatal("failed registration consumed slot", item)
+	}
+	if ok, e := db.RevokeInviteCode("MULTI"); e != nil || !ok {
+		t.Fatal(e)
+	}
+	records, _ = db.InviteRedemptions("MULTI")
+	if len(records) != 4 {
+		t.Fatal("disabled invitation lost history")
+	}
+	if e = db.CreateInviteCode("UNLIMITED", 0, 0); e != nil {
+		t.Fatal(e)
+	}
+	for i := 0; i < 7; i++ {
+		if _, e = db.CreateInvitedUser(fmt.Sprintf("unlimited-%d", i), "hash", "UNLIMITED"); e != nil {
+			t.Fatal(e)
+		}
+	}
+	item, _ = db.FindInviteCode("UNLIMITED")
+	if item["used_count"] != int64(7) || item["max_uses"] != int64(0) {
+		t.Fatal(item)
+	}
+}
+
+func TestInviteV22MigrationPreservesLegacyUsage(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "invites.db")
+	db, e := New(path)
+	if e != nil {
+		t.Fatal(e)
+	}
+	user, _ := db.CreateUser("legacy-invited-user", "hash", "user")
+	db.CreateInviteCode("USED", 0)
+	db.CreateInviteCode("UNUSED", 0)
+	if ok, e := db.ConsumeInviteCode("USED", user); e != nil || !ok {
+		t.Fatal(e)
+	}
+	if _, e = db.db.Exec("DELETE FROM invite_redemptions"); e != nil {
+		t.Fatal(e)
+	}
+	for _, column := range []string{"max_uses", "used_count", "enabled", "revision"} {
+		if _, e = db.db.Exec("ALTER TABLE invite_codes DROP COLUMN " + column); e != nil {
+			t.Fatal(e)
+		}
+	}
+	if _, e = db.db.Exec("PRAGMA user_version=21"); e != nil {
+		t.Fatal(e)
+	}
+	db.Close()
+	db, e = New(path)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer db.Close()
+	used, _ := db.FindInviteCode("USED")
+	unused, _ := db.FindInviteCode("UNUSED")
+	if used["max_uses"] != int64(1) || used["used_count"] != int64(1) || unused["max_uses"] != int64(1) || unused["used_count"] != int64(0) {
+		t.Fatal("legacy invitations widened", used, unused)
+	}
+	records, e := db.InviteRedemptions("USED")
+	if e != nil || len(records) != 1 || records[0]["username"] != "legacy-invited-user" {
+		t.Fatal(records, e)
+	}
+	if _, e = db.CreateInvitedUser("used-again", "hash", "USED"); !errors.Is(e, ErrInvalidInvite) {
+		t.Fatal("used invitation reopened", e)
+	}
+	if _, e = db.CreateInvitedUser("unused-now-used", "hash", "UNUSED"); e != nil {
+		t.Fatal(e)
 	}
 }

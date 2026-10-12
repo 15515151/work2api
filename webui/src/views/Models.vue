@@ -49,7 +49,7 @@ async function load() {
     if (version !== loadVersion) return
     if (wb.status === 'fulfilled') {
       source.value = wb.value.source || ''
-      next.set('workbuddy', (wb.value.models || []).map((model) => ({ provider: 'workbuddy', model })))
+      next.set('workbuddy', (wb.value.models || []).map((model) => ({ provider: 'workbuddy', model: { ...model, id: String(model.id).startsWith('workbuddy/') ? model.id : `workbuddy/${model.id}` } })))
     } else errors.workbuddy = '读取失败，保留上次成功目录'
     if (providers.status === 'fulfilled') {
       knownProviders.value = providers.value.providers || []
@@ -82,7 +82,7 @@ async function loadBenchmarks() {
     if (!res.configured) return
     const map = res.models || {}
     for (const e of entries.value) {
-      const b = map[e.model.id]
+      const b = map[e.model.id] || (e.provider === 'workbuddy' ? map[String(e.model.id).replace(/^workbuddy\//, '')] : undefined)
       if (b) e.model.benchmark = b
     }
   } catch {
@@ -174,6 +174,7 @@ onBeforeUnmount(() => { loadVersion++ })
 <template>
   <WPage title="模型" :sub="`统一模型目录 · 来源 ${source === 'dynamic' ? '上游实时' : source === 'static' ? '内置' : '—'}`">
     <template #actions>
+      <RouterLink to="/models/routes"><WButton>统一模型路由</WButton></RouterLink>
       <WButton v-if="aaConfigured" variant="ghost" :loading="refreshingAA" @click="refreshAA"><WIcon name="refresh" :size="15" /> 刷新评测</WButton>
       <WButton variant="ghost" :loading="refreshing" @click="refresh"><WIcon name="refresh" :size="15" /> {{ providerFilter ? '刷新该渠道' : '刷新目录' }}</WButton>
     </template>
