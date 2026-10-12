@@ -1804,3 +1804,257 @@ func TestCommonSessionObservationIsolationAndCompletion(t *testing.T) {
 		end(provider.UsageReport{})
 	}
 }
+
+type routeProtocolProbe struct {
+	registryProbe
+	status  int
+	partial bool
+	calls   int
+}
+
+func (*routeProtocolProbe) Ready() bool { return true }
+func (p *routeProtocolProbe) Models(context.Context) []provider.CatalogModel {
+	return []provider.CatalogModel{{ID: p.prefix + "model", Name: "Fixture"}}
+}
+func (p *routeProtocolProbe) Serve(ctx context.Context, req provider.ServeRequest) (provider.UsageReport, error) {
+	p.calls++
+	if err := provider.CheckDispatch(ctx, provider.AccountRef{Provider: p.name, LocalID: "fixture"}, p.prefix+"model"); err != nil {
+		return provider.UsageReport{}, err
+	}
+	if p.status >= 400 {
+		writeJSON(req.Writer, p.status, map[string]any{"error": map[string]any{"message": "fixture failure"}})
+		return provider.UsageReport{Status: "error"}, nil
+	}
+	req.Writer.Header().Set("Content-Type", "text/event-stream")
+	if req.Payload["stream"] == true {
+		_, err := io.WriteString(req.Writer, `data: {"model":"`+p.prefix+`model","choices":[{"delta":{"content":"hello"}}]}`+"\n\n")
+		if err != nil {
+			return provider.UsageReport{}, err
+		}
+	} else {
+		writeJSON(req.Writer, 200, map[string]any{"model": p.prefix + "model", "choices": []any{map[string]any{"message": map[string]any{"content": "hello"}}}})
+	}
+	if p.partial {
+		return provider.UsageReport{Status: "incomplete"}, errors.New("fixture partial stream")
+	}
+	return provider.UsageReport{Status: "ok"}, nil
+}
+func TestUnifiedRouteFallbackAndNoReplayAfterOutput(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		status  int
+		partial bool
+		second  int
+		code    int
+	}{
+		{"retry-before-response", 503, false, 1, 200}, {"request-rejection", 400, false, 0, 400}, {"partial-output", 0, true, 0, 200},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			o, _ := newDNSFailoverOrch(t, &failingUpstream{})
+			first := &routeProtocolProbe{registryProbe: registryProbe{name: "first", prefix: "first/"}, status: tc.status, partial: tc.partial}
+			second := &routeProtocolProbe{registryProbe: registryProbe{name: "second", prefix: "second/"}}
+			if err := o.runtimes.Register(first); err != nil {
+				t.Fatal(err)
+			}
+			if err := o.runtimes.Register(second); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := o.db.SaveModelRoute(store.ModelRoute{Model: "my-route", Name: "Mine", Enabled: true, Members: []string{"first/model", "second/model"}}); err != nil {
+				t.Fatal(err)
+			}
+			appID, err := o.db.CreateApp("route-caller", o.hashKey("route-fixture-key"), "", "", "", "", 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			s := NewServer(o)
+			r := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"my-route","stream":true,"messages":[{"role":"user","content":"hello"}]}`))
+			r.Header.Set("Authorization", "Bearer route-fixture-key")
+			r.Header.Set("X-Claude-Code-Session-Id", "fixture-session")
+			r = r.WithContext(context.WithValue(r.Context(), principalContextKey{}, &Principal{AppID: appID, AppName: "route-caller"}))
+			w := httptest.NewRecorder()
+			s.handleChat(w, r)
+			if w.Code != tc.code || first.calls != 1 || second.calls != tc.second {
+				t.Fatal("routing decision", w.Code, w.Body.String(), first.calls, second.calls)
+			}
+			if tc.code == 200 && !strings.Contains(w.Body.String(), `"model":"my-route"`) {
+				t.Fatal("physical model exposed to client", w.Body.String())
+			}
+			if state := s.modelsAdmission.snapshot(); state["running"] != 0 || state["queued"] != 0 || state["buffer_reserved_bytes"] != int64(0) {
+				t.Fatal("lease leaked", state)
+			}
+			if tc.partial && len(o.routes.bindings) > 0 {
+				t.Fatal("failed stream created successful affinity")
+			}
+			if tc.second == 1 {
+				r2 := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"my-route","stream":true,"messages":[{"role":"user","content":"hello"}]}`))
+				r2.Header = r.Header.Clone()
+				r2 = r2.WithContext(context.WithValue(r2.Context(), principalContextKey{}, &Principal{AppID: appID, AppName: "route-caller"}))
+				w2 := httptest.NewRecorder()
+				s.handleChat(w2, r2)
+				if w2.Code != 200 || first.calls != 1 || second.calls != 2 {
+					t.Fatal("successful route did not remain sticky", w2.Code, first.calls, second.calls)
+				}
+			}
+		})
+	}
+}
+func TestRouteWriterSplitFramesAndOpaqueState(t *testing.T) {
+	for _, stream := range []bool{true, false} {
+		dst := httptest.NewRecorder()
+		writer := &routeWriter{dst: dst, header: make(http.Header), logical: "logical", stream: stream}
+		raw := `{"model":"physical","usage":{"count":9007199254740993}}`
+		if stream {
+			raw = "data: " + raw + "\n\ndata: [DONE]\n\n"
+		}
+		for _, part := range []string{raw[:8], raw[8:17], raw[17:]} {
+			if _, err := writer.Write([]byte(part)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		writer.finish()
+		if !strings.Contains(dst.Body.String(), `"model":"logical"`) || !strings.Contains(dst.Body.String(), "9007199254740993") {
+			t.Fatal("split response corrupted", dst.Body.String())
+		}
+	}
+	if !routeOpaqueContinuation(map[string]any{"input": []any{map[string]any{"type": "reasoning", "encrypted_content": "opaque"}}}) {
+		t.Fatal("encrypted continuation replayable")
+	}
+	if routeOpaqueContinuation(map[string]any{"previous_response_id": "", "input": "portable"}) {
+		t.Fatal("empty continuation forced sticky state")
+	}
+}
+
+func TestUnifiedRoutePortalEmptyAllowlistAndMemberScope(t *testing.T) {
+	o, _ := newDNSFailoverOrch(t, &failingUpstream{})
+	// Portal candidates must resolve to a runtime implementing
+	// provider.PortalProvider, so this fixture needs a real WorkBuddy catalog
+	// entry rather than a protocol probe.
+	o.wb.Catalog = models.NewWithCatalogClient(o.wb.Pool, o.db, &http.Client{Transport: catalogTransport{}})
+	o.wb.Catalog.Refresh() // Catalog transport returns fixture JSON without network access.
+	s := NewServer(o)
+	var member string
+	for id := range s.physicalCatalog() {
+		if strings.HasPrefix(id, "workbuddy/") && id != "workbuddy/auto" {
+			member = id
+			break
+		}
+	}
+	if member == "" {
+		t.Fatal("fixture needs WorkBuddy catalog")
+	}
+	route := store.ModelRoute{Model: "portal-unified", Name: "Portal", Enabled: true, Members: []string{member}}
+	id, err := o.db.SaveModelRoute(route)
+	if err != nil {
+		t.Fatal(err)
+	}
+	route.ID = id
+	app, err := o.db.CreateApp("portal-route-grant", "route-hash", "", "", "", `["portal-unified"]`, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	physical := o.resolveModel(member)
+	p := &Principal{AppID: app, UserID: 99, PortalModels: map[string]bool{physical: true}, ModelScopes: map[string]map[string]bool{physical: {"test-account": true}}}
+	if members, _ := s.routeCandidates(p, route, nil); len(members) != 0 {
+		t.Fatal("empty portal key gained logical route", members)
+	}
+	p.AllowedModels = []string{"portal-unified"}
+	if members, _ := s.routeCandidates(p, route, nil); len(members) != 1 {
+		t.Fatal("explicit logical permission failed", members)
+	}
+	// A member added after the key grant was frozen stays invisible until the
+	// key permissions are saved again. The extra member is fully portal-eligible
+	// so only the frozen grant can exclude it.
+	if s.physicalCatalog()["workbuddy/auto"] == nil {
+		t.Fatal("fixture needs the standard auto catalog entry")
+	}
+	p.PortalModels["auto"] = true
+	p.ModelScopes["auto"] = map[string]bool{"test-account": true}
+	saved, err := o.db.ModelRoutes()
+	if err != nil || len(saved) != 1 {
+		t.Fatal("fixture route missing", saved, err)
+	}
+	saved[0].Members = []string{member, "workbuddy/auto"}
+	if _, err := o.db.SaveModelRoute(saved[0]); err != nil {
+		t.Fatal(err)
+	}
+	if members, _ := s.routeCandidates(p, saved[0], nil); len(members) != 1 || members[0] != member {
+		t.Fatal("route edit widened a frozen key grant", members)
+	}
+	p.ModelScopes[physical] = map[string]bool{}
+	if members, _ := s.routeCandidates(p, saved[0], nil); len(members) != 0 {
+		t.Fatal("route widened an empty account scope", members)
+	}
+}
+
+func TestUnlimitedModelAdmissionRetainsAccountingWithoutLocalCaps(t *testing.T) {
+	a := newModelAdmission(&config.Config{ModelLimitsDisabled: true, MaxConcurrentRequests: 1, PortalSharedConcurrency: 1, ModelQueueSize: 1, ModelKeyQueueSize: 1, WorkBuddyAccountConcurrency: 1, ModelBufferBudgetBytes: 1})
+	leases := []*modelLease{}
+	for i := 0; i < 40; i++ {
+		l, err := a.acquireWithBudget(context.Background(), "portal-user-1", 1, "model", 1<<20)
+		if err != nil {
+			t.Fatal("retired cap blocked model", err)
+		}
+		ref, err := l.bindProviderAccount(context.Background(), func(busy map[string]bool) (*provider.AccountRef, *apiError) {
+			if len(busy) != 0 {
+				t.Fatal("account concurrency cap still applied")
+			}
+			return &provider.AccountRef{Provider: "workbuddy", LocalID: "same"}, nil
+		})
+		if err != nil || ref == nil {
+			t.Fatal(ref, err)
+		}
+		leases = append(leases, l)
+	}
+	if got := a.snapshot(); got["running"] != 40 || got["queued"] != 0 || got["limits_disabled"] != true {
+		t.Fatal(got)
+	}
+	for _, l := range leases {
+		l.release()
+		l.release()
+	}
+	if got := a.snapshot(); got["running"] != 0 || len(a.byAccount) != 0 {
+		t.Fatal("request accounting leaked", got)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := a.acquire(ctx, "k"); err == nil {
+		t.Fatal("cancellation ignored")
+	}
+}
+
+func TestOptionalJSONAndRawBodyBudgetsDefaultToNoExtraCap(t *testing.T) {
+	if !jsonWithinComplexity([]byte(strings.Repeat("[", 200)+strings.Repeat("]", 200)), 0, 0) {
+		t.Fatal("retired depth limit applied")
+	}
+	if jsonWithinComplexity([]byte(`[[[]]]`), 0, 2) {
+		t.Fatal("explicit depth guard ignored")
+	}
+	if jsonWithinComplexity([]byte(`{"a":1,"b":2}`), 2, 0) {
+		t.Fatal("explicit item guard ignored")
+	}
+	b := &bodyBudget{}
+	if !b.reserve(1024) || !b.reserve(2048) || b.usage() != 3072 {
+		t.Fatal("zero body budget rejected request")
+	}
+	b.release(3072)
+	if b.usage() != 0 {
+		t.Fatal("body accounting leaked")
+	}
+}
+
+func TestUnifiedStreamDoesNotUseNonStreamResponseCap(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	writer := &routeWriter{dst: recorder, header: make(http.Header), logical: "test", stream: true, limit: 4}
+	data := []byte("data: {}\n\ndata: {}\n\n")
+	if n, err := writer.Write(data); err != nil || n != len(data) {
+		t.Fatal("valid stream limited by JSON budget", n, err)
+	}
+	writer.finish()
+	if recorder.Body.Len() != len(data) {
+		t.Fatal("stream truncated", recorder.Body.String())
+	}
+	writer = &routeWriter{dst: httptest.NewRecorder(), header: make(http.Header), logical: "test", limit: 4}
+	if _, err := writer.Write([]byte("abcde")); err == nil {
+		t.Fatal("non-stream cap removed")
+	}
+}

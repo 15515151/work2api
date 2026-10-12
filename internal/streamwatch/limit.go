@@ -7,30 +7,56 @@ import (
 )
 
 type responseLimitKey struct{}
+type bufferedResponseLimitKey struct{}
+
+const DefaultMaxLineBytes = 40 << 20
+const DefaultResponseBytes = 128 << 20
 
 var ErrResponseTooLarge = errors.New("upstream response exceeds configured byte limit")
 
 func WithResponseLimit(ctx context.Context, limit int64) context.Context {
+	if limit == 0 {
+		buffered := ResponseLimit(ctx)
+		if buffered == 0 {
+			buffered, _ = ctx.Value(bufferedResponseLimitKey{}).(int64)
+		}
+		if buffered <= 0 {
+			buffered = DefaultResponseBytes
+		}
+		ctx = context.WithValue(ctx, bufferedResponseLimitKey{}, buffered)
+	}
 	return context.WithValue(ctx, responseLimitKey{}, limit)
 }
 
 func ResponseLimit(ctx context.Context) int64 {
-	if n, ok := ctx.Value(responseLimitKey{}).(int64); ok && n > 0 {
+	if n, ok := ctx.Value(responseLimitKey{}).(int64); ok && n >= 0 {
 		return n
 	}
-	return 64 << 20
+	return DefaultResponseBytes
 }
 
 func LimitReader(ctx context.Context, r io.Reader) io.Reader {
-	return &responseReader{r: r, left: ResponseLimit(ctx)}
+	limit := ResponseLimit(ctx)
+	if limit == 0 {
+		return r
+	}
+	return &responseReader{r: r, left: limit}
 }
 
-// ReadBody applies the same idle/duration and byte bounds to JSON and error
-// bodies as to SSE. A smaller diagnostic limit may be supplied by callers.
+// ReadBody always bounds buffered JSON/error bodies, even in an unbounded SSE
+// context. A smaller diagnostic limit may be supplied by callers.
 func ReadBody(ctx context.Context, body io.ReadCloser, limit int64) ([]byte, error) {
-	if limit > 0 && limit < ResponseLimit(ctx) {
-		ctx = WithResponseLimit(ctx, limit)
+	current := ResponseLimit(ctx)
+	if current == 0 {
+		current, _ = ctx.Value(bufferedResponseLimitKey{}).(int64)
+		if current <= 0 {
+			current = DefaultResponseBytes
+		}
 	}
+	if limit > 0 && limit < current {
+		current = limit
+	}
+	ctx = WithResponseLimit(ctx, current)
 	watch := NewWatch(body, ctx, 0, 0)
 	defer watch.Close()
 	data, err := io.ReadAll(watch.Reader(body))

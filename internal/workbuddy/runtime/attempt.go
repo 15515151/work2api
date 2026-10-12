@@ -73,7 +73,7 @@ func (r *Runtime) Stream(ctx context.Context, acc *pool.Account, body map[string
 	preambleBytes := 0
 	wrapped := func(line string) error {
 		responseBytes += int64(len(line))
-		if responseBytes > streamwatch.ResponseLimit(ctx) {
+		if limit := streamwatch.ResponseLimit(ctx); limit > 0 && responseBytes > limit {
 			return streamwatch.ErrResponseTooLarge
 		}
 		if !started {

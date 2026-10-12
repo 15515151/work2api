@@ -28,7 +28,7 @@ func trackUsageTiming(ctx context.Context, id int64) {
 	}
 }
 
-func (s *Server) persistUsageTiming(rows *usageTimingRows, t streamwatch.TimingSnapshot) {
+func (s *Server) persistUsageTiming(rows *usageTimingRows, t streamwatch.TimingSnapshot, status int, stream bool) {
 	rows.mu.Lock()
 	ids := append([]int64(nil), rows.ids...)
 	rows.mu.Unlock()
@@ -36,7 +36,7 @@ func (s *Server) persistUsageTiming(rows *usageTimingRows, t streamwatch.TimingS
 		return
 	}
 	duration := time.Since(t.Start)
-	value := store.UsagePerformance{RequestID: t.RequestID, QueueMS: t.Queue.Milliseconds(), AccountWaitMS: t.Account.Milliseconds(), TotalMS: duration.Milliseconds(), Attempts: t.Attempts, Upstream429: t.Upstream429}
+	value := store.UsagePerformance{HTTPStatus: status, ResponseStream: stream, RequestID: t.RequestID, QueueMS: t.Queue.Milliseconds(), AccountWaitMS: t.Account.Milliseconds(), TotalMS: duration.Milliseconds(), Attempts: t.Attempts, Upstream429: t.Upstream429}
 	if t.BytesSeen {
 		ms := t.FirstByte.Milliseconds()
 		value.FirstByteMS = &ms
@@ -46,7 +46,7 @@ func (s *Server) persistUsageTiming(rows *usageTimingRows, t streamwatch.TimingS
 		value.ExecutionMS = &ms
 	}
 	for _, stage := range t.AttemptStages {
-		value.Stages = append(value.Stages, store.UsageAttempt{Number: stage.Number, HeaderWaitMS: stage.HeaderWaitMS, HTTPStatus: stage.HTTPStatus, Finished: stage.Finished})
+		value.Stages = append(value.Stages, store.UsageAttempt{UpstreamRequestID: stage.UpstreamRequestID, Number: stage.Number, HeaderWaitMS: stage.HeaderWaitMS, HTTPStatus: stage.HTTPStatus, Finished: stage.Finished})
 	}
 	if err := s.o.db.UpdateUsagePerformance(ids, value); err != nil {
 		log.Printf("保存调用性能诊断失败: %v", err)

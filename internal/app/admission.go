@@ -38,6 +38,7 @@ type modelTicket struct {
 // A single bounded queue rotates between authenticated applications. Parked
 // account-throttle waits remain in this queue, rather than holding execution slots.
 type modelAdmission struct {
+	unlimited                                                bool
 	mu                                                       sync.Mutex
 	capacity, queueSize, keyQueue                            int
 	wait                                                     time.Duration
@@ -76,7 +77,12 @@ func positiveOr(v, fallback int) int {
 }
 
 func newModelAdmission(c *config.Config) *modelAdmission {
-	a := &modelAdmission{capacity: positiveOr(c.MaxConcurrentRequests, 13), queueSize: positiveOr(c.ModelQueueSize, 32), keyQueue: positiveOr(c.ModelKeyQueueSize, 16), wait: time.Duration(positiveOr(c.ModelQueueWaitSeconds, 60)) * time.Second, limits: map[string]int{}, byKey: map[string]int{}, served: map[string]uint64{}, changed: make(chan struct{}), rejected: map[string]int64{}}
+	a := &modelAdmission{unlimited: c.ModelLimitsDisabled, capacity: positiveOr(c.MaxConcurrentRequests, 13), queueSize: positiveOr(c.ModelQueueSize, 32), keyQueue: positiveOr(c.ModelKeyQueueSize, 16), wait: time.Duration(positiveOr(c.ModelQueueWaitSeconds, 60)) * time.Second, limits: map[string]int{}, byKey: map[string]int{}, served: map[string]uint64{}, changed: make(chan struct{}), rejected: map[string]int64{}}
+	if a.unlimited {
+		a.byModel = map[string]int{}
+		a.byAccount = map[string]int{}
+		return a
+	}
 	if c.ModelKeyLimits != "" {
 		if err := json.Unmarshal([]byte(c.ModelKeyLimits), &a.limits); err != nil {
 			log.Print("MODEL_KEY_CONCURRENCY_LIMITS 无效，使用全局并发限制")
@@ -99,7 +105,7 @@ func newModelAdmission(c *config.Config) *modelAdmission {
 	a.byAccount = map[string]int{}
 	responseLimit := c.MaxResponseBytes
 	if responseLimit <= 0 {
-		responseLimit = 8 << 20
+		responseLimit = config.DefaultMaxResponseBytes
 	}
 	a.bufferBudget = c.ModelBufferBudgetBytes
 	if a.bufferBudget <= 0 {
@@ -216,6 +222,18 @@ func (a *modelAdmission) acquireWithBudget(ctx context.Context, key string, limi
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if a.unlimited {
+		t := &modelTicket{key: key, ready: true, running: true, since: time.Now(), shared: strings.HasPrefix(key, "portal-user-"), model: model}
+		a.mu.Lock()
+		a.active++
+		a.byKey[key]++
+		if t.shared {
+			a.sharedActive++
+			a.byModel[model]++
+		}
+		a.mu.Unlock()
+		return &modelLease{a: a, t: t}, nil
+	}
 	capacity := a.capacity
 	limit := capacity
 	if n := a.limits[key]; n > 0 && n < limit {
@@ -326,6 +344,25 @@ func (l *modelLease) releaseAccountLocked() {
 // a free authorized account and an execution slot. The same wait budget covers
 // initial admission, account contention, start pacing and retry admission.
 func (l *modelLease) bindProviderAccount(ctx context.Context, choose func(map[string]bool) (*provider.AccountRef, *apiError)) (*provider.AccountRef, error) {
+	if l.a.unlimited {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		account, err := choose(map[string]bool{})
+		if err != nil || account == nil {
+			return account, err
+		}
+		l.a.mu.Lock()
+		defer l.a.mu.Unlock()
+		if l.t.released {
+			return nil, context.Canceled
+		}
+		l.releaseAccountLocked()
+		l.t.account = account
+		l.t.accountHeld = true
+		l.a.byAccount[account.ResourceKey()]++
+		return account, nil
+	}
 	a := l.a
 	a.mu.Lock()
 	if l.t.released || !l.t.running {
@@ -459,6 +496,9 @@ func (l *modelLease) await(ctx context.Context) error {
 // throttle uses the remaining queue budget and gives the model slot to other
 // channels while WorkBuddy waits for an account's minimum interval.
 func (l *modelLease) throttle(ctx context.Context, wait func(context.Context) error) error {
+	if l.a.unlimited {
+		return wait(ctx)
+	}
 	start := time.Now()
 	a := l.a
 	a.mu.Lock()
@@ -521,6 +561,9 @@ func (l *modelLease) throttle(ctx context.Context, wait func(context.Context) er
 func (a *modelAdmission) snapshot() map[string]any {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.unlimited {
+		return map[string]any{"limits_disabled": true, "running": a.active, "shared_running": a.sharedActive, "account_running": provider.DisplayAccountCounts(a.byAccount, "workbuddy"), "portal_model_running": copyCounts(a.byModel), "queued": 0, "capacity": 0, "queue_capacity": 0, "oldest_wait_ms": 0, "rejected": map[string]int64{}}
+	}
 	oldest := time.Duration(0)
 	for _, t := range a.queue {
 		if age := time.Since(t.since); age > oldest {
@@ -565,7 +608,7 @@ func (a *modelAdmission) snapshot() map[string]any {
 
 func (s *Server) admitModel(w http.ResponseWriter, r *http.Request, p *Principal) (*http.Request, func(), bool) {
 	key := strconv.FormatInt(p.AppID, 10)
-	charge := int64(positiveOr(int(s.o.cfg.MaxResponseBytes), 8<<20)) * 4
+	charge := int64(positiveOr(int(s.o.cfg.MaxResponseBytes), config.DefaultMaxResponseBytes)) * 4
 	if stream, ok := pRequestStream(r); ok && stream {
 		charge /= 2
 	}
@@ -602,8 +645,17 @@ func (s *Server) admitModel(w http.ResponseWriter, r *http.Request, p *Principal
 // finishAdmit is the tail shared by both admission paths (headers + context).
 func (s *Server) finishAdmit(w http.ResponseWriter, r *http.Request, l *modelLease) (*http.Request, func(), bool) {
 	w.Header().Set("X-Queue-Wait-Ms", strconv.FormatInt(time.Since(l.t.since).Milliseconds(), 10))
-	ctx := streamwatch.WithResponseLimit(r.Context(), int64(positiveOr(int(s.o.cfg.MaxResponseBytes), 8<<20)))
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+	limit := int64(positiveOr(int(s.o.cfg.MaxResponseBytes), config.DefaultMaxResponseBytes))
+	ctx := streamwatch.WithResponseLimit(r.Context(), limit)
+	if streaming, _ := pRequestStream(r); streaming {
+		ctx = streamwatch.WithResponseLimit(ctx, 0)
+	}
+	var cancel context.CancelFunc
+	if s.modelsAdmission.unlimited {
+		ctx, cancel = context.WithCancel(ctx)
+	} else {
+		ctx, cancel = context.WithTimeout(ctx, 30*time.Minute)
+	}
 	return r.WithContext(context.WithValue(ctx, modelLeaseKey{}, l)), func() { cancel(); l.release(); _ = http.NewResponseController(w).SetWriteDeadline(time.Time{}) }, true
 }
 

@@ -2,6 +2,8 @@ package streamwatch
 
 import (
 	"context"
+	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -25,10 +27,11 @@ type Timing struct {
 
 // AttemptStage contains no URL, account identifier, headers or request content.
 type AttemptStage struct {
-	Number       int   `json:"number"`
-	HeaderWaitMS int64 `json:"header_wait_ms"`
-	HTTPStatus   int   `json:"http_status"`
-	Finished     bool  `json:"headers_finished"`
+	UpstreamRequestID string `json:"upstream_request_id,omitempty"`
+	Number            int    `json:"number"`
+	HeaderWaitMS      int64  `json:"header_wait_ms"`
+	HTTPStatus        int    `json:"http_status"`
+	Finished          bool   `json:"headers_finished"`
 }
 
 func WithTiming(ctx context.Context) (context.Context, *Timing) {
@@ -64,7 +67,7 @@ func StartAttempt(ctx context.Context) {
 }
 
 // AttemptHeaders records only connection/header wait, not body generation time.
-func AttemptHeaders(ctx context.Context, status int) {
+func AttemptHeaders(ctx context.Context, status int, headers ...http.Header) {
 	if t := TimingFrom(ctx); t != nil {
 		t.mu.Lock()
 		defer t.mu.Unlock()
@@ -78,7 +81,38 @@ func AttemptHeaders(ctx context.Context, status int) {
 		stage.HeaderWaitMS = time.Since(t.lastAttempt).Milliseconds()
 		stage.HTTPStatus = status
 		stage.Finished = true
+		if len(headers) > 0 {
+			stage.UpstreamRequestID = ResponseRequestID(headers[0])
+		}
 	}
+}
+
+// Store only recognizable, bounded correlation IDs; never arbitrary headers.
+func ResponseRequestID(header http.Header) string {
+	for _, key := range []string{"X-Request-Id", "Request-Id", "X-Tt-Logid"} {
+		value := strings.TrimSpace(header.Get(key))
+		if value == "" || len(value) > 128 {
+			continue
+		}
+		safe := true
+		for _, c := range value {
+			if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || strings.ContainsRune("-_:.", c)) {
+				safe = false
+				break
+			}
+		}
+		if safe {
+			return value
+		}
+	}
+	return ""
+}
+func AttemptHTTP(ctx context.Context, response *http.Response) {
+	if response == nil {
+		AttemptHeaders(ctx, 0)
+		return
+	}
+	AttemptHeaders(ctx, response.StatusCode, response.Header)
 }
 func AttemptResult(ctx context.Context, status int) {
 	if status != 429 {

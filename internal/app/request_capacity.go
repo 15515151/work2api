@@ -37,7 +37,7 @@ type bodyBudget struct {
 func (b *bodyBudget) reserve(n int64) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if n > b.limit-b.used {
+	if b.limit > 0 && n > b.limit-b.used {
 		return false
 	}
 	b.used += n
@@ -186,6 +186,9 @@ func (s *Server) serveRefresh(w http.ResponseWriter, r *http.Request, next http.
 // A linear scan bounds JSON allocation amplification before Decode builds maps
 // and slices. JSON syntax remains the decoder's job. Multipart is not scanned.
 func jsonWithinComplexity(body []byte, itemsLimit, depthLimit int) bool {
+	if itemsLimit <= 0 && depthLimit <= 0 {
+		return true
+	}
 	trimmed := bytes.TrimSpace(body)
 	if len(trimmed) == 0 || trimmed[0] != '{' && trimmed[0] != '[' {
 		return true
@@ -214,7 +217,7 @@ func jsonWithinComplexity(body []byte, itemsLimit, depthLimit int) bool {
 		case ',', ':':
 			items++
 		}
-		if depth > depthLimit || items > itemsLimit {
+		if depthLimit > 0 && depth > depthLimit || itemsLimit > 0 && items > itemsLimit {
 			return false
 		}
 	}

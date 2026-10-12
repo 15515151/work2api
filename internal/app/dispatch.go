@@ -10,6 +10,7 @@ import (
 	"work2api/internal/core/provider"
 	"work2api/internal/store"
 	"work2api/internal/streamwatch"
+	wbruntime "work2api/internal/workbuddy/runtime"
 )
 
 // dispatchRuntime executes the registered default or namespaced provider.
@@ -20,6 +21,9 @@ func (s *Server) dispatchRuntime(w http.ResponseWriter, r *http.Request, proto p
 // dispatchRuntimeTo is dispatchRuntime with an explicit writer (the model test
 // endpoint injects an httptest.Recorder to capture the response).
 func (s *Server) dispatchRuntimeTo(w http.ResponseWriter, r *http.Request, proto provider.Protocol, payload map[string]any, principal *Principal) bool {
+	if principal.RouteModel != "" {
+		return s.dispatchModelRoute(w, r, proto, payload, principal)
+	}
 	rawModel := strOr(payload["model"], "")
 	if rawModel == "" {
 		return false
@@ -76,6 +80,12 @@ func (s *Server) dispatchRuntimeTo(w http.ResponseWriter, r *http.Request, proto
 		AppName:  principal.AppName,
 		Headers:  r.Header,
 	}
+	// Channel normalization must not mutate the body captured by authorization
+	// refresh callbacks (in particular, stripping a model namespace).
+	request.Payload = make(map[string]any, len(payload))
+	for key, value := range payload {
+		request.Payload[key] = value
+	}
 	var report provider.UsageReport
 	if native, ok := rt.(provider.NativeSessionObserver); !ok || !native.OwnsSessionObservations() {
 		finish := s.o.observations.Begin(rt.Name(), request)
@@ -102,8 +112,11 @@ func (s *Server) dispatchRuntimeTo(w http.ResponseWriter, r *http.Request, proto
 			}
 		}
 	}
+	if result, ok := r.Context().Value(routeAttemptResultKey{}).(*routeAttemptResult); ok {
+		result.ok = err == nil && (report.Status == "" || report.Status == "ok")
+	}
 	if !report.Recorded {
-		s.o.logRuntimeUsage(report, string(proto), resolved, t0, principal.AppName, principal.UserID, principal.AppID)
+		s.o.logRuntimeUsageDiagnostic(report, string(proto), resolved, t0, principal.AppName, principal.UserID, principal.AppID, wbruntime.UsageDiagnostics(r.Context()), r.Context())
 	}
 	if !report.Recorded {
 		streamwatch.Outcome(r.Context(), report.Status)
@@ -115,6 +128,17 @@ func (s *Server) dispatchRuntimeTo(w http.ResponseWriter, r *http.Request, proto
 // workbuddy path it does not touch the workbuddy pool (runtimes own their own
 // accounts), so it writes directly to the usage log with the report's fields.
 func (o *Orchestrator) logRuntimeUsage(rep provider.UsageReport, protocol, model string, t0 time.Time, appName string, userID int64, appIDs ...int64) {
+	var appID int64
+	if len(appIDs) > 0 {
+		appID = appIDs[0]
+	}
+	o.logRuntimeUsageDiagnostic(rep, protocol, model, t0, appName, userID, appID, nil)
+}
+func (o *Orchestrator) logRuntimeUsageDiagnostic(rep provider.UsageReport, protocol, model string, t0 time.Time, appName string, userID, appID int64, diagnostics *store.UsageDiagnostics, contexts ...context.Context) {
+	var ctx context.Context
+	if len(contexts) > 0 {
+		ctx = contexts[0]
+	}
 	effort := rep.Effort
 	if effort == "" {
 		effort = "default"
@@ -123,17 +147,14 @@ func (o *Orchestrator) logRuntimeUsage(rep provider.UsageReport, protocol, model
 	if status == "" {
 		status = "ok"
 	}
-	var appID int64
-	if len(appIDs) > 0 {
-		appID = appIDs[0]
-	}
 	if userID > 0 {
 		rep.Input = ""
 		rep.Output = ""
 		rep.Reasoning = ""
 	}
-	_ = o.db.LogUsage(store.UsageParams{
+	o.recordUsage(ctx, store.UsageParams{
 		Model:            model,
+		Diagnostics:      diagnostics,
 		Protocol:         protocol,
 		AccountUID:       rep.AccountUID,
 		InputTokens:      rep.InputTokens,

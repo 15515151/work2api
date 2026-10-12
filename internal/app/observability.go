@@ -7,6 +7,7 @@ import (
 	"math"
 	"net/http"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 	"work2api/internal/streamwatch"
@@ -198,7 +199,7 @@ func (s *Server) observeCalls(next http.Handler) http.Handler {
 			}
 			snapshot := t.Snapshot()
 			s.calls.record(snapshot, writer.status)
-			s.persistUsageTiming(rows, snapshot)
+			s.persistUsageTiming(rows, snapshot, writer.status, strings.HasPrefix(writer.Header().Get("Content-Type"), "text/event-stream"))
 		}()
 		next.ServeHTTP(writer, r)
 	})

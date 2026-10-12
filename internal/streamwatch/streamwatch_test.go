@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -163,5 +164,24 @@ func TestAttemptStagesBoundedAndDetached(t *testing.T) {
 	snap.AttemptStages[0].HTTPStatus = 400
 	if timing.Snapshot().AttemptStages[0].HTTPStatus != 200 {
 		t.Fatal("snapshot alias")
+	}
+}
+
+func TestAttemptCorrelationIDIsBoundedAndWhitelisted(t *testing.T) {
+	ctx, timing := WithTiming(context.Background())
+	StartAttempt(ctx)
+	header := make(http.Header)
+	header.Set("X-Request-Id", "abc-123_def:456")
+	header.Set("Authorization", "Bearer secret")
+	AttemptHTTP(ctx, &http.Response{StatusCode: 400, Header: header})
+	stages := timing.Snapshot().AttemptStages
+	if len(stages) != 1 || stages[0].UpstreamRequestID != "abc-123_def:456" || stages[0].HTTPStatus != 400 {
+		t.Fatal(stages)
+	}
+	for _, value := range []string{"Bearer secret", "https://private.invalid/token", strings.Repeat("a", 129)} {
+		header.Set("X-Request-Id", value)
+		if ResponseRequestID(header) != "" {
+			t.Fatal("unsafe correlation ID retained")
+		}
 	}
 }

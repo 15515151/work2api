@@ -128,6 +128,8 @@ type UsageParams struct {
 
 // UsageDiagnostics contains protocol facts only, never prompts or credentials.
 type UsageDiagnostics struct {
+	RequestedModel  string            `json:"requested_model,omitempty"`
+	PhysicalModel   string            `json:"physical_model,omitempty"`
 	FinishReason    string            `json:"finish_reason,omitempty"`
 	RequestedLimits map[string]int    `json:"requested_output_limits,omitempty"`
 	EffectiveLimits map[string]int    `json:"effective_output_limits,omitempty"`
@@ -364,7 +366,7 @@ func usageWhere(protocol, model string, appName *string, status, search string) 
 	return "WHERE " + strings.Join(clauses, " AND "), params
 }
 
-const usageLightCols = "id, ts, model, protocol, account_uid, input_tokens, output_tokens, total_tokens, latency_ms, status, error, credits, app_name, user_id, reasoning_effort, tokens_known, cached_tokens, diagnostics"
+const usageLightCols = "id, ts, model, protocol, account_uid, input_tokens, output_tokens, total_tokens, latency_ms, status, error, credits, app_name, user_id, reasoning_effort, tokens_known, cached_tokens, app_id, diagnostics"
 
 // UsageRecent returns recent usage records with optional filters.
 func (d *DB) UsageRecent(limit int, protocol, model string, appName *string, status string, light bool, offset int, search string) ([]map[string]any, error) {
@@ -426,7 +428,7 @@ func (d *DB) GetUsage(id int) (map[string]any, error) {
 func decodeUsageDiagnostics(row map[string]any) {
 	if raw, ok := row["diagnostics"].(string); ok {
 		var value UsageDiagnostics
-		if len(raw) <= 4096 && json.Unmarshal([]byte(raw), &value) == nil {
+		if len(raw) <= 16384 && json.Unmarshal([]byte(raw), &value) == nil {
 			row["diagnostics"] = value
 		} else {
 			row["diagnostics"] = nil

@@ -17,6 +17,8 @@ import (
 
 // Config is the fully-resolved runtime configuration.
 type Config struct {
+	RequestBodyReadTimeoutSeconds int
+
 	Host                   string // listen host
 	Port                   int    // listen port
 	AllowPortFallback      bool   // only an unconfigured default port may auto-avoid
@@ -29,6 +31,7 @@ type Config struct {
 	ModelMemoryGuard       bool
 	ModelBufferBudgetBytes int64
 	ModelMemoryHighBytes   int64
+	ModelLimitsDisabled    bool // Model execution has no local concurrency, queue or daily quota caps.
 	MaxConcurrentRequests  int
 	ModelQueueSize         int
 	ModelQueueWaitSeconds  int
@@ -92,7 +95,9 @@ type Config struct {
 // process CWD.
 var PackageRoot string
 
-const DefaultMaxRequestBytes = 64 << 20
+const DefaultMaxRequestBytes = 256 << 20
+const DefaultMaxResponseBytes = 128 << 20
+const DefaultRequestBodyReadTimeoutSeconds = 120
 const DefaultRequestBodyBudget = 256 << 20
 
 func init() {
@@ -138,13 +143,15 @@ func Load(args []string) *Config {
 	cookieSecure, cookieExplicit := deploymentBoolEnv("ADMIN_COOKIE_SECURE", *adminToken != "" || allowExternalHost)
 	memoryGuard, _ := deploymentBoolEnv("MODEL_MEMORY_GUARD", false)
 	requestLimit := int64(positiveEnvInt("MAX_REQUEST_BYTES", DefaultMaxRequestBytes))
-	responseLimit := int64(positiveEnvInt("MAX_RESPONSE_BYTES", 8<<20))
+	responseLimit := int64(positiveEnvInt("MAX_RESPONSE_BYTES", DefaultMaxResponseBytes))
 	modelConcurrency := positiveEnvInt("MAX_CONCURRENT_REQUESTS", 13)
 	// Cover raw-buffer growth and all configured execution slots without requiring
 	// operators to tune independent byte budgets for ordinary Agent requests.
-	bodyBudget := max(int64(DefaultRequestBodyBudget), 3*requestLimit)
+	bodyBudget := int64(0) // No extra global request-body quota by default.
 	responseBudget := 4 * responseLimit * int64(modelConcurrency)
 	return &Config{
+		RequestBodyReadTimeoutSeconds: positiveEnvInt("REQUEST_BODY_READ_TIMEOUT_SECONDS", DefaultRequestBodyReadTimeoutSeconds),
+
 		AllowPortFallback:      !explicitPort,
 		Host:                   *host,
 		Port:                   *port,
@@ -158,6 +165,7 @@ func Load(args []string) *Config {
 		ModelMemoryGuard:       memoryGuard,
 		ModelBufferBudgetBytes: int64(positiveEnvInt("MODEL_BUFFER_BUDGET_BYTES", int(responseBudget))),
 		ModelMemoryHighBytes:   int64(positiveEnvInt("MODEL_MEMORY_HIGH_BYTES", 256<<20)),
+		ModelLimitsDisabled:    true,
 		MaxConcurrentRequests:  modelConcurrency,
 		ModelQueueSize:         positiveEnvInt("MODEL_QUEUE_SIZE", 32),
 		ModelQueueWaitSeconds:  positiveEnvInt("MODEL_QUEUE_WAIT_SECONDS", 60),
@@ -167,10 +175,10 @@ func Load(args []string) *Config {
 		HeavyAdminConcurrency:  positiveEnvInt("HEAVY_ADMIN_CONCURRENCY", 2),
 		QueryConcurrency:       positiveEnvInt("QUERY_CONCURRENCY", 4),
 		BodyReadConcurrency:    positiveEnvInt("BODY_READ_CONCURRENCY", 4),
-		RequestBodyBudget:      int64(positiveEnvInt("REQUEST_BODY_BUDGET", int(bodyBudget))),
+		RequestBodyBudget:      int64(max(0, envInt("REQUEST_BODY_BUDGET", int(bodyBudget)))),
 		MaxResponseBytes:       responseLimit,
-		MaxJSONItems:           positiveEnvInt("MAX_JSON_ITEMS", 100000),
-		MaxJSONDepth:           positiveEnvInt("MAX_JSON_DEPTH", 128),
+		MaxJSONItems:           max(0, envInt("MAX_JSON_ITEMS", 0)),
+		MaxJSONDepth:           max(0, envInt("MAX_JSON_DEPTH", 0)),
 		LogLevel:               strings.ToUpper(*logLevel),
 		LogToFile:              env("LOG_TO_FILE", "1") != "0",
 
@@ -182,9 +190,9 @@ func Load(args []string) *Config {
 		PortalSharedConcurrency: positiveEnvInt("PORTAL_SHARED_CONCURRENCY", 12),
 		// 单账号 UID 的真实名额保护；不改变服务器、共享池及用户硬上限。
 		WorkBuddyAccountConcurrency: positiveEnvInt("WORKBUDDY_ACCOUNT_CONCURRENCY", 4),
-		PortalDailyRequests:         envInt("PORTAL_DAILY_REQUESTS", 0),
-		PortalDailyInputTokens:      envInt("PORTAL_DAILY_INPUT_TOKENS", 0),
-		PortalDailyOutputTokens:     envInt("PORTAL_DAILY_OUTPUT_TOKENS", 0),
+		PortalDailyRequests:         0,
+		PortalDailyInputTokens:      0,
+		PortalDailyOutputTokens:     0,
 		PortalKeyMaxPerUser:         positiveEnvInt("PORTAL_KEY_MAX_PER_USER", 2),
 		PortalEnabled:               boolEnv("PORTAL_ENABLED", true),
 
@@ -192,7 +200,7 @@ func Load(args []string) *Config {
 		ChannelIdentityCompat: boolEnv("CHANNEL_IDENTITY_COMPAT", true),
 		ChannelMetadataCompat: boolEnv("CHANNEL_METADATA_COMPAT", true),
 		OptimizeContext:       boolEnv("OPTIMIZE_CONTEXT", false),
-		Ratelimit:             boolEnv("RATELIMIT", true),
+		Ratelimit:             false,
 		RatelimitInterval:     floatEnv("RATELIMIT_INTERVAL", 1.5),
 		CheckinHours:          intListEnv("CHECKIN_HOURS", []int{9, 21}),
 		CreditRefreshMin:      envInt("CREDIT_REFRESH_MIN", 30),

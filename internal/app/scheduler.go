@@ -262,3 +262,13 @@ func (s *Scheduler) setting(key, def string) string {
 	}
 	return def
 }
+
+func (s *Scheduler) StopAndWait(ctx context.Context) error {
+	s.Stop()
+	select {
+	case <-s.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}

@@ -14,13 +14,15 @@ import (
 	"sync"
 	"time"
 	"work2api/internal/config"
+	"work2api/internal/selfupdate"
 	"work2api/internal/statebackup"
 )
 
 // Server is the HTTP surface over an Orchestrator.
 type Server struct {
-	calls callMonitor
-	o     *Orchestrator
+	updater *selfupdate.Manager
+	calls   callMonitor
+	o       *Orchestrator
 	// adminSessions + loginLimiter back the WebUI login (HttpOnly cookie
 	// sessions). In-memory only: restart signs everyone out.
 	sessions                                                    *adminSessionManager
@@ -76,10 +78,14 @@ type principalContextKey struct{}
 
 // NewServer builds the HTTP server.
 func NewServer(o *Orchestrator) *Server {
+	bodyLimit := int64(positiveOr(int(o.cfg.RequestBodyBudget), config.DefaultRequestBodyBudget))
+	if o.cfg.ModelLimitsDisabled {
+		bodyLimit = max(int64(0), o.cfg.RequestBodyBudget)
+	}
 	return &Server{o: o, sessions: newAdminSessionManager(), loginLimiter: newLoginRateLimiter(), portalLoginLimiter: newLoginRateLimiter(), portalSlots: make(chan struct{}, 8),
 		portalTasks: map[string]*portalContributionTask{}, portalPollLimiter: map[int64]*pollLimiter{},
 		publicBodySlots: make(chan struct{}, 2), publicBodyWaiting: make(chan struct{}, 2), publicBodies: &bodyBudget{limit: 64 << 10},
-		bodyWaiting: make(chan struct{}, positiveOr(o.cfg.ModelQueueSize, 32)), modelsAdmission: newModelAdmission(o.cfg), adminSlots: make(chan struct{}, positiveOr(o.cfg.AdminConcurrency, 8)), heavySlots: make(chan struct{}, positiveOr(o.cfg.HeavyAdminConcurrency, 2)), querySlots: make(chan struct{}, positiveOr(o.cfg.QueryConcurrency, 4)), bodySlots: make(chan struct{}, positiveOr(o.cfg.BodyReadConcurrency, 4)), bodies: &bodyBudget{limit: int64(positiveOr(int(o.cfg.RequestBodyBudget), config.DefaultRequestBodyBudget))}, refreshSlots: make(chan struct{}, 8), refreshes: map[string]*refreshFlight{}}
+		bodyWaiting: make(chan struct{}, positiveOr(o.cfg.ModelQueueSize, 32)), modelsAdmission: newModelAdmission(o.cfg), adminSlots: make(chan struct{}, positiveOr(o.cfg.AdminConcurrency, 8)), heavySlots: make(chan struct{}, positiveOr(o.cfg.HeavyAdminConcurrency, 2)), querySlots: make(chan struct{}, positiveOr(o.cfg.QueryConcurrency, 4)), bodySlots: make(chan struct{}, positiveOr(o.cfg.BodyReadConcurrency, 4)), bodies: &bodyBudget{limit: bodyLimit}, refreshSlots: make(chan struct{}, 8), refreshes: map[string]*refreshFlight{}}
 }
 
 // Handler returns the root handler with all routes mounted and Host guarded.
@@ -185,38 +191,43 @@ func (s *Server) requestGuard(next http.Handler) http.Handler {
 				writeJSON(w, 413, errBody(413, "请求体过大", "invalid_request_error").Body)
 				return
 			}
-			select {
-			case bodySlots <- struct{}{}:
-			default:
-				// A short bounded wait absorbs Agent fan-out before body parsing;
-				// readers and raw-byte allocations retain their existing limits.
-				select {
-				case bodyWaiting <- struct{}{}:
-				default:
-					s.writeOverload(w, "body_read_capacity")
-					return
-				}
-				timer := time.NewTimer(5 * time.Second)
+			if !model || !s.o.cfg.ModelLimitsDisabled {
 				select {
 				case bodySlots <- struct{}{}:
-					timer.Stop()
-					<-bodyWaiting
-				case <-r.Context().Done():
-					timer.Stop()
-					<-bodyWaiting
-					return
-				case <-timer.C:
-					<-bodyWaiting
-					s.writeOverload(w, "body_read_capacity")
-					return
+				default:
+					// A short bounded wait absorbs Agent fan-out before body parsing;
+					// readers and raw-byte allocations retain their existing limits.
+					select {
+					case bodyWaiting <- struct{}{}:
+					default:
+						s.writeOverload(w, "body_read_capacity")
+						return
+					}
+					timer := time.NewTimer(5 * time.Second)
+					select {
+					case bodySlots <- struct{}{}:
+						timer.Stop()
+						<-bodyWaiting
+					case <-r.Context().Done():
+						timer.Stop()
+						<-bodyWaiting
+						return
+					case <-timer.C:
+						<-bodyWaiting
+						s.writeOverload(w, "body_read_capacity")
+						return
+					}
 				}
-			}
 
+			}
 			body, reserved, err := func() ([]byte, int64, error) {
-				defer func() { <-bodySlots }()
+				if !model || !s.o.cfg.ModelLimitsDisabled {
+					defer func() { <-bodySlots }()
+				}
 				defer r.Body.Close()
 				controller := http.NewResponseController(w)
-				_ = controller.SetReadDeadline(time.Now().Add(30 * time.Second))
+				readTimeout := positiveOr(s.o.cfg.RequestBodyReadTimeoutSeconds, config.DefaultRequestBodyReadTimeoutSeconds)
+				_ = controller.SetReadDeadline(time.Now().Add(time.Duration(readTimeout) * time.Second))
 				defer controller.SetReadDeadline(time.Time{})
 				return bodies.read(http.MaxBytesReader(w, r.Body, limit), r.ContentLength)
 			}()
@@ -228,17 +239,20 @@ func (s *Server) requestGuard(next http.Handler) http.Handler {
 					return
 				}
 				status := http.StatusBadRequest
+				message := "请求体读取失败，请检查网络连接后重试"
 				var tooLarge *http.MaxBytesError
 				var timeout net.Error
 				if errors.As(err, &tooLarge) {
 					status = http.StatusRequestEntityTooLarge
+					message = "请求体超过大小限制"
 				} else if errors.As(err, &timeout) && timeout.Timeout() {
 					status = http.StatusRequestTimeout
+					message = "接收请求正文超时，请检查网络或代理后重试"
 				}
-				writeJSON(w, status, errBody(status, "请求体读取失败或超过限制", "invalid_request_error").Body)
+				writeJSON(w, status, errBody(status, message, "invalid_request_error").Body)
 				return
 			}
-			if !jsonWithinComplexity(body, positiveOr(s.o.cfg.MaxJSONItems, 100000), positiveOr(s.o.cfg.MaxJSONDepth, 128)) {
+			if !jsonWithinComplexity(body, s.o.cfg.MaxJSONItems, s.o.cfg.MaxJSONDepth) {
 				writeJSON(w, 400, errBody(400, "JSON 结构过于复杂或嵌套过深", "invalid_request_error").Body)
 				return
 			}
@@ -429,15 +443,23 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	data := s.modelCatalog(r.Context())
-	settings, _ := s.o.db.GetSettings()
-	aliases := parseModelAliases(settings["model_aliases"])
 	out := make([]map[string]any, 0, len(data))
 	for _, item := range data {
 		id := str2(item["id"])
-		resolved := id
-		if real, ok := aliases[id]; ok {
-			resolved = real
+		if route, _ := s.o.modelRoute(id); route != nil {
+			members, aerr := s.routeCandidates(principal, *route, nil)
+			if aerr != nil || len(members) == 0 {
+				continue
+			}
+			clean := map[string]any{}
+			for k, v := range item {
+				clean[k] = v
+			}
+			clean["members"] = members
+			out = append(out, clean)
+			continue
 		}
+		resolved := s.o.resolveModel(id)
 		// Portal keys see exactly the shared scope (deny by default); private
 		// keys keep the unrestricted-catalog behavior.
 		if principal.UserID > 0 {
@@ -461,6 +483,11 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 func (s *Server) modelCatalog(ctx context.Context) []map[string]any {
 	// Merge all providers before aliases and key policy.
 	data := s.o.runtimeModels(ctx)
+	for _, entry := range data {
+		if str2(entry["provider"]) == "workbuddy" {
+			entry["id"] = physicalModel(str2(entry["id"]))
+		}
+	}
 	settings, _ := s.o.db.GetSettings()
 	aliases := parseModelAliases(settings["model_aliases"])
 	if len(aliases) > 0 {
@@ -472,7 +499,7 @@ func (s *Server) modelCatalog(ctx context.Context) []map[string]any {
 			if _, dup := byID[alias]; dup {
 				continue
 			}
-			if src, ok := byID[strings.TrimPrefix(real, "workbuddy/")]; ok {
+			if src, ok := byID[physicalModel(real)]; ok {
 				item := map[string]any{}
 				for k, v := range src {
 					item[k] = v
@@ -483,7 +510,7 @@ func (s *Server) modelCatalog(ctx context.Context) []map[string]any {
 			}
 		}
 	}
-	return data
+	return append(data, s.routeCatalog(ctx)...)
 }
 
 func (s *Server) handleCountTokens(w http.ResponseWriter, r *http.Request) {
