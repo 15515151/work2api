@@ -29,13 +29,38 @@ func (s *Server) refreshPortalRequest(w http.ResponseWriter, r *http.Request, p 
 		if fresh.AppID != p.AppID || fresh.UserID != p.UserID {
 			return errBody(403, "密钥归属已改变", "auth_error")
 		}
-		if aerr := s.prepareModel(fresh, payload); aerr != nil {
+		if p.RouteModel != "" {
+			route, err := s.o.modelRoute(p.RouteModel)
+			if err != nil || route == nil {
+				return errBody(403, "统一模型配置已撤销", "model_not_allowed")
+			}
+			members, aerr := s.routeCandidates(fresh, *route, payload)
+			if aerr != nil {
+				return aerr
+			}
+			if len(members) == 0 {
+				return errBody(403, "统一模型权限已撤销", "model_not_allowed")
+			}
+			if actualModel != "" {
+				found := false
+				for _, m := range members {
+					if s.o.resolveModel(m) == s.o.resolveModel(actualModel) {
+						found = true
+					}
+				}
+				if !found {
+					return errBody(403, "实际模型已不在授权成员中", "model_not_allowed")
+				}
+				fresh.AccountScope = fresh.ModelScopes[s.o.resolveModel(actualModel)]
+			}
+			fresh.RouteModel, fresh.EffectiveModel = p.RouteModel, p.RouteModel
+		} else if aerr := s.prepareModel(fresh, payload); aerr != nil {
 			return aerr
 		}
 		if admittedModel != "" && fresh.EffectiveModel != admittedModel {
 			return errBody(403, "模型映射已改变，请重新发起请求", "model_not_allowed")
 		}
-		if actualModel != "" && s.o.resolveModel(strOr(payload["model"], "")) != s.o.resolveModel(actualModel) {
+		if p.RouteModel == "" && actualModel != "" && s.o.resolveModel(strOr(payload["model"], "")) != s.o.resolveModel(actualModel) {
 			return errBody(403, "模型映射已改变，请重新发起请求", "model_not_allowed")
 		}
 		if fresh.UserID > 0 && uid != "" && !fresh.AccountScope[uid] {
@@ -131,7 +156,7 @@ func (q *portalQuotaReservation) settle() {
 }
 
 func (s *Server) reservePortalBudget(w http.ResponseWriter, p *Principal, payload map[string]any) bool {
-	if p.UserID == 0 {
+	if p.UserID == 0 || s.o.cfg.ModelLimitsDisabled {
 		return true
 	}
 	c := s.o.cfg

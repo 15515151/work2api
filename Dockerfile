@@ -6,6 +6,9 @@ FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS builder
 ARG TARGETOS
 ARG TARGETARCH
 ARG VERSION=dev
+ARG RELEASE_BUILD=false
+ARG RELEASE_REPOSITORY=YuapXc/work2api
+ARG RELEASE_COMMIT=
 
 WORKDIR /src
 
@@ -19,7 +22,7 @@ RUN CGO_ENABLED=0 \
     GOARCH="${TARGETARCH:-amd64}" \
     go build \
       -trimpath \
-      -ldflags="-s -w -X main.version=${VERSION}" \
+      -ldflags="-s -w -X main.version=${VERSION} -X main.releaseBuild=${RELEASE_BUILD} -X main.releaseRepository=${RELEASE_REPOSITORY} -X main.releaseCommit=${RELEASE_COMMIT}" \
       -o /out/work2api ./cmd/server
 
 FROM alpine:3.22
@@ -36,7 +39,8 @@ COPY --from=builder /out/work2api /usr/local/bin/work2api
 
 # 容器内必须绑 0.0.0.0（否则宿主端口映射打不进来）。DATA_DIR 指向卷，DB/凭据/密钥
 # 都落在这里，随卷持久化。
-ENV HOST=0.0.0.0 \
+ENV WORK2API_CONTAINER=1 \
+    HOST=0.0.0.0 \
     PORT=8787 \
     DATA_DIR=/data
 

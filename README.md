@@ -11,16 +11,16 @@
 - 三协议的流式与非流式调用、工具调用和协议转换。
 - 独立 API Key、模型白名单、账号路由、会话粘性与故障换号。
 - 按上游实际信息展示模型能力、额度、资源包与用量；缺失字段保留未知。
-- 管理台统一管理各渠道；用户门户支持注册、贡献账号和自助创建 Key。
+- 管理台统一管理各渠道；用户门户支持注册、自助创建 Key 和可选账号贡献，管理员维护默认模型权限。
 - 在线完整备份、定时维护与调用诊断。
 
 兼容范围和各渠道差异见 [功能说明](docs/features.md) 与 [渠道接入](docs/providers.md)。
 
-| 渠道 | 模型名 | 用户贡献 / 共享 |
+| 渠道 | 模型名 | 用户贡献 / 调用 |
 |---|---|---|
 | WorkBuddy / CodeBuddy | `workbuddy/<模型>`，兼容裸模型名 | 支持 |
-| Qoder | `qoder/<模型>` | 暂不开放 |
-| OpenCode | `opencode/<模型>` | 暂不开放 |
+| Qoder | `qoder/<模型>` | 支持 OAuth / PAT |
+| OpenCode | `opencode/<模型>` | 支持个人 Zen / Go Key |
 | 国内 Trae IDE / Work-SOLO | `trae/<模型>` | 支持 |
 
 ## 快速开始
@@ -47,12 +47,14 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 |---|---|
 | [渠道接入](docs/providers.md) | 凭据来源、各渠道配置和调用差异 |
 | [API 与客户端](docs/api.md) | 三协议地址、模型前缀、Key 授权与默认模型 |
+| [统一模型路由](docs/model-routing.md) | 手工跨渠道合并、成员顺序、粘性与 Key 授权 |
 | [用户门户与管理员](docs/portal.md) | 注册、共享资格、管理员权限与恢复入口 |
 | [下载与部署](docs/deployment.md) | Release、Docker、HTTPS、Cloudflare Tunnel 与安全边界 |
 | [配置与调用容量](docs/configuration.md) | 环境变量、自动默认值、并发与请求预算 |
 | [功能与协议能力](docs/features.md) | 工具、技能、多模态、缓存与响应完整性 |
 | [运行维护与备份](docs/operations.md) | 实例复用、更新、诊断、在线备份与迁移 |
 | [开发与构建](docs/development.md) | 后端编译、前端同步与验证 |
+| [版本自更新](docs/self-update.md) | 手动/定时更新、构建来源识别与恢复边界 |
 | [故障排查](docs/troubleshooting.md) | 413、502、跨源拒绝、11128、端口和构建问题 |
 | [使用声明](docs/usage-policy.md) | 原有免责声明与使用边界 |
 

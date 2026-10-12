@@ -25,3 +25,34 @@ func (d *DB) Snapshot(ctx context.Context, path string) error {
 	}
 	return nil
 }
+
+func (d *DB) QuickCheck(ctx context.Context) error {
+	var value string
+	if err := d.db.QueryRowContext(ctx, "PRAGMA quick_check").Scan(&value); err != nil {
+		return err
+	}
+	if value != "ok" {
+		return fmt.Errorf("database quick_check failed")
+	}
+	return nil
+}
+
+func (d *DB) CheckEncryptedApps(check func(string, string) bool) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	rows, err := d.db.Query("SELECT key_enc,key_hash FROM apps WHERE key_enc IS NOT NULL AND key_enc!=''")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var enc, hash string
+		if err = rows.Scan(&enc, &hash); err != nil {
+			return err
+		}
+		if !check(enc, hash) {
+			return fmt.Errorf("existing API Key ciphertext cannot be verified")
+		}
+	}
+	return rows.Err()
+}

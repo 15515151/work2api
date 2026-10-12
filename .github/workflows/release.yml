@@ -132,7 +132,7 @@ jobs:
           ARCHIVE_FORMAT: ${{ matrix.archive }}
         run: |
           mkdir -p "dist/$PACKAGE_NAME"
-          go build -trimpath -ldflags="-s -w -X main.version=$RELEASE_TAG" \
+          go build -trimpath -ldflags="-s -w -X main.version=$RELEASE_TAG -X main.releaseBuild=true -X main.releaseRepository=${GITHUB_REPOSITORY} -X main.releaseCommit=$(git rev-parse HEAD)" \
             -o "dist/$PACKAGE_NAME/work2api$EXTENSION" ./cmd/server
           cp README.md "dist/$PACKAGE_NAME/"
           cp .env.example "dist/$PACKAGE_NAME/"
@@ -199,6 +199,9 @@ jobs:
           labels: ${{ steps.image_metadata.outputs.labels }}
           build-args: |
             VERSION=${{ needs.prepare.outputs.release_tag }}
+            RELEASE_BUILD=true
+            RELEASE_REPOSITORY=${{ github.repository }}
+            RELEASE_COMMIT=${{ needs.prepare.outputs.source_sha }}
           cache-from: type=gha,scope=container
           cache-to: type=gha,mode=max,scope=container
           provenance: mode=max

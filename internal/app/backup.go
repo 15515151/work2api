@@ -43,6 +43,7 @@ type backupState struct {
 	work        sync.Mutex
 	mu          sync.Mutex
 	status      string
+	lastPath    string
 	lastSuccess time.Time
 	lastAttempt time.Time
 }
@@ -255,7 +256,7 @@ func (o *Orchestrator) runBackup(ctx context.Context) (err error) {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			if path == root || (path != source && (d.Name() == ".git" || d.Name() == "logs")) {
+			if path == filepath.Join(o.cfg.DataDir, ".updates") || path == root || (path != source && (d.Name() == ".git" || d.Name() == "logs")) {
 				if d.IsDir() {
 					return filepath.SkipDir
 				}
@@ -438,6 +439,9 @@ func (o *Orchestrator) runBackup(ctx context.Context) (err error) {
 	if err = os.Rename(partial, final); err != nil {
 		return err
 	}
+	o.backup.mu.Lock()
+	o.backup.lastPath = final
+	o.backup.mu.Unlock()
 	marker := hex.EncodeToString(hash.Sum(nil)) + "  " + name + "\n"
 	actual, err := backupDigest(final)
 	if err != nil {

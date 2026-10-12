@@ -150,7 +150,17 @@ func (g *drainGate) drain(ctx context.Context, wait time.Duration) error {
 	return err
 }
 
-func startControl(dir, identity, adminURL string, g *drainGate, stop chan<- struct{}) (func(), error) {
+type updateHooks struct {
+	keepAliveOnUpdateStop bool
+	resume                func(string) error
+	abort                 func(string) error
+	prepare               func(context.Context, string) error
+	readiness             func(context.Context, string) (any, error)
+	accept                func(string) error
+}
+
+func (g *drainGate) resume() { g.mu.Lock(); g.draining = false; g.mu.Unlock() }
+func startControl(dir, identity, adminURL string, g *drainGate, stop chan<- struct{}, update ...updateHooks) (func(), error) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return nil, err
@@ -168,6 +178,44 @@ func startControl(dir, identity, adminURL string, g *drainGate, stop chan<- stru
 			return
 		}
 		switch r.Method {
+		case "OPTIONS":
+			if len(update) == 0 || update[0].resume == nil || update[0].resume(r.Header.Get("X-Update-Transaction")) != nil {
+				http.Error(w, "invalid transaction", 403)
+				return
+			}
+			w.WriteHeader(204)
+		case "DELETE":
+			if len(update) == 0 || update[0].abort == nil || update[0].abort(r.Header.Get("X-Update-Transaction")) != nil {
+				http.Error(w, "not gated", 403)
+				return
+			}
+			w.WriteHeader(202)
+			_ = http.NewResponseController(w).Flush()
+			select {
+			case stop <- struct{}{}:
+			default:
+			}
+		case "PATCH":
+			if len(update) == 0 || update[0].readiness == nil {
+				http.Error(w, "unsupported", 404)
+				return
+			}
+			value, err := update[0].readiness(r.Context(), r.Header.Get("X-Update-Transaction"))
+			if err != nil {
+				http.Error(w, "readiness failed", 409)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(value)
+		case "PUT":
+			if len(update) == 0 || update[0].accept == nil {
+				http.Error(w, "unsupported", 404)
+				return
+			}
+			if err := update[0].accept(r.Header.Get("X-Update-Transaction")); err != nil {
+				http.Error(w, "invalid transaction", 403)
+				return
+			}
+			w.WriteHeader(204)
 		case "GET":
 			g.mu.Lock()
 			draining := g.draining
@@ -185,9 +233,24 @@ func startControl(dir, identity, adminURL string, g *drainGate, stop chan<- stru
 				http.Error(w, err.Error(), 409)
 				return
 			}
+			if token := r.Header.Get("X-Update-Transaction"); token != "" {
+				if len(update) == 0 || update[0].prepare == nil {
+					g.resume()
+					http.Error(w, "unsupported", 409)
+					return
+				}
+				if err := update[0].prepare(r.Context(), token); err != nil {
+					g.resume()
+					http.Error(w, "更新前备份失败，旧服务已恢复", 409)
+					return
+				}
+			}
 			w.WriteHeader(202)
 			_, _ = w.Write([]byte("drained"))
 			_ = http.NewResponseController(w).Flush()
+			if r.Header.Get("X-Update-Transaction") != "" && len(update) > 0 && update[0].keepAliveOnUpdateStop {
+				return
+			}
 			select {
 			case stop <- struct{}{}:
 			default:
