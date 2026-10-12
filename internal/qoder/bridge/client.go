@@ -234,7 +234,7 @@ func (c *BearerClient) openStreamLines(ctx context.Context, fullURL string, json
 		if resp != nil {
 			status = resp.StatusCode
 		}
-		streamwatch.AttemptHeaders(ctx, status)
+		streamwatch.AttemptHTTP(ctx, resp)
 		streamwatch.AttemptResult(ctx, status)
 		if err != nil {
 			lastErr = err
@@ -279,7 +279,7 @@ func (c *BearerClient) openStreamLines(ctx context.Context, fullURL string, json
 		defer close(done)
 		go func() {
 			scanner := bufio.NewScanner(watch.Reader(resp.Body))
-			scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024)
+			scanner.Buffer(make([]byte, 0, streamwatch.DefaultMaxLineBytes), streamwatch.DefaultMaxLineBytes)
 			for scanner.Scan() {
 				select {
 				case lineCh <- scanner.Text():

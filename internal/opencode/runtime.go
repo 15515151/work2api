@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -22,6 +23,8 @@ const (
 // found it stays inert: Ready() is false, Models() is empty, and Serve()
 // returns an error.
 type Runtime struct {
+	keyModelsMu  sync.RWMutex
+	keyModels    map[string][]string
 	modelRefresh provider.RefreshGate
 	lifecycleCtx context.Context
 	registry     atomic.Pointer[provider.Registry]
@@ -202,9 +205,11 @@ func (rt *Runtime) Models(ctx context.Context) []provider.CatalogModel {
 		md := rt.catalog.MetadataForTier(route.ID, route.Tier)
 		decision := rt.catalog.anonymousDecision(route.ID)
 		extra := map[string]any{
+			"account_uids":      rt.routeAccountUIDs(route),
 			"catalog_source":    snapshot.CacheSource,
 			"catalog_stale":     snapshot.Stale,
 			"free":              decision.Allowed,
+			"upstream_free":     isFreeModel(route.ID),
 			"tier":              string(route.Tier),
 			"native_protocol":   string(route.Protocol),
 			"reasoning":         md.Reasoning,

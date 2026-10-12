@@ -34,12 +34,30 @@ func (rt *Runtime) AdminData(ctx context.Context) provider.AdminData {
 	if rt.cfg.Anonymous {
 		accts = append(accts, map[string]any{"id": "anonymous", "label": "匿名（public）", "tier": "anonymous", "key_count": 1})
 	}
+	seen := map[string]bool{}
+	for _, tier := range []struct {
+		name string
+		pool *nodePool
+	}{{"zen", rt.zenNodes}, {"go", rt.goNodes}} {
+		for _, node := range tier.pool.nodes {
+			uid := PortalKeyUID(node.key)
+			if seen[uid] {
+				continue
+			}
+			seen[uid] = true
+			accts = append(accts, map[string]any{"id": uid, "label": "OpenCode " + tier.name + " · " + uid[len(uid)-8:], "source": "native", "credential": true, "key_count": 1, "enabled": true})
+		}
+	}
 	d.Accounts = accts
 	d.Resources = []provider.ResourceSummary{}
 	for _, row := range accts {
 		kind := "key_tier"
 		if row["tier"] == "anonymous" {
 			kind = "anonymous"
+		}
+		if row["credential"] == true {
+			d.Resources = append(d.Resources, provider.ResourceMetadata(row, "api_key", map[string]provider.ResourceAction{}))
+			continue
 		}
 		d.Resources = append(d.Resources, provider.ResourceMetadata(row, kind, map[string]provider.ResourceAction{
 			"config": {Label: "编辑配置", Enabled: true},

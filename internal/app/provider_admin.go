@@ -8,6 +8,7 @@ import (
 	"sort"
 
 	"work2api/internal/core/provider"
+	"work2api/internal/store"
 )
 
 func (s *Server) mountProviderAdmin(mux *http.ServeMux) {
@@ -339,7 +340,47 @@ func (s *Server) adminProviderDetail(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"name": name, "ready": rt.Ready()})
 		return
 	}
-	writeJSON(w, 200, adminDataToMap(name, ar.AdminData(r.Context())))
+	d := ar.AdminData(r.Context())
+	contributions, err := s.o.db.ListContributions()
+	if err != nil {
+		writeAPIErr(w, errBody(503, "账号归属查询失败", "server_error"))
+		return
+	}
+	users, err := s.o.db.ListUsers()
+	if err != nil {
+		writeAPIErr(w, errBody(503, "账号归属查询失败", "server_error"))
+		return
+	}
+	names := map[int64]string{}
+	for _, u := range users {
+		names[u.ID] = u.Username
+	}
+	owners := map[string]store.Contribution{}
+	for _, c := range contributions {
+		owners[c.AccountUID] = c
+	}
+	rows := make([]map[string]any, 0, len(d.Accounts))
+	for _, original := range d.Accounts {
+		row := map[string]any{}
+		for k, v := range original {
+			row[k] = v
+		}
+		uid := str2(row["uid"])
+		if uid == "" {
+			uid = str2(row["id"])
+		}
+		if name == "qoder" {
+			uid = "qoder:" + uid
+		}
+		if c, ok := owners[uid]; ok {
+			row["owner_username"] = names[c.UserID]
+			row["owner_user_id"] = c.UserID
+			row["contribution_status"] = c.Status
+		}
+		rows = append(rows, row)
+	}
+	d.Accounts = rows
+	writeJSON(w, 200, adminDataToMap(name, d))
 }
 
 func (s *Server) adminProviderCheckin(w http.ResponseWriter, r *http.Request) {

@@ -12,6 +12,7 @@ import (
 	"work2api/internal/streamwatch"
 
 	"work2api/internal/core/protocol"
+	"work2api/internal/core/provider"
 	"work2api/internal/jsonutil"
 )
 
@@ -113,6 +114,9 @@ func (rt *Runtime) doUpstreamTiers(ctx context.Context, route Route, bodies map[
 	effectiveRoute := route
 	attempts := attemptOffset
 	if route.Anonymous {
+		lastErr = provider.CheckDispatch(ctx, provider.AccountRef{Provider: runtimeName, LocalID: "opencode:anonymous"}, runtimePrefix+route.ID)
+	}
+	if route.Anonymous && lastErr == nil {
 		resp, err, used := rt.doAnonymousUpstream(ctx, route, bodies, ids, attempts)
 		attempts += used
 		if err == nil && resp != nil && resp.StatusCode/100 == 2 {
@@ -192,13 +196,19 @@ func (rt *Runtime) doAnonymousUpstream(ctx context.Context, route Route, bodies 
 		if err != nil {
 			return nil, err, attempts
 		}
+		if err := provider.CheckDispatch(ctx, provider.AccountRef{Provider: runtimeName, LocalID: "opencode:anonymous"}, runtimePrefix+route.ID); err != nil {
+			return nil, err, attempts
+		}
 		streamwatch.StartAttempt(ctx)
+		if ids.AccountUID != nil {
+			*ids.AccountUID = "opencode:anonymous"
+		}
 		resp, err := node.proxy.client.Do(req)
 		attemptStatus := 0
 		if resp != nil {
 			attemptStatus = resp.StatusCode
 		}
-		streamwatch.AttemptHeaders(ctx, attemptStatus)
+		streamwatch.AttemptHTTP(ctx, resp)
 		streamwatch.AttemptResult(req.Context(), attemptStatus)
 		if ctx.Err() != nil {
 			lastResponse, lastErr = resp, err
@@ -389,7 +399,8 @@ func (rt *Runtime) doKeyUpstream(ctx context.Context, route Route, bodies map[Ti
 	if shaped, changed := rt.shapeKeyBody(body, route, route.Tier); changed {
 		body = shaped
 	}
-	for attempts < rt.cfg.Retry.MaxAttempts {
+	visited := 0
+	for attempts < rt.cfg.Retry.MaxAttempts && visited < nodes.Len()*rt.cfg.Retry.MaxAttempts {
 		if ctx.Err() != nil {
 			if lastErr == nil {
 				lastErr = ctx.Err()
@@ -400,11 +411,24 @@ func (rt *Runtime) doKeyUpstream(ctx context.Context, route Route, bodies map[Ti
 		if node == nil {
 			break
 		}
-		attempts++
+		visited++
+		uid := PortalKeyUID(node.key)
+		if !rt.keySupportsModel(uid, route.ID) {
+			continue
+		}
+		call := provider.CurrentInvocation(ctx)
+		if call.Caller.UserID > 0 && !call.Caller.AccountScope[uid] {
+			continue
+		}
+		if err := provider.CheckDispatch(ctx, provider.AccountRef{Provider: runtimeName, LocalID: uid}, runtimePrefix+route.ID); err != nil {
+			lastErr = err
+			continue
+		}
 		if lastResponse != nil {
 			drainAndClose(lastResponse.Body)
 			lastResponse = nil
 		}
+		attempts++
 		req, err := newUpstreamRequest(ctx, baseURL, route.Protocol, body, ids, node.key)
 		if err != nil {
 			return nil, err, attempts
@@ -415,12 +439,15 @@ func (rt *Runtime) doKeyUpstream(ctx context.Context, route Route, bodies map[Ti
 			break
 		}
 		streamwatch.StartAttempt(ctx)
+		if ids.AccountUID != nil {
+			*ids.AccountUID = uid
+		}
 		resp, err := proxy.client.Do(req)
 		attemptStatus := 0
 		if resp != nil {
 			attemptStatus = resp.StatusCode
 		}
-		streamwatch.AttemptHeaders(ctx, attemptStatus)
+		streamwatch.AttemptHTTP(ctx, resp)
 		streamwatch.AttemptResult(req.Context(), attemptStatus)
 		if ctx.Err() != nil {
 			lastResponse, lastErr = resp, err
@@ -441,6 +468,9 @@ func (rt *Runtime) doKeyUpstream(ctx context.Context, route Route, bodies map[Ti
 	}
 	if lastResponse != nil {
 		return lastResponse, nil, attempts
+	}
+	if lastErr == nil && provider.CurrentInvocation(ctx).Caller.UserID > 0 {
+		lastErr = provider.NewAPIError(403, "没有符合当前模型权限的账号", "account_not_allowed")
 	}
 	return nil, lastErr, attempts
 }

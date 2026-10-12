@@ -2,6 +2,7 @@ package qoder
 
 import (
 	"fmt"
+	"time"
 	"work2api/internal/statebackup"
 
 	"work2api/internal/core/provider"
@@ -16,6 +17,7 @@ var _ provider.OAuthRuntime = (*Runtime)(nil)
 // oauthState tracks one in-flight scan login. WaitLogin blocks up to 10 min, so
 // it runs in a goroutine and updates this state; the WebUI polls OAuthPoll.
 type oauthState struct {
+	created time.Time
 	status  string         // "pending" | "ready" | "error"
 	message string         // error detail / progress
 	account map[string]any // set on ready
@@ -56,7 +58,8 @@ func (r *Runtime) OAuthBegin(opts map[string]any) (map[string]any, error) {
 	go func(loginID string) {
 		leave := statebackup.Enter()
 		defer leave()
-		acct, err := account.WaitLogin(loginID)
+		claim, _ := opts["claim"].(func(string) error)
+		acct, err := account.WaitLogin(loginID, claim)
 		if err != nil {
 			r.setOAuth(loginID, &oauthState{status: "error", message: err.Error()})
 			return
@@ -65,12 +68,16 @@ func (r *Runtime) OAuthBegin(opts map[string]any) (map[string]any, error) {
 			r.setOAuth(loginID, &oauthState{status: "error", message: "保存账号失败：" + err.Error()})
 			return
 		}
-		_ = account.SetActive(acct.ID)
+		if opts["portal"] != true {
+			_ = account.SetActive(acct.ID)
+		}
 		if err := account.SetGatewayHidden(acct.ID, false); err != nil {
 			r.setOAuth(loginID, &oauthState{status: "error", message: "恢复账户失败：" + err.Error()})
 			return
 		}
-		_ = account.SetGatewayHidden("qoder-local-"+string(acct.Region), false)
+		if opts["portal"] != true {
+			_ = account.SetGatewayHidden("qoder-local-"+string(acct.Region), false)
+		}
 		r.mu.Lock()
 		delete(r.bridges, acct.ID)
 		r.bridgeGeneration[acct.ID]++
@@ -103,6 +110,17 @@ func (r *Runtime) setOAuth(loginID string, st *oauthState) {
 	defer r.oauthMu.Unlock()
 	if r.oauthStates == nil {
 		r.oauthStates = map[string]*oauthState{}
+	}
+	now := time.Now()
+	if old := r.oauthStates[loginID]; old != nil {
+		st.created = old.created
+	} else {
+		st.created = now
+	}
+	for id, state := range r.oauthStates {
+		if now.Sub(state.created) > 15*time.Minute {
+			delete(r.oauthStates, id)
+		}
 	}
 	r.oauthStates[loginID] = st
 }

@@ -12,6 +12,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -319,37 +320,114 @@ func (r *Runtime) bridgeFor(ctx context.Context, acct *account.Account, secret s
 // Models returns the active account's cached catalog without network I/O.
 // Until discovery succeeds, it exposes a clearly marked conservative fallback.
 func (r *Runtime) Models(ctx context.Context) []provider.CatalogModel {
-	acct, secret, err := r.pickAccount()
-	if err != nil {
+	if !r.Ready() {
 		return nil
 	}
-	key := modelCatalogKey(acct, secret)
+	current, secret, _ := r.pickAccount()
+	accounts, _ := account.List()
+	valid := map[string][32]byte{}
+	for i := range accounts {
+		a := &accounts[i]
+		if account.IsGatewayHidden(a.ID) {
+			continue
+		}
+		if sec, e := account.GetSecret(a.ID); e == nil && sec != "" {
+			valid[a.ID] = modelCatalogKey(a, sec)
+		}
+	}
+	currentKey := [32]byte{}
+	if current != nil {
+		currentKey = modelCatalogKey(current, secret)
+		valid[current.ID] = currentKey
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.modelCacheLoaded && r.modelCacheKey == key {
-		out := make([]provider.CatalogModel, 0, len(r.modelCache))
-		for _, model := range r.modelCache {
-			model.Extra = cloneCatalogExtra(model.Extra)
-			model.Extra["catalog_source"] = "live"
-			model.Extra["catalog_stale"] = r.modelCacheStale
-			out = append(out, model)
-		}
-		return out
+	out := []provider.CatalogModel{}
+	index := map[string]int{}
+	freeSource := func(m provider.CatalogModel) bool {
+		factor, ok := m.Extra["price_factor"].(*float64)
+		return ok && factor != nil && *factor == 0 && m.Extra["pricing_known"] == true
 	}
-	return r.fallbackModels()
+	add := func(m provider.CatalogModel, id string) {
+		if i, ok := index[m.ID]; ok {
+			if freeSource(m) {
+				out[i].Extra["has_free_source"] = true
+			}
+			uids, _ := out[i].Extra["account_uids"].([]string)
+			for _, uid := range uids {
+				if uid == PortalAccountUID(id) {
+					return
+				}
+			}
+			out[i].Extra["account_uids"] = append(uids, PortalAccountUID(id))
+			return
+		}
+		m.Extra = cloneCatalogExtra(m.Extra)
+		m.Extra["account_uids"] = []string{PortalAccountUID(id)}
+		m.Extra["has_free_source"] = freeSource(m)
+		index[m.ID] = len(out)
+		out = append(out, m)
+	}
+	if r.modelCacheLoaded && current != nil && r.modelCacheKey == currentKey {
+		for _, m := range r.modelCache {
+			m.Extra = cloneCatalogExtra(m.Extra)
+			m.Extra["catalog_source"] = "live"
+			m.Extra["catalog_stale"] = r.modelCacheStale
+			add(m, current.ID)
+		}
+	}
+	for key, snapshot := range r.accountModels {
+		if v, ok := valid[snapshot.accountID]; !ok || v != key {
+			continue
+		}
+		for _, m := range snapshot.catalog {
+			add(m, snapshot.accountID)
+		}
+	}
+	if len(out) == 0 && !(r.modelCacheLoaded && current != nil && r.modelCacheKey == currentKey) {
+		return r.fallbackModels()
+	}
+	return out
 }
 
 // RefreshModels performs network discovery only on explicit/scheduled refresh.
 // Ordinary catalog and health reads use Models' cached/fallback snapshot.
 func (r *Runtime) RefreshModels(ctx context.Context) error {
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	if !r.Ready() {
+		return fmt.Errorf("Qoder 未配置可用凭据")
+	}
+	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
-	acct, secret, err := r.pickAccount()
+	accounts, err := account.List()
 	if err != nil {
 		return err
 	}
-	key := modelCatalogKey(acct, secret)
-	return r.modelRefresh.Do(ctx, fmt.Sprintf("%x", key), func(ctx context.Context) error { return r.refreshAccountModels(ctx, acct, secret, key) })
+	if a, _, e := r.pickAccount(); e == nil && strings.HasPrefix(a.ID, "qoder-local-") {
+		accounts = append(accounts, *a)
+	}
+	var failures []error
+	for i := range accounts {
+		a := &accounts[i]
+		if account.IsGatewayHidden(a.ID) {
+			continue
+		}
+		secret, e := account.GetSecret(a.ID)
+		if strings.HasPrefix(a.ID, "qoder-local-") {
+			_, secret, e = r.pickAccount()
+		}
+		if e != nil || secret == "" {
+			continue
+		}
+		key := modelCatalogKey(a, secret)
+		e = r.modelRefresh.Do(ctx, fmt.Sprintf("%x", key), func(ctx context.Context) error { return r.refreshAccountModels(ctx, a, secret, key) })
+		if e != nil {
+			failures = append(failures, e)
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+	}
+	return errors.Join(failures...)
 }
 func (r *Runtime) refreshAccountModels(ctx context.Context, acct *account.Account, secret string, key [32]byte) error {
 	b, err := r.bridgeFor(ctx, acct, secret)
@@ -366,6 +444,9 @@ func (r *Runtime) refreshAccountModels(ctx context.Context, acct *account.Accoun
 	}
 	out := make([]provider.CatalogModel, 0, len(models))
 	for _, m := range models {
+		if !m.Enable {
+			continue
+		}
 		ctxWin := m.ContextWindow
 		if ctxWin == 0 {
 			ctxWin = m.MaxInputTokens
@@ -396,9 +477,21 @@ func (r *Runtime) refreshAccountModels(ctx context.Context, acct *account.Accoun
 			},
 		})
 	}
-	current, currentSecret, err := r.pickAccount()
-	if err != nil || modelCatalogKey(current, currentSecret) != key {
-		return fmt.Errorf("qoder account changed during model discovery")
+	current, currentSecret, _ := r.pickAccount()
+	r.mu.Lock()
+	if r.accountModels == nil {
+		r.accountModels = map[[32]byte]accountModelSnapshot{}
+	}
+	available := map[string]bool{}
+	for _, m := range models {
+		if m.Enable {
+			available[m.Key] = true
+		}
+	}
+	r.accountModels[key] = accountModelSnapshot{models: available, catalog: out, accountID: acct.ID, expires: time.Now().Add(5 * time.Minute)}
+	r.mu.Unlock()
+	if current == nil || modelCatalogKey(current, currentSecret) != key {
+		return nil
 	}
 	r.mu.Lock()
 	r.modelCache = out
@@ -463,8 +556,9 @@ func (r *Runtime) fallbackModels() []provider.CatalogModel {
 // to req.Writer via the ported bridge handlers.
 func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (provider.UsageReport, error) {
 	report := provider.UsageReport{Status: "ok"}
+	requestedModel := str(req.Payload["model"])
 
-	acct, secret, err := r.pickAccount()
+	acct, secret, err := r.pickServingAccount(ctx, str(req.Payload["model"]))
 	if err != nil {
 		writeServeError(req, err)
 		report.Status = "error"
@@ -473,7 +567,7 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (provide
 	}
 	preferredKey := modelCatalogKey(acct, secret)
 	affinityKey, hasAffinity := requestAffinityKey(req)
-	if sticky, stickySecret := r.affinityAccount(affinityKey, hasAffinity, preferredKey); sticky != nil {
+	if sticky, stickySecret := r.affinityAccount(affinityKey, hasAffinity, preferredKey); sticky != nil && accountAllowed(ctx, sticky.ID, str(req.Payload["model"])) == nil {
 		acct, secret = sticky, stickySecret
 	}
 	selected := acct
@@ -493,7 +587,7 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (provide
 	cooling := time.Now().Before(coolUntil)
 	r.mu.Unlock()
 	if cooling {
-		candidate, e := r.nextAccountBridge(ctx, acct.Region, model, tried)
+		candidate, e := r.nextAccountBridge(ctx, acct.Region, model, tried, requestedModel)
 		if candidate == nil {
 			if e == nil {
 				e = fmt.Errorf("Qoder 账号暂时不可用，请稍后重试")
@@ -517,7 +611,7 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (provide
 		if len(tried) >= 3 {
 			return nil, nil
 		}
-		candidate, err := r.nextAccountBridge(ctx, acct.Region, model, tried)
+		candidate, err := r.nextAccountBridge(ctx, acct.Region, model, tried, requestedModel)
 		if candidate == nil {
 			return nil, err
 		}
@@ -528,6 +622,10 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (provide
 	}
 	ctx = bridge.WithAccountFallback(ctx, next)
 
+	if err := accountAllowed(ctx, acct.ID, str(req.Payload["model"])); err != nil {
+		writeServeError(req, err)
+		return provider.UsageReport{Status: "error", Error: err.Error()}, err
+	}
 	b, err := r.bridgeFor(ctx, acct, secret)
 	if err != nil && ctx.Err() == nil {
 		candidate, candidateErr := next(ctx, model, err)
@@ -549,6 +647,10 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (provide
 		req.Payload["model"] = strings.TrimPrefix(m, runtimePrefix)
 	}
 
+	if err := accountAllowed(ctx, selected.ID, requestedModel); err != nil {
+		writeServeError(req, err)
+		return provider.UsageReport{Status: "error", Error: err.Error()}, err
+	}
 	var res bridge.ServeResult
 	switch req.Protocol {
 	case provider.ProtocolChat:
@@ -595,7 +697,12 @@ func writeServeError(req provider.ServeRequest, err error) {
 		return
 	}
 	req.Writer.Header().Set("Content-Type", "application/json")
-	req.Writer.WriteHeader(http.StatusServiceUnavailable)
+	status := http.StatusServiceUnavailable
+	var api *provider.APIError
+	if errors.As(err, &api) {
+		status = api.Status
+	}
+	req.Writer.WriteHeader(status)
 	body, _ := json.Marshal(map[string]interface{}{
 		"error": map[string]interface{}{"message": err.Error(), "type": "qoder_error"},
 	})

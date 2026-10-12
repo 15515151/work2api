@@ -269,13 +269,21 @@ func (rt *Runtime) refreshAnonymousTier(ctx context.Context, base string) []stri
 
 func (rt *Runtime) refreshTier(ctx context.Context, base string, nodes *nodePool) []string {
 	cursor := nodes.Cursor()
-	for attempt := 0; attempt < rt.cfg.Retry.MaxAttempts; attempt++ {
+	limit := rt.cfg.Retry.MaxAttempts
+	allKeys := len(rt.cfg.KeyModels) > 0
+	if allKeys {
+		limit = nodes.Len()
+	}
+	union := []string{}
+	seen := map[string]bool{}
+	succeeded := false
+	for attempt := 0; attempt < limit; attempt++ {
 		if ctx.Err() != nil {
 			return nil
 		}
 		node := cursor.Next()
 		if node == nil {
-			return nil
+			break
 		}
 		refreshCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		proxy := nodes.Proxy(node)
@@ -292,9 +300,28 @@ func (rt *Runtime) refreshTier(ctx context.Context, base string, nodes *nodePool
 		cancel()
 		if err == nil {
 			nodes.MarkSuccess(node)
-			return models
+			if !allKeys {
+				return models
+			}
+			rt.keyModelsMu.Lock()
+			if rt.keyModels == nil {
+				rt.keyModels = map[string][]string{}
+			}
+			rt.keyModels[PortalKeyUID(node.key)] = append([]string{}, models...)
+			rt.keyModelsMu.Unlock()
+			succeeded = true
+			for _, m := range models {
+				if !seen[m] {
+					union = append(union, m)
+					seen[m] = true
+				}
+			}
+			continue
 		}
 		nodes.MarkFailure(node, nil, err)
+	}
+	if succeeded {
+		return union
 	}
 	return nil
 }

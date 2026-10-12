@@ -233,7 +233,7 @@ func TestPrivateFailoverEligibilityAndAffinityInvalidation(t *testing.T) {
 		}
 		r.bridges[id] = &bridge.Bridge{}
 		r.bridgeKeys[id] = sha256.Sum256([]byte(string(region) + "\x00" + secret))
-		r.accountModels[modelCatalogKey(a, secret)] = accountModelSnapshot{map[string]bool{model: true}, time.Now().Add(time.Minute)}
+		r.accountModels[modelCatalogKey(a, secret)] = accountModelSnapshot{models: map[string]bool{model: true}, expires: time.Now().Add(time.Minute)}
 		return a
 	}
 	primary := save("primary", account.RegionCN, "qfmodel")
@@ -314,5 +314,57 @@ func TestClaudeSessionAffinityUsesCallerScope(t *testing.T) {
 	req.Payload["model"] = "qoder/other"
 	if next, _ := requestAffinityKey(req); next == first {
 		t.Fatal("conversation crosses models")
+	}
+}
+
+func TestPortalQoderSelectionAndLoginIsolation(t *testing.T) {
+	oldRoot := account.DataRoot()
+	account.SetDataRoot(t.TempDir())
+	defer account.SetDataRoot(oldRoot)
+	for _, id := range []string{"foreign", "own"} {
+		a := &account.Account{ID: id, Name: id, Region: account.RegionCN, Active: id == "foreign"}
+		if e := account.Save(a); e != nil {
+			t.Fatal(e)
+		}
+		if e := account.SaveSecret(id, "test-"+id); e != nil {
+			t.Fatal(e)
+		}
+	}
+	rt := New("error")
+	uid := PortalAccountUID("own")
+	ctx := provider.WithInvocation(context.Background(), provider.Invocation{Caller: provider.Caller{UserID: 1, AccountScope: map[string]bool{uid: true}}, Check: func(_ context.Context, a provider.AccountRef, m string) error {
+		if a.LocalID != uid || m != "qoder/model" {
+			t.Fatal("invalid scope", a, m)
+		}
+		return nil
+	}})
+	a, _, e := rt.pickServingAccount(ctx, "qoder/model")
+	if e != nil || a == nil || a.ID != "own" {
+		t.Fatal("preferred foreign identity bypassed owner scope", a, e)
+	}
+	first, e := account.StartLogin(account.RegionCN)
+	if e != nil {
+		t.Fatal(e)
+	}
+	second, e := account.StartLogin(account.RegionCN)
+	if e != nil {
+		t.Fatal(e)
+	}
+	account.CancelLogin(first.LoginID)
+	done := make(chan error, 1)
+	go func() { _, e := account.WaitLogin(second.LoginID); done <- e }()
+	select {
+	case e := <-done:
+		t.Fatal("second login was replaced by first cancellation", e)
+	case <-time.After(20 * time.Millisecond):
+	}
+	account.CancelLogin(second.LoginID)
+	select {
+	case e := <-done:
+		if e == nil || !strings.Contains(e.Error(), "cancelled") {
+			t.Fatal(e)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("own cancellation did not release login")
 	}
 }

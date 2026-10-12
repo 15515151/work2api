@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"work2api/internal/streamwatch"
 )
 
 var errStreamUpstreamFailure = errors.New("upstream stream failure delivered")
@@ -287,7 +288,7 @@ func nextSSEBoundary(data []byte) (int, int) {
 
 func readSSE(reader io.Reader, handler func(eventName, data string) error) error {
 	scanner := bufio.NewScanner(reader)
-	scanner.Buffer(make([]byte, 64<<10), 16<<20)
+	scanner.Buffer(make([]byte, 64<<10), streamwatch.DefaultMaxLineBytes)
 	var eventName string
 	var dataLines []string
 	flush := func() error {

@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"work2api/internal/core/protocol"
 	"work2api/internal/core/provider"
 )
 
@@ -227,4 +228,81 @@ func TestExplicitCatalogRefreshRetainsFailedTierAndClearsEmptyTier(t *testing.T)
 	if err := rt.RefreshModels(context.Background()); !errors.Is(err, context.Canceled) {
 		t.Fatal("closed runtime started refresh", err)
 	}
+}
+
+func TestPortalKeyFilteringDoesNotConsumeUpstreamAttempts(t *testing.T) {
+	calls := 0
+	proxy := &proxyTransport{client: &http.Client{Transport: catalogTestTransport(func(req *http.Request) (*http.Response, error) {
+		calls++
+		if req.Header.Get("Authorization") != "Bearer own" {
+			t.Fatal("foreign key dispatched")
+		}
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader("{}")), Header: make(http.Header)}, nil
+	})}}
+	proxy.healthy.Store(true)
+	transports := &transportPool{items: []*proxyTransport{proxy}}
+	nodes, e := newNodePool([]string{"foreign-one", "foreign-two", "own"}, transports, time.Minute)
+	if e != nil {
+		t.Fatal(e)
+	}
+	rt := &Runtime{cfg: Config{Retry: RetryConfig{MaxAttempts: 1}, Upstream: UpstreamConfig{Zen: "https://upstream.invalid"}}, zenNodes: nodes, catalog: NewCatalog(TierZen, nil)}
+	uid := PortalKeyUID("own")
+	ctx := provider.WithInvocation(context.Background(), provider.Invocation{Caller: provider.Caller{UserID: 1, AccountScope: map[string]bool{uid: true}}, Check: func(_ context.Context, a provider.AccountRef, m string) error {
+		if a.LocalID != uid || m != "opencode/paid-model" {
+			t.Fatal("incorrect dispatch identity", a, m)
+		}
+		return nil
+	}})
+	route := Route{ID: "paid-model", Tier: TierZen, Protocol: protocol.Chat}
+	bodies := map[Tier][]byte{TierZen: []byte(`{"model":"paid-model"}`)}
+	accountUID := ""
+	resp, e, attempts := rt.doKeyUpstream(ctx, route, bodies, RequestIDs{AccountUID: &accountUID}, 0)
+	if e != nil || resp == nil || calls != 1 || attempts != 1 || accountUID != uid {
+		t.Fatal("authorized key starved by scope filtering", e, calls, attempts, accountUID)
+	}
+	resp.Body.Close()
+	nodes.next.Store(0)
+	calls = 0
+	revoked := provider.WithInvocation(context.Background(), provider.Invocation{Caller: provider.Caller{UserID: 1, AccountScope: map[string]bool{uid: true}}, Check: func(context.Context, provider.AccountRef, string) error {
+		return provider.NewAPIError(403, "revoked", "forbidden")
+	}})
+	if resp, e, _ = rt.doKeyUpstream(revoked, route, bodies, RequestIDs{}, 0); resp != nil || e == nil || calls != 0 {
+		t.Fatal("revoked credential dispatched", resp, e, calls)
+	}
+	if got := toStringSlice([]string{"kept-key"}); len(got) != 1 || got[0] != "kept-key" {
+		t.Fatal("native import clears credentials")
+	}
+	rt.cfg.KeyModels = map[string][]string{uid: {"allowed-model"}}
+	if rt.keySupportsModel(uid, "paid-model") || !rt.keySupportsModel(uid, "allowed-model") {
+		t.Fatal("credential catalog ignored")
+	}
+}
+
+func TestSingleAllowedKeyRetainsTransientRetryBudget(t *testing.T) {
+	calls := 0
+	proxy := &proxyTransport{client: &http.Client{Transport: catalogTestTransport(func(req *http.Request) (*http.Response, error) {
+		// Connectivity probes are GETs, not model attempts. Keep their result
+		// separate from the POST retry counter, including asynchronous probes.
+		if req.Method == http.MethodGet {
+			return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("ok"))}, nil
+		}
+		calls++
+		status := 503
+		if calls == 2 {
+			status = 200
+		}
+		return &http.Response{StatusCode: status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("{}"))}, nil
+	})}}
+	proxy.healthy.Store(true)
+	transports := &transportPool{items: []*proxyTransport{proxy}}
+	nodes, e := newNodePool([]string{"one"}, transports, time.Minute)
+	if e != nil {
+		t.Fatal(e)
+	}
+	rt := &Runtime{cfg: Config{Retry: RetryConfig{MaxAttempts: 2}, Upstream: UpstreamConfig{Zen: "https://upstream.invalid"}}, zenNodes: nodes, transports: transports, catalog: NewCatalog(TierZen, nil)}
+	resp, e, attempts := rt.doKeyUpstream(context.Background(), Route{ID: "paid-model", Tier: TierZen, Protocol: protocol.Chat}, map[Tier][]byte{TierZen: []byte(`{}`)}, RequestIDs{}, 0)
+	if e != nil || resp == nil || resp.StatusCode != 200 || attempts != 2 || calls != 2 {
+		t.Fatal("single-key transient retries changed", e, attempts, calls)
+	}
+	resp.Body.Close()
 }

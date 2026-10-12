@@ -36,7 +36,7 @@ type pendingOAuth struct {
 
 var (
 	pendingMu sync.Mutex
-	pending   *pendingOAuth
+	pending   = map[string]*pendingOAuth{}
 )
 
 // StartLogin 启动 OAuth 登录流程
@@ -59,12 +59,19 @@ func StartLogin(region Region) (*OAuthSession, error) {
 	logger.Info("OAuth: StartLogin loginID=%s region=%s", loginID, region)
 
 	pendingMu.Lock()
-	if pending != nil {
-		pending.cancel()
+	for id, p := range pending {
+		if time.Now().After(p.deadline) {
+			p.cancel()
+			delete(pending, id)
+		}
+	}
+	if len(pending) >= 64 {
+		pendingMu.Unlock()
+		return nil, fmt.Errorf("too many pending logins")
 	}
 	deadline := time.Now().Add(10 * time.Minute)
 	ctx, cancel := context.WithDeadline(context.Background(), deadline)
-	pending = &pendingOAuth{
+	pending[loginID] = &pendingOAuth{
 		loginID:  loginID,
 		nonce:    nonce,
 		verifier: verifier,
@@ -79,11 +86,11 @@ func StartLogin(region Region) (*OAuthSession, error) {
 }
 
 // WaitLogin 等待用户完成 OAuth 授权
-func WaitLogin(loginID string) (*Account, error) {
+func WaitLogin(loginID string, claims ...func(string) error) (*Account, error) {
 	logger.Debug("OAuth: WaitLogin called loginID=%s", loginID)
 
 	pendingMu.Lock()
-	p := pending
+	p := pending[loginID]
 	pendingMu.Unlock()
 
 	if p == nil || p.loginID != loginID {
@@ -94,8 +101,8 @@ func WaitLogin(loginID string) (*Account, error) {
 	defer func() {
 		p.cancel()
 		pendingMu.Lock()
-		if pending == p {
-			pending = nil
+		if pending[loginID] == p {
+			delete(pending, loginID)
 		}
 		pendingMu.Unlock()
 	}()
@@ -119,7 +126,7 @@ func WaitLogin(loginID string) (*Account, error) {
 				continue
 			}
 			logger.Info("OAuth: Got token, building account")
-			acct, err := buildAccountFromToken(p.ctx, deviceToken, refreshToken, p.region, ep)
+			acct, err := buildAccountFromToken(p.ctx, deviceToken, refreshToken, p.region, ep, claims...)
 			if err != nil {
 				logger.Error("OAuth: Build account error: %v", err)
 				return nil, err
@@ -133,9 +140,9 @@ func WaitLogin(loginID string) (*Account, error) {
 func CancelLogin(loginID string) {
 	pendingMu.Lock()
 	defer pendingMu.Unlock()
-	if pending != nil && pending.loginID == loginID {
-		pending.cancel()
-		pending = nil
+	if p := pending[loginID]; p != nil {
+		p.cancel()
+		delete(pending, loginID)
 	}
 }
 
@@ -167,7 +174,7 @@ func pollToken(ctx context.Context, nonce, verifier string, ep Endpoints) (strin
 }
 
 // buildAccountFromToken 使用 device token 构建账号信息
-func buildAccountFromToken(ctx context.Context, deviceToken, refreshToken string, region Region, ep Endpoints) (*Account, error) {
+func buildAccountFromToken(ctx context.Context, deviceToken, refreshToken string, region Region, ep Endpoints, claims ...func(string) error) (*Account, error) {
 	info, err := oauthJSON(ctx, ep.UserinfoBase, deviceToken)
 	if err != nil {
 		return nil, fmt.Errorf("fetch user info: %w", err)
@@ -180,17 +187,26 @@ func buildAccountFromToken(ctx context.Context, deviceToken, refreshToken string
 	}
 	now := time.Now()
 	acct := &Account{
-		ID:        id,
-		Name:      strGet(info, "name"),
-		Email:     strings.ToLower(strGet(info, "email")),
-		UserType:  strGet(info, "userType"),
-		Plan:      plan,
-		Region:    region,
-		AuthMode:  "oauth",
-		APIMode:   "openai",
-		Tags:      []string{},
-		CreatedAt: now,
+		ID:         id,
+		UpstreamID: strGet(info, "userId"),
+		Name:       strGet(info, "name"),
+		Email:      strings.ToLower(strGet(info, "email")),
+		UserType:   strGet(info, "userType"),
+		Plan:       plan,
+		Region:     region,
+		AuthMode:   "oauth",
+		APIMode:    "openai",
+		Tags:       []string{},
+		CreatedAt:  now,
 	}
+	personal := len(claims) > 0 && claims[0] != nil
+	if personal && acct.UpstreamID == "" && acct.Email == "" {
+		return nil, fmt.Errorf("missing verified account identity")
+	}
+	if err := CanonicalIdentity(acct, personal); err != nil {
+		return nil, err
+	}
+	id = acct.ID
 	secretPayload, err := json.Marshal(map[string]string{
 		"device_token":  deviceToken,
 		"refresh_token": refreshToken,
@@ -200,6 +216,13 @@ func buildAccountFromToken(ctx context.Context, deviceToken, refreshToken string
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	for _, claim := range claims {
+		if claim != nil {
+			if err := claim(id); err != nil {
+				return nil, err
+			}
+		}
 	}
 	if err := SaveSecret(id, string(secretPayload)); err != nil {
 		return nil, err

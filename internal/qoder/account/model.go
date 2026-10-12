@@ -1,21 +1,27 @@
 package account
 
-import "time"
+import (
+	"crypto/sha256"
+	"fmt"
+	"strings"
+	"time"
+)
 
 type Account struct {
-	ID        string     `json:"id"`
-	Name      string     `json:"name"`
-	Email     string     `json:"email,omitempty"`
-	UserType  string     `json:"user_type,omitempty"`
-	Plan      string     `json:"plan,omitempty"`
-	Region    Region     `json:"region,omitempty"` // "global" | "cn"，空值视为 global
-	AuthMode  string     `json:"auth_mode"`        // "pat" | "oauth"
-	APIMode   string     `json:"api_mode"`         // "openai" | "anthropic" | "gemini" | "claude-code"
-	Tags      []string   `json:"tags"`
-	CreatedAt time.Time  `json:"created_at"`
-	LastUsed  *time.Time `json:"last_used,omitempty"`
-	Active    bool       `json:"active"`
-	SortOrder int        `json:"sort_order"`
+	UpstreamID string     `json:"upstream_id,omitempty"`
+	ID         string     `json:"id"`
+	Name       string     `json:"name"`
+	Email      string     `json:"email,omitempty"`
+	UserType   string     `json:"user_type,omitempty"`
+	Plan       string     `json:"plan,omitempty"`
+	Region     Region     `json:"region,omitempty"` // "global" | "cn"，空值视为 global
+	AuthMode   string     `json:"auth_mode"`        // "pat" | "oauth"
+	APIMode    string     `json:"api_mode"`         // "openai" | "anthropic" | "gemini" | "claude-code"
+	Tags       []string   `json:"tags"`
+	CreatedAt  time.Time  `json:"created_at"`
+	LastUsed   *time.Time `json:"last_used,omitempty"`
+	Active     bool       `json:"active"`
+	SortOrder  int        `json:"sort_order"`
 }
 
 type OAuthSession struct {
@@ -73,4 +79,34 @@ type QuotaBucket struct {
 	Total     float64 `json:"total"`
 	Remaining float64 `json:"remaining"`
 	ResetTime string  `json:"reset_time,omitempty"`
+}
+
+// CanonicalIdentity keeps OAuth and PAT imports of the same verified identity
+// under one ownership record, including native accounts created before this field.
+func CanonicalIdentity(a *Account, stable ...bool) error {
+	list, err := List()
+	if err != nil {
+		return err
+	}
+	email := strings.ToLower(strings.TrimSpace(a.Email))
+	for _, old := range list {
+		if NormalizeRegion(string(old.Region)) != NormalizeRegion(string(a.Region)) {
+			continue
+		}
+		if old.ID == a.ID && a.UpstreamID != "" && old.UpstreamID != "" && old.UpstreamID != a.UpstreamID && (email == "" || !strings.EqualFold(old.Email, email)) {
+			return fmt.Errorf("account identity collision")
+		}
+		if (a.UpstreamID != "" && old.UpstreamID == a.UpstreamID) || (email != "" && strings.EqualFold(old.Email, email)) || old.ID == a.ID {
+			a.ID, a.CreatedAt, a.Active, a.SortOrder = old.ID, old.CreatedAt, old.Active, old.SortOrder
+			return nil
+		}
+	}
+	if len(stable) > 0 && stable[0] && (a.UpstreamID != "" || email != "") {
+		identity := "uid:" + a.UpstreamID
+		if email != "" {
+			identity = "email:" + email
+		}
+		a.ID = fmt.Sprintf("qoder-%x", sha256.Sum256([]byte(string(a.Region)+":"+identity)))
+	}
+	return nil
 }

@@ -52,6 +52,9 @@ func (rt *Runtime) SaveConfigDoc(patch map[string]any) error {
 	if v, ok := patch["go_keys"]; ok {
 		cfg.GoKeys = toStringSlice(v)
 	}
+	if models, ok := patch["key_models"].(map[string][]string); ok {
+		cfg.KeyModels = models
+	}
 	if v, ok := patch["anonymous"].(bool); ok {
 		cfg.Anonymous = v
 	}
@@ -128,6 +131,9 @@ func writeConfigFile(path string, cfg Config) error {
 }
 
 func toStringSlice(v any) []string {
+	if values, ok := v.([]string); ok {
+		return append([]string{}, values...)
+	}
 	arr, ok := v.([]any)
 	if !ok {
 		return nil

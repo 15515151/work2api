@@ -29,7 +29,7 @@ func externalProtocol(p provider.Protocol) protocol.Protocol {
 
 // Serve handles one inference request end-to-end, writing the client response
 // to req.Writer and returning a usage report for the caller to log.
-func (rt *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (provider.UsageReport, error) {
+func (rt *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (result provider.UsageReport, serveErr error) {
 	if !rt.Ready() {
 		return provider.UsageReport{}, errors.New("opencode 未配置")
 	}
@@ -63,6 +63,9 @@ func (rt *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (provid
 
 	stream := jsonutil.BoolAt(payload, "stream")
 	ids := deriveCallerRequestIDs(req)
+	accountUID := ""
+	ids.AccountUID = &accountUID
+	defer func() { result.AccountUID = accountUID }()
 
 	// System One decision payloads share no shape with the message bridge, so
 	// they are relayed verbatim to every tier.
@@ -84,6 +87,11 @@ func (rt *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (provid
 		if errors.Is(err, context.DeadlineExceeded) {
 			protocol.WriteError(w, external, http.StatusGatewayTimeout, "upstream request timed out", "upstream_timeout", ids.Request)
 			return provider.UsageReport{Status: "error", Error: "upstream timeout"}, nil
+		}
+		var api *provider.APIError
+		if errors.As(err, &api) {
+			protocol.WriteError(w, external, api.Status, "当前模型或账号权限已改变，请重新发起请求", "account_not_allowed", ids.Request)
+			return provider.UsageReport{Status: "error", Error: api.Error()}, api
 		}
 		protocol.WriteError(w, external, http.StatusBadGateway, "all upstream attempts failed", "upstream_error", ids.Request)
 		return provider.UsageReport{Status: "error", Error: "upstream error"}, nil
@@ -178,6 +186,11 @@ func (rt *Runtime) serveSystemOne(ctx context.Context, w http.ResponseWriter, ex
 		if errors.Is(err, context.DeadlineExceeded) {
 			protocol.WriteError(w, protocol.SystemOne, http.StatusGatewayTimeout, "upstream request timed out", "upstream_timeout", ids.Request)
 			return provider.UsageReport{Status: "error", Error: "upstream timeout"}, nil
+		}
+		var api *provider.APIError
+		if errors.As(err, &api) {
+			protocol.WriteError(w, protocol.SystemOne, api.Status, "当前模型或账号权限已改变，请重新发起请求", "account_not_allowed", ids.Request)
+			return provider.UsageReport{Status: "error", Error: api.Error()}, api
 		}
 		protocol.WriteError(w, protocol.SystemOne, http.StatusBadGateway, "all upstream attempts failed", "upstream_error", ids.Request)
 		return provider.UsageReport{Status: "error", Error: "upstream error"}, nil

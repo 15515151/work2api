@@ -25,7 +25,7 @@ type eventReader struct {
 
 func newEvents(reader io.Reader) *eventReader {
 	s := bufio.NewScanner(reader)
-	s.Buffer(make([]byte, 4096), 8<<20)
+	s.Buffer(make([]byte, 4096), streamwatch.DefaultMaxLineBytes)
 	return &eventReader{scanner: s}
 }
 func (r *eventReader) next() (*upstream.SOLOEvent, error) {
@@ -177,7 +177,10 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 		if err = provider.CheckDispatch(ctx, ref, "trae/"+model); err != nil {
 			return report, err
 		}
+		streamwatch.StartAttempt(ctx)
 		stream, status, errorBody, headers, sendErr := r.client(ctx).ChatStreamWithHeaders(identity, encoded, identityModel)
+		streamwatch.AttemptHeaders(ctx, status, headers)
+		streamwatch.AttemptResult(ctx, status)
 		if sendErr != nil {
 			return report, errors.New("Trae 上游连接失败")
 		}
@@ -190,7 +193,10 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 						return report, checkErr
 					}
 					attempt++ // the same-identity retry shares the total dispatch budget
+					streamwatch.StartAttempt(ctx)
 					stream, status, errorBody, headers, sendErr = r.client(ctx).ChatStreamWithHeaders(identity, encoded, identityModel)
+					streamwatch.AttemptHeaders(ctx, status, headers)
+					streamwatch.AttemptResult(ctx, status)
 					if sendErr != nil {
 						return report, errors.New("Trae 上游连接失败")
 					}

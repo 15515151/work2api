@@ -63,22 +63,37 @@ func (r *Runtime) AddAccountByToken(ctx context.Context, token string, opts map[
 	}
 	id := account.SanitizeID(rawID + bridge.StrVal(jt, "name"))
 	acct := &account.Account{
-		ID:        id,
-		Name:      bridge.StrVal(jt, "name"),
-		Email:     bridge.StrVal(jt, "email"),
-		UserType:  bridge.StrValDefault(jt, "userType", "personal_standard"),
-		Region:    region,
-		AuthMode:  "pat",
-		APIMode:   "openai",
-		Tags:      []string{},
-		CreatedAt: time.Now(),
+		ID:         id,
+		UpstreamID: rawID,
+		Name:       bridge.StrVal(jt, "name"),
+		Email:      bridge.StrVal(jt, "email"),
+		UserType:   bridge.StrValDefault(jt, "userType", "personal_standard"),
+		Region:     region,
+		AuthMode:   "pat",
+		APIMode:    "openai",
+		Tags:       []string{},
+		CreatedAt:  time.Now(),
+	}
+	if err := account.CanonicalIdentity(acct, opts["portal"] == true); err != nil {
+		return nil, err
+	}
+	if claim, ok := opts["claim"].(func(string) error); ok {
+		if err := claim(acct.ID); err != nil {
+			return nil, err
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if err := account.ImportAndActivate(acct, token); err != nil {
+	var persistErr error
+	if opts["portal"] == true {
+		persistErr = account.ImportAndActivate(acct, token, false)
+	} else {
+		persistErr = account.ImportAndActivate(acct, token)
+	}
+	if err := persistErr; err != nil {
 		return nil, fmt.Errorf("保存及激活账号失败: %w", err)
 	}
 	delete(r.bridges, acct.ID)

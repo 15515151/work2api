@@ -499,7 +499,7 @@ func (r *Runtime) importAccount(ctx context.Context, token string, opts map[stri
 		return nil, err
 	}
 	if ownerID > 0 && owner.Status == "verifying" {
-		if err = r.db.ActivateContributionWithGroups(owner.ID, ownerID); err != nil {
+		if err = r.db.ActivateContribution(owner.ID, ownerID); err != nil {
 			return nil, err
 		}
 		if previous != nil && !previous.Enabled {

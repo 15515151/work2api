@@ -151,11 +151,7 @@ func (c *Client) StreamUpstream(ctx context.Context, headers map[string]string, 
 		req.Header.Set(k, v)
 	}
 	resp, err := c.hc.Do(req)
-	status := 0
-	if resp != nil {
-		status = resp.StatusCode
-	}
-	streamwatch.AttemptHeaders(ctx, status)
+	streamwatch.AttemptHTTP(ctx, resp)
 	if err != nil {
 		return err
 	}
@@ -230,7 +226,7 @@ func streamSSE(resp *http.Response, yield LineFunc) error {
 	defer watch.Close()
 	scanner := bufio.NewScanner(watch.Reader(resp.Body))
 	scanner.Split(scanEventLine)
-	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+	scanner.Buffer(make([]byte, 0, 64*1024), streamwatch.DefaultMaxLineBytes)
 	state := completionState{}
 	var event strings.Builder
 	var terminal []string

@@ -21,21 +21,22 @@ const (
 // JSON compatibility but is unused here: client auth is handled by work2api's
 // app-key layer, not by this runtime.
 type Config struct {
-	Listen      string            `json:"listen"`
-	ServerKeys  []string          `json:"server_keys"`
-	ZenKeys     []string          `json:"zen_keys"`
-	GoKeys      []string          `json:"go_keys"`
-	Anonymous   bool              `json:"anonymous"`
-	Proxies     []string          `json:"proxies"`
-	ProxyFile   string            `json:"proxyfile"`
-	Upstream    UpstreamConfig    `json:"upstream"`
-	Retry       RetryConfig       `json:"retry"`
-	Models      ModelsConfig      `json:"models"`
-	Performance PerformanceConfig `json:"performance"`
-	Logging     LoggingConfig     `json:"logging"`
-	WebUI       WebUIConfig       `json:"webui"`
-	Prefer      Tier              `json:"prefer"`
-	Reasoning   ReasoningConfig   `json:"reasoning"`
+	Listen      string              `json:"listen"`
+	ServerKeys  []string            `json:"server_keys"`
+	ZenKeys     []string            `json:"zen_keys"`
+	GoKeys      []string            `json:"go_keys"`
+	KeyModels   map[string][]string `json:"key_models,omitempty"`
+	Anonymous   bool                `json:"anonymous"`
+	Proxies     []string            `json:"proxies"`
+	ProxyFile   string              `json:"proxyfile"`
+	Upstream    UpstreamConfig      `json:"upstream"`
+	Retry       RetryConfig         `json:"retry"`
+	Models      ModelsConfig        `json:"models"`
+	Performance PerformanceConfig   `json:"performance"`
+	Logging     LoggingConfig       `json:"logging"`
+	WebUI       WebUIConfig         `json:"webui"`
+	Prefer      Tier                `json:"prefer"`
+	Reasoning   ReasoningConfig     `json:"reasoning"`
 
 	effectiveProxies []string
 }

@@ -19,6 +19,7 @@ type RequestIDs struct {
 	Request       string
 	Project       string
 	ParentSession string
+	AccountUID    *string
 }
 
 // deriveRequestIDs builds the correlation IDs from the client's session

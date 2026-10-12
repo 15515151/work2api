@@ -14,8 +14,10 @@ import (
 )
 
 type accountModelSnapshot struct {
-	models  map[string]bool
-	expires time.Time
+	models    map[string]bool
+	catalog   []provider.CatalogModel
+	accountID string
+	expires   time.Time
 }
 type servingAccount struct {
 	account *account.Account
@@ -143,7 +145,11 @@ func (r *Runtime) coolAccount(acct *account.Account, secret string, cause error)
 
 // Failover never changes the active flag or region, and only selects a model
 // explicitly advertised by the candidate account. Unknown catalogs are skipped.
-func (r *Runtime) nextAccountBridge(ctx context.Context, region account.Region, model string, tried map[string]bool) (*servingAccount, error) {
+func (r *Runtime) nextAccountBridge(ctx context.Context, region account.Region, model string, tried map[string]bool, requested ...string) (*servingAccount, error) {
+	permissionModel := runtimePrefix + model
+	if len(requested) > 0 {
+		permissionModel = requested[0]
+	}
 	accounts, err := account.List()
 	if err != nil {
 		return nil, err
@@ -157,6 +163,9 @@ func (r *Runtime) nextAccountBridge(ctx context.Context, region account.Region, 
 			break
 		}
 		if tried[acct.ID] || account.NormalizeRegion(string(acct.Region)) != account.NormalizeRegion(string(region)) || account.IsGatewayHidden(acct.ID) {
+			continue
+		}
+		if accountAllowed(ctx, acct.ID, permissionModel) != nil {
 			continue
 		}
 		secret, e := account.GetSecret(acct.ID)
@@ -186,7 +195,8 @@ func (r *Runtime) nextAccountBridge(ctx context.Context, region account.Region, 
 			var models []bridge.QoderModel
 			models, e = b.ListAvailableModelsContext(probeCtx)
 			if e == nil {
-				snapshot = accountModelSnapshot{models: make(map[string]bool), expires: time.Now().Add(5 * time.Minute)}
+				snapshot.models = make(map[string]bool)
+				snapshot.expires = time.Now().Add(5 * time.Minute)
 				for _, m := range models {
 					if m.Enable {
 						snapshot.models[m.Key] = true
@@ -198,7 +208,7 @@ func (r *Runtime) nextAccountBridge(ctx context.Context, region account.Region, 
 				}
 				// Bound cache cardinality across credential reimports.
 				for id, value := range r.accountModels {
-					if !value.expires.After(time.Now()) {
+					if !value.expires.After(time.Now()) && len(value.catalog) == 0 {
 						delete(r.accountModels, id)
 					}
 				}
@@ -221,6 +231,9 @@ func (r *Runtime) nextAccountBridge(ctx context.Context, region account.Region, 
 			if e != nil || se != nil || current == nil || modelCatalogKey(current, currentSecret) != key {
 				continue
 			}
+		}
+		if err := accountAllowed(ctx, acct.ID, permissionModel); err != nil {
+			return nil, err
 		}
 		return &servingAccount{acct, secret, b}, nil
 	}

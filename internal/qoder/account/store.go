@@ -238,7 +238,8 @@ func EnsureMachineSalt() (string, error) {
 // ImportAndActivate updates the credential and account as one serialized
 // operation. Recover the exact previous bytes on failure, including activation
 // and the hidden marker; never delete a pre-existing credential as rollback.
-func ImportAndActivate(a *Account, secret string) (err error) {
+func ImportAndActivate(a *Account, secret string, activate ...bool) (err error) {
+	makeActive := len(activate) == 0 || activate[0]
 	mu.Lock()
 	defer mu.Unlock()
 	d, err := dir()
@@ -259,6 +260,7 @@ func ImportAndActivate(a *Account, secret string) (err error) {
 			previous := accounts[i]
 			previous.Region, previous.AuthMode = a.Region, a.AuthMode
 			previous.Email, previous.UserType = a.Email, a.UserType
+			previous.UpstreamID = a.UpstreamID
 			if previous.Name == "" {
 				previous.Name = a.Name
 			}
@@ -307,7 +309,9 @@ func ImportAndActivate(a *Account, secret string) (err error) {
 		return err
 	}
 	for i := range accounts {
-		accounts[i].Active = accounts[i].ID == a.ID
+		if makeActive {
+			accounts[i].Active = accounts[i].ID == a.ID
+		}
 		data, e := json.MarshalIndent(&accounts[i], "", "  ")
 		if e != nil {
 			return e
@@ -319,7 +323,9 @@ func ImportAndActivate(a *Account, secret string) (err error) {
 	if err = SetGatewayHidden(a.ID, false); err != nil {
 		return err
 	}
-	a.Active = true
+	if makeActive {
+		a.Active = true
+	}
 	return nil
 }
 func writeAtomic(path string, data []byte) error {
