@@ -307,6 +307,19 @@ func (o *Runtime) OpenUpstreamScoped(ctx context.Context, acc *pool.Account, bod
 	compatTries := 0
 	compatUID := ""
 	compatLevel := 0
+	requestCompatLevel := 0
+	var candidates [3]struct {
+		body           map[string]any
+		matched, ready bool
+	}
+	compatibleBody := func(level int) (map[string]any, bool) {
+		candidate := &candidates[level]
+		if !candidate.ready {
+			candidate.body, candidate.matched = ChannelCompatibilityBody(body, level)
+			candidate.ready = true
+		}
+		return candidate.body, candidate.matched
+	}
 	fingerprint := CompatibilityFingerprint(body)
 	for attempt := 0; ; attempt++ {
 
@@ -405,22 +418,24 @@ func (o *Runtime) OpenUpstreamScoped(ctx context.Context, acc *pool.Account, bod
 		}
 		SessionPhase(ctx, true)
 		tried[acc.UID] = true
-		// Preserve client instructions and tool metadata on every account attempt.
-		// Region failover must not rewrite the conversation or its identifiers.
+		// A verified rejection may activate a request-local template adaptation.
+		// Account changes must preserve that adaptation, not spend the remaining
+		// budget resending the already-rejected original template. No region gate.
 		streamwatch.StartAttempt(ctx)
 		attemptBody := body
 		level := 0
-		if o.cfg.ChannelIdentityCompat && siterouting.ProfileSite(acc.Profile) == siterouting.Domestic {
+		if o.cfg.ChannelIdentityCompat {
 			level = o.Sessions.Compatibility(sessionKey, acc.UID, fingerprint)
 			if !o.cfg.ChannelMetadataCompat && level > 1 {
 				level = 0
 			}
+			level = max(level, requestCompatLevel)
 			if acc.UID == compatUID {
 				level = compatLevel
 			}
 			if level > 0 {
 				var matched bool
-				attemptBody, matched = ChannelCompatibilityBody(body, level)
+				attemptBody, matched = compatibleBody(level)
 				if !matched {
 					level = 0
 					attemptBody = body
@@ -483,18 +498,20 @@ func (o *Runtime) OpenUpstreamScoped(ctx context.Context, acc *pool.Account, bod
 			return acc, err
 		}
 		if denied {
-			_, identityMatch := ChannelCompatibilityBody(body, 1)
-			_, metadataMatch := ChannelCompatibilityBody(body, 2)
+			requestCompatLevel = max(requestCompatLevel, level)
+			_, identityMatch := compatibleBody(1)
+			_, metadataMatch := compatibleBody(2)
 			log.Printf("渠道拒绝诊断: profile=%s model=%s compatibility=%s compat_enabled=%t metadata_enabled=%t identity_match=%t metadata_match=%t started=%t attempt=%d", acc.Profile, model, CompatibilityName(level), o.cfg.ChannelIdentityCompat, o.cfg.ChannelMetadataCompat, identityMatch, metadataMatch, started, attempt+1)
 		}
-		if denied && o.cfg.ChannelIdentityCompat && compatTries < 2 && attempt+1 < maxFailoverAttempts && siterouting.ProfileSite(acc.Profile) == siterouting.Domestic {
+		if denied && o.cfg.ChannelIdentityCompat && compatTries < 2 && attempt+1 < maxFailoverAttempts {
 			maxLevel := 1
 			if o.cfg.ChannelMetadataCompat {
 				maxLevel = 2
 			}
 			for next := level + 1; next <= maxLevel; next++ {
-				if _, matched := ChannelCompatibilityBody(body, next); matched {
+				if _, matched := compatibleBody(next); matched {
 					compatUID, compatLevel = acc.UID, next
+					requestCompatLevel = max(requestCompatLevel, next)
 					compatTries++
 					delete(tried, acc.UID)
 					break

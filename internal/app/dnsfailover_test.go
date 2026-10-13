@@ -23,6 +23,7 @@ import (
 	"work2api/internal/workbuddy/models"
 	"work2api/internal/workbuddy/pool"
 	wbruntime "work2api/internal/workbuddy/runtime"
+	"work2api/internal/workbuddy/siterouting"
 	"work2api/internal/workbuddy/upstream"
 )
 
@@ -289,11 +290,17 @@ type channelRetryUpstream struct {
 	body      string
 	always    bool
 	bodies    []map[string]any
+	urls      []string
+	afterCall func(int)
 }
 
-func (f *channelRetryUpstream) StreamUpstream(_ context.Context, _ map[string]string, request map[string]any, _ string, yield upstream.LineFunc) error {
+func (f *channelRetryUpstream) StreamUpstream(_ context.Context, _ map[string]string, request map[string]any, target string, yield upstream.LineFunc) error {
 	f.calls++
 	f.bodies = append(f.bodies, request)
+	f.urls = append(f.urls, target)
+	if f.afterCall != nil {
+		f.afterCall(f.calls)
+	}
 	if f.calls == 1 || f.calls <= f.denyCalls || f.always {
 		if f.partial {
 			if e := yield(`data: {"choices":[{"delta":{"content":"partial"}}]}`); e != nil {
@@ -319,27 +326,36 @@ func TestChannelIdentityCompatibilityPreservesCapabilitiesAndBounds(t *testing.T
 		disabled, partial, always, revoke bool
 		wantCalls                         int
 		wantCompat                        bool
+		denyCalls                         int
+		lateDomestic                      bool
 	}{
 		{name: "domestic", profile: "cn-cli", prompt: banner + tail, errorBody: denial, wantCalls: 2, wantCompat: true},
 		{name: "zcode branch", profile: "cn-cli", prompt: zcodeBranch + tail, errorBody: denial, wantCalls: 2, wantCompat: true, wantRewrite: zcodeCompatible + tail},
 		{name: "zcode disabled", profile: "cn-cli", prompt: zcodeBranch + tail, errorBody: denial, disabled: true, wantCalls: 2},
-		{name: "zcode international", profile: "intl-cli", prompt: zcodeBranch + tail, errorBody: denial, wantCalls: 2},
-		{name: "zcode content policy", profile: "cn-cli", prompt: zcodeBranch + tail, errorBody: `{"code":11128,"msg":"blocked by security policy"}`, wantCalls: 1},
+		{name: "zcode international", profile: "intl-cli", prompt: zcodeBranch + tail, errorBody: denial, wantCalls: 2, wantCompat: true, wantRewrite: zcodeCompatible + tail},
+		{name: "zcode international work", profile: "intl-work", prompt: zcodeBranch + tail, errorBody: denial, wantCalls: 2, wantCompat: true, wantRewrite: zcodeCompatible + tail},
+		{name: "zcode domestic work", profile: "cn-work", prompt: zcodeBranch + tail, errorBody: denial, wantCalls: 2, wantCompat: true, wantRewrite: zcodeCompatible + tail},
+		{name: "zcode content policy", profile: "cn-cli", prompt: zcodeBranch + tail, errorBody: `{"code":11128,"msg":"blocked by security policy"}`, wantCalls: 2, wantCompat: true, wantRewrite: zcodeCompatible + tail},
+		{name: "zcode international policy", profile: "intl-work", prompt: zcodeBranch + tail, errorBody: `{"code":11128,"msg":"请求被安全策略拦截"}`, wantCalls: 2, wantCompat: true, wantRewrite: zcodeCompatible + tail},
+		{name: "zcode code only", profile: "intl-cli", prompt: zcodeBranch + tail, errorBody: `{"code":"11128"}`, wantCalls: 2, wantCompat: true, wantRewrite: zcodeCompatible + tail},
+		{name: "zcode fifth domestic attempt", profile: "intl-cli", prompt: zcodeBranch + tail, errorBody: denial, wantCalls: 5, wantCompat: true, wantRewrite: zcodeCompatible + tail, denyCalls: 4, lateDomestic: true},
 		{name: "zcode partial output", profile: "cn-cli", prompt: zcodeBranch + tail, errorBody: denial, partial: true, wantCalls: 1},
+		{name: "zcode international partial output", profile: "intl-work", prompt: zcodeBranch + tail, errorBody: denial, partial: true, wantCalls: 1},
 		{name: "zcode persistent denial", profile: "cn-cli", prompt: zcodeBranch + tail, errorBody: denial, always: true, wantCalls: 5, wantCompat: true, wantRewrite: zcodeCompatible + tail},
 		{name: "zcode revoked during retry", profile: "cn-cli", prompt: zcodeBranch + tail, errorBody: denial, revoke: true, wantCalls: 1},
+		{name: "zcode international revoked", profile: "intl-cli", prompt: zcodeBranch + tail, errorBody: denial, revoke: true, wantCalls: 1},
 		{name: "codex domestic", profile: "cn-cli", prompt: codexBanner + tail, errorBody: denial, wantCalls: 2, wantCompat: true},
 		{name: "codex disabled", profile: "cn-cli", prompt: codexBanner + tail, errorBody: denial, disabled: true, wantCalls: 2},
-		{name: "codex international", profile: "intl-cli", prompt: codexBanner + tail, errorBody: denial, wantCalls: 2},
-		{name: "codex content policy", profile: "cn-cli", prompt: codexBanner + tail, errorBody: `{"code":11128,"msg":"blocked by security policy"}`, wantCalls: 1},
+		{name: "codex international", profile: "intl-cli", prompt: codexBanner + tail, errorBody: denial, wantCalls: 2, wantCompat: true},
+		{name: "codex content policy", profile: "cn-cli", prompt: codexBanner + tail, errorBody: `{"code":11128,"msg":"blocked by security policy"}`, wantCalls: 2, wantCompat: true},
 		{name: "codex partial output", profile: "cn-cli", prompt: codexBanner + tail, errorBody: denial, partial: true, wantCalls: 1},
 		{name: "codex persistent denial", profile: "cn-cli", prompt: codexBanner + tail, errorBody: denial, always: true, wantCalls: 5, wantCompat: true},
 		{name: "codex revoked during retry", profile: "cn-cli", prompt: codexBanner + tail, errorBody: denial, revoke: true, wantCalls: 1},
 		{name: "disabled", profile: "cn-cli", prompt: banner + tail, errorBody: denial, disabled: true, wantCalls: 2},
-		{name: "international", profile: "intl-cli", prompt: banner + tail, errorBody: denial, wantCalls: 2},
+		{name: "international", profile: "intl-cli", prompt: banner + tail, errorBody: denial, wantCalls: 2, wantCompat: true},
 		{name: "unknown banner", profile: "cn-cli", prompt: "You are Claude Code." + tail, errorBody: denial, wantCalls: 2},
 		{name: "embedded banner", profile: "cn-cli", prompt: "Project note: " + banner + tail, errorBody: denial, wantCalls: 2},
-		{name: "content policy", profile: "cn-cli", prompt: banner + tail, errorBody: `{"code":11128,"msg":"blocked by security policy"}`, wantCalls: 1},
+		{name: "content policy", profile: "cn-cli", prompt: banner + tail, errorBody: `{"code":11128,"msg":"blocked by security policy"}`, wantCalls: 2, wantCompat: true},
 		{name: "role validation", profile: "cn-cli", prompt: banner + tail, errorBody: `{"code":11128,"msg":"first message is not system prompt"}`, wantCalls: 2},
 		{name: "partial output", profile: "cn-cli", prompt: banner + tail, errorBody: denial, partial: true, wantCalls: 1},
 		{name: "persistent denial", profile: "cn-cli", prompt: banner + tail, errorBody: denial, always: true, wantCalls: 5, wantCompat: true},
@@ -349,7 +365,11 @@ func TestChannelIdentityCompatibilityPreservesCapabilitiesAndBounds(t *testing.T
 			o, first := newDNSFailoverOrch(t, &failingUpstream{})
 			mgr := o.wb.Managers[first.UID]
 			managers := map[string]pool.Credential{first.UID: mgr}
-			for i := 0; i < 6; i++ {
+			alternatives := 6
+			if tc.lateDomestic {
+				alternatives = 3
+			}
+			for i := 0; i < alternatives; i++ {
 				uid := fmt.Sprintf("alternate-%d", i)
 				managers[uid] = mgr
 				o.wb.Managers[uid] = mgr
@@ -362,10 +382,23 @@ func TestChannelIdentityCompatibilityPreservesCapabilitiesAndBounds(t *testing.T
 					a.Profile = "intl-cli"
 				}
 			}
+			if tc.lateDomestic {
+				o.wb.Pool.Get("alternate-2").Profile = "cn-cli"
+			}
 			o.wb.Catalog = models.NewWithCatalogClient(o.wb.Pool, o.db, &http.Client{Transport: catalogTransport{}})
 			o.wb.Catalog.Refresh()
 			o.cfg.ChannelIdentityCompat = !tc.disabled
-			client := &channelRetryUpstream{body: tc.errorBody, partial: tc.partial, always: tc.always}
+			client := &channelRetryUpstream{body: tc.errorBody, partial: tc.partial, always: tc.always, denyCalls: tc.denyCalls}
+			if tc.lateDomestic {
+				// Keep normal routing intact: this authorized domestic candidate
+				// becomes available only for the last remaining dispatch slot.
+				o.wb.Pool.SetEnabled("alternate-2", false, "fixture unavailable")
+				client.afterCall = func(n int) {
+					if n == 4 {
+						o.wb.Pool.SetEnabled("alternate-2", true, "")
+					}
+				}
+			}
 			o.wb.UpstreamClient = client
 			body := map[string]any{"model": "test-model", "messages": []any{map[string]any{"role": "system", "content": tc.prompt}, map[string]any{"role": "user", "content": "<system-reminder>Plan mode: read only.</system-reminder>"}}, "tools": []any{map[string]any{"type": "function", "function": map[string]any{"name": "Skill", "description": "Use find-skills", "parameters": map[string]any{"type": "object"}}}}}
 			original, _ := json.Marshal(body)
@@ -389,12 +422,18 @@ func TestChannelIdentityCompatibilityPreservesCapabilitiesAndBounds(t *testing.T
 			if client.calls != tc.wantCalls {
 				t.Fatalf("calls=%d, want %d, error=%v", client.calls, tc.wantCalls, err)
 			}
-			if (tc.name == "domestic" || tc.name == "codex domestic" || tc.name == "zcode branch") && (err != nil || served.UID != first.UID || o.modelCooldownUntil(first.UID, "test-model") > nowSec() || o.sessions.Lookup("sticky") != first.UID) {
+			if tc.wantCompat && tc.wantCalls == 2 && (err != nil || served.UID != first.UID || o.modelCooldownUntil(first.UID, "test-model") > nowSec() || o.sessions.Lookup("sticky") != first.UID) {
 				t.Fatal("successful banner compatibility penalized/rotated account", err)
+			}
+			if tc.lateDomestic {
+				wantURL, _ := siterouting.ChatURLForProfile("cn-cli")
+				if err != nil || served.UID != "alternate-2" || client.urls[4] != wantURL {
+					t.Fatalf("last domestic slot: account=%s URL=%s error=%v", served.UID, client.urls[4], err)
+				}
 			}
 			for i, attempt := range client.bodies {
 				expected := tc.prompt
-				if tc.wantCompat && i == 1 {
+				if tc.wantCompat && i > 0 {
 					expected = "You are a coding assistant." + tail
 					if tc.wantRewrite != "" {
 						expected = tc.wantRewrite
@@ -547,58 +586,88 @@ func TestChannelCompatibilityProgressionAndSessionMemory(t *testing.T) {
 			map[string]any{"role": "user", "content": "<system-reminder>Available skills: example</system-reminder>"},
 		}, "tools": []any{map[string]any{"type": "function", "function": map[string]any{"name": "Skill"}}}}
 	}
-	for _, metadata := range []bool{false, true} {
-		t.Run(fmt.Sprintf("metadata=%t", metadata), func(t *testing.T) {
-			client := &channelRetryUpstream{body: denial, denyCalls: 2}
-			o, first := newDNSFailoverOrch(t, &failingUpstream{})
-			o.wb.UpstreamClient = client
-			first.Profile = "cn-cli"
-			o.wb.Catalog = models.NewWithCatalogClient(o.wb.Pool, o.db, &http.Client{Transport: catalogTransport{}})
-			o.wb.Catalog.Refresh()
-			o.cfg.ChannelIdentityCompat = true
-			o.cfg.ChannelMetadataCompat = metadata
-			body := makeBody("x-anthropic-billing-header: cc_version=2.1.0; cch=aaa;")
-			before, _ := json.Marshal(body)
-			ctx, finish := o.sessions.Begin(context.Background(), "memory", "test-model", nil, body)
-			defer finish()
-			o.sessions.Bind("memory", first.UID)
-			_, err := o.openUpstreamScoped(ctx, first, body, "test-model", "memory", func(string) error { return nil }, nil, map[string]bool{first.UID: true})
-			if !metadata {
-				if err == nil || client.calls != 2 || o.sessions.Lookup("memory") != "" {
-					t.Fatal("disabled metadata retry or failed binding", client.calls, err)
+	for _, profile := range []string{"cn-cli", "cn-work", "intl-cli", "intl-work"} {
+		for _, metadata := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/metadata=%t", profile, metadata), func(t *testing.T) {
+				client := &channelRetryUpstream{body: denial, denyCalls: 2}
+				o, first := newDNSFailoverOrch(t, &failingUpstream{})
+				o.wb.UpstreamClient = client
+				first.Profile = profile
+				o.wb.Catalog = models.NewWithCatalogClient(o.wb.Pool, o.db, &http.Client{Transport: catalogTransport{}})
+				o.wb.Catalog.Refresh()
+				o.cfg.ChannelIdentityCompat = true
+				o.cfg.ChannelMetadataCompat = metadata
+				body := makeBody("x-anthropic-billing-header: cc_version=2.1.0; cch=aaa;")
+				before, _ := json.Marshal(body)
+				ctx, finish := o.sessions.Begin(context.Background(), "memory", "test-model", nil, body)
+				defer finish()
+				o.sessions.Bind("memory", first.UID)
+				_, err := o.openUpstreamScoped(ctx, first, body, "test-model", "memory", func(string) error { return nil }, nil, map[string]bool{first.UID: true})
+				if !metadata {
+					if err == nil || client.calls != 2 || o.sessions.Lookup("memory") != "" {
+						t.Fatal("disabled metadata retry or failed binding", client.calls, err)
+					}
+					return
 				}
-				return
-			}
-			if err != nil || client.calls != 3 {
-				t.Fatal("progressive compatibility failed", client.calls, err)
-			}
-			transformed := client.bodies[2]["messages"].([]any)[0].(map[string]any)["content"].([]any)
-			if transformed[0].(map[string]any)["text"] != "" || transformed[1].(map[string]any)["text"] != "You are a coding assistant."+tail {
-				t.Fatal("capabilities lost", transformed)
-			}
-			after, _ := json.Marshal(body)
-			if string(before) != string(after) {
-				t.Fatal("original mutated")
-			}
-			body = makeBody("x-anthropic-billing-header: cc_version=2.1.0; cch=bbb;")
-			fingerprint := compatibilityFingerprint(body)
-			if o.sessions.Compatibility("memory", first.UID, fingerprint) != 2 {
-				t.Fatal("memory missed changing attribution")
-			}
-			_, err = o.openUpstreamScoped(ctx, first, body, "test-model", "memory", func(string) error { return nil }, nil, map[string]bool{first.UID: true})
-			if err != nil || client.calls != 4 || client.bodies[3]["messages"].([]any)[0].(map[string]any)["content"].([]any)[0].(map[string]any)["text"] != "" {
-				t.Fatal("successful compatibility not reused", err)
-			}
-			body["tools"] = []any{map[string]any{"type": "function", "function": map[string]any{"name": "Other"}}}
-			if o.sessions.Compatibility("memory", first.UID, compatibilityFingerprint(body)) != 0 || o.sessions.Compatibility("other", first.UID, fingerprint) != 0 || o.sessions.Compatibility("memory", "other", fingerprint) != 0 {
-				t.Fatal("memory scope too broad")
-			}
-			o.sessions.UnbindMatching("memory", first.UID)
-			if o.sessions.Compatibility("memory", first.UID, fingerprint) != 0 {
-				t.Fatal("failed binding kept compatibility")
-			}
-		})
+				if err != nil || client.calls != 3 {
+					t.Fatal("progressive compatibility failed", client.calls, err)
+				}
+				transformed := client.bodies[2]["messages"].([]any)[0].(map[string]any)["content"].([]any)
+				if transformed[0].(map[string]any)["text"] != "" || transformed[1].(map[string]any)["text"] != "You are a coding assistant."+tail {
+					t.Fatal("capabilities lost", transformed)
+				}
+				after, _ := json.Marshal(body)
+				if string(before) != string(after) {
+					t.Fatal("original mutated")
+				}
+				body = makeBody("x-anthropic-billing-header: cc_version=2.1.0; cch=bbb;")
+				fingerprint := compatibilityFingerprint(body)
+				if o.sessions.Compatibility("memory", first.UID, fingerprint) != 2 {
+					t.Fatal("memory missed changing attribution")
+				}
+				_, err = o.openUpstreamScoped(ctx, first, body, "test-model", "memory", func(string) error { return nil }, nil, map[string]bool{first.UID: true})
+				if err != nil || client.calls != 4 || client.bodies[3]["messages"].([]any)[0].(map[string]any)["content"].([]any)[0].(map[string]any)["text"] != "" {
+					t.Fatal("successful compatibility not reused", err)
+				}
+				body["tools"] = []any{map[string]any{"type": "function", "function": map[string]any{"name": "Other"}}}
+				if o.sessions.Compatibility("memory", first.UID, compatibilityFingerprint(body)) != 0 || o.sessions.Compatibility("other", first.UID, fingerprint) != 0 || o.sessions.Compatibility("memory", "other", fingerprint) != 0 {
+					t.Fatal("memory scope too broad")
+				}
+				o.sessions.UnbindMatching("memory", first.UID)
+				if o.sessions.Compatibility("memory", first.UID, fingerprint) != 0 {
+					t.Fatal("failed binding kept compatibility")
+				}
+			})
+		}
 	}
+	t.Run("metadata retained across scoped account change", func(t *testing.T) {
+		o, first := newDNSFailoverOrch(t, &failingUpstream{})
+		mgr := o.wb.Managers[first.UID]
+		o.wb.Pool = pool.New(map[string]pool.Credential{first.UID: mgr, "alternate": mgr}, "")
+		first = o.wb.Pool.Get(first.UID)
+		first.Profile = "intl-work"
+		o.wb.Managers["alternate"] = mgr
+		o.wb.Catalog = models.NewWithCatalogClient(o.wb.Pool, o.db, &http.Client{Transport: catalogTransport{}})
+		o.wb.Catalog.Refresh()
+		o.cfg.ChannelIdentityCompat, o.cfg.ChannelMetadataCompat = true, true
+		client := &channelRetryUpstream{body: denial, denyCalls: 3}
+		o.wb.UpstreamClient = client
+		body := makeBody("x-anthropic-billing-header: cc_version=2.1.0; cch=abc;")
+		before, _ := json.Marshal(body)
+		ctx, finish := o.sessions.Begin(context.Background(), "scoped-memory", "test-model", nil, body)
+		defer finish()
+		o.sessions.Bind("scoped-memory", first.UID)
+		served, err := o.openUpstreamScoped(ctx, first, body, "test-model", "scoped-memory", func(string) error { return nil }, nil, map[string]bool{first.UID: true, "alternate": true})
+		if err != nil || client.calls != 4 || served.UID != "alternate" {
+			t.Fatal("scoped compatibility did not reach authorized alternative", client.calls, err)
+		}
+		third, _ := json.Marshal(client.bodies[2])
+		fourth, _ := json.Marshal(client.bodies[3])
+		after, _ := json.Marshal(body)
+		if string(third) != string(fourth) || string(before) != string(after) || o.sessions.Compatibility("scoped-memory", served.UID, compatibilityFingerprint(body)) != 2 {
+			t.Fatal("metadata compatibility reset, original mutated or successful memory lost")
+		}
+	})
 }
 
 func TestUsageDiagnosticsPreservesRequestAndUpstreamFacts(t *testing.T) {

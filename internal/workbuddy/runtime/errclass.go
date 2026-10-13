@@ -30,7 +30,7 @@ const (
 	ErrSessionDead    ErrKind = "session_dead"    // 登录态失效（401+12153）→ 禁用
 	ErrNotFound       ErrKind = "not_found"       // 404 偶发 → 短冷却
 	ErrServer         ErrKind = "server"          // 上游 5xx
-	ErrChannelDenied  ErrKind = "channel_denied"  // 明确渠道拒绝 → 本请求换授权账号，不施加共享冷却
+	ErrChannelDenied  ErrKind = "channel_denied"  // 11128 请求风控 → 有限兼容/换授权账号，不施加共享冷却
 	ErrContentBlocked ErrKind = "content_blocked" // 内容策略拦截 → 不罚号，透传
 	ErrBadParams      ErrKind = "bad_params"      // 请求体畸形（11101）→ 不罚号，仍轮转
 	ErrAccountFault   ErrKind = "account_fault"   // 账号级授权/配额故障（11140 / 14017）
@@ -154,8 +154,9 @@ func IsModelBlocked(status int, text, lower string) bool {
 	return strings.Contains(strings.ToLower(msg), "service info not found")
 }
 
-// 11128 also denotes message-role validation. Only the explicit channel
-// message together with its business code enables this bounded failover.
+// The 11128 envelope covers client fingerprints and policy rejection, whose
+// display messages are not a reliable distinction. Explicit role validation is
+// handled by request normalization, not by changing the client's identity.
 func IsChannelDenied(status int, text string) bool {
 	if (status != 400 && status != 403) || !BusinessCode(text, "11128") {
 		return false
@@ -165,16 +166,15 @@ func IsChannelDenied(status int, text string) bool {
 	if inner, ok := root["error"].(map[string]any); ok {
 		nodes = append(nodes, inner)
 	}
-	const message = "illegal api invocation from an unapproved channel"
 	for _, node := range nodes {
 		for _, key := range []string{"msg", "message"} {
 			value, ok := node[key].(string)
-			if ok && strings.EqualFold(strings.TrimSpace(value), message) {
-				return true
+			if ok && strings.Contains(strings.ToLower(value), "first message is not system prompt") {
+				return false
 			}
 		}
 	}
-	return false
+	return true
 }
 
 func HasBusinessEnvelope(text string) bool {
@@ -288,6 +288,10 @@ func ClassifyUpstream(status int, raw []byte, _ http.Header) ErrKind {
 	text := string(raw)
 	lower := strings.ToLower(text)
 	switch {
+	case IsChannelDenied(status, text):
+		// The structured 11128 code takes precedence over ambiguous prose such
+		// as "request illegal", which must not disable a healthy credential.
+		return ErrChannelDenied
 	case IsModelBlocked(status, text, lower):
 		return ErrModelBlocked
 	case status == 402:
@@ -310,8 +314,6 @@ func ClassifyUpstream(status int, raw []byte, _ http.Header) ErrKind {
 		return ErrNotFound
 	case status >= 500:
 		return ErrServer
-	case IsChannelDenied(status, text):
-		return ErrChannelDenied
 	case IsWAFBlocked(status, text):
 		return ErrWAFBlock
 	case status == 400 && (HitFold(text, lower, InvalidImageMarkers) || CodeMarker(lower, "11135")):
@@ -351,7 +353,7 @@ func ActionFor(kind ErrKind, raw []byte, headers http.Header, now float64) ErrAc
 	case ErrChannelDenied:
 		// The same envelope also covers input-dependent policy decisions. Exclude
 		// within this request; do not cool the shared model for unrelated users.
-		return ErrAction{Rotate: true, Reason: "该请求的模型调用渠道被拒绝"}
+		return ErrAction{Rotate: true, Reason: "上游请求校验或风控拒绝（11128）"}
 	case ErrContentBlocked, ErrPromptTooLong, ErrImageInvalid:
 		return ErrAction{Rotate: false, Cooldown: 0, FailFast: true}
 	case ErrModelBlocked:
