@@ -32,6 +32,72 @@ func TestLaunchArgsPreservesControlLikeValues(t *testing.T) {
 	}
 }
 
+func TestUpdatedProcessKeepsSecretsOutOfArguments(t *testing.T) {
+	for _, args := range [][]string{{"-port", "8787", "-admin-token", "override"}, {"--admin-token=override", "-strict-port"}, {"-admin-token", ""}} {
+		clean, env := privateUpdateArgs(args, []string{"ADMIN_TOKEN=inherited", "OTHER=keep"})
+		if strings.Contains(strings.Join(clean, "|"), "admin-token") || strings.Contains(strings.Join(clean, "|"), "override") {
+			t.Fatal("secret exposed in argv", clean)
+		}
+		want := "ADMIN_TOKEN=override"
+		if len(args) == 2 && args[1] == "" {
+			want = "ADMIN_TOKEN="
+		}
+		if !strings.Contains(strings.Join(env, "\n"), want) || strings.Contains(strings.Join(env, "\n"), "inherited") {
+			t.Fatal("effective override changed", env)
+		}
+	}
+}
+
+func TestLargeBackupManifestValidatesBeforeChangingLiveFiles(t *testing.T) {
+	root := t.TempDir()
+	data := filepath.Join(root, "data")
+	_ = os.MkdirAll(data, 0700)
+	db := filepath.Join(data, "work2api.db")
+	_ = os.WriteFile(db, []byte("live"), 0600)
+	archive := filepath.Join(root, "backup.tar.gz")
+	f, err := os.Create(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gz := gzip.NewWriter(f)
+	tw := tar.NewWriter(gz)
+	files := map[string]string{}
+	emptyHash := sha256.Sum256(nil)
+	for i := 0; i < 8000; i++ {
+		name := fmt.Sprintf("sources/data/file-%05d-%s", i, strings.Repeat("x", 64))
+		files[name] = hex.EncodeToString(emptyHash[:])
+		if err = tw.WriteHeader(&tar.Header{Name: name, Mode: 0600, Size: 0}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dbHash := sha256.Sum256([]byte("saved"))
+	files["database.sqlite"] = hex.EncodeToString(dbHash[:])
+	_ = tw.WriteHeader(&tar.Header{Name: "database.sqlite", Mode: 0600, Size: 5})
+	_, _ = tw.Write([]byte("saved"))
+	manifest, _ := json.MarshalIndent(map[string]any{"format_version": 1, "sources": map[string]string{"sources/data": data, "database.sqlite": db}, "sha256": files}, "", "  ")
+	if len(manifest) <= 1<<20 {
+		t.Fatal("fixture does not exceed old manifest cap", len(manifest))
+	}
+	_ = tw.WriteHeader(&tar.Header{Name: "manifest.json", Mode: 0600, Size: int64(len(manifest))})
+	_, _ = tw.Write(manifest)
+	_ = tw.Close()
+	_ = gz.Close()
+	_ = f.Close()
+	digest, err := selfupdate.HashFile(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = selfupdate.ValidateBackup(archive, digest, filepath.Join(root, "work2api"), data, db); err != nil {
+		t.Fatal(err)
+	}
+	if current, _ := os.ReadFile(db); string(current) != "live" {
+		t.Fatal("validation changed live state")
+	}
+	if _, err = os.Stat(filepath.Join(data, "file-00000-"+strings.Repeat("x", 64))); !os.IsNotExist(err) {
+		t.Fatal("validation wrote restored data")
+	}
+}
+
 func TestDrainTimeoutPreservesService(t *testing.T) {
 	g := &drainGate{}
 	entered, release, finished := make(chan struct{}), make(chan struct{}), make(chan struct{})

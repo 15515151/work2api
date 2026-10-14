@@ -27,6 +27,50 @@ import (
 	"work2api/internal/workbuddy/upstream"
 )
 
+func TestRoutePayloadClonePreservesHistoryAndAttemptIsolation(t *testing.T) {
+	var input map[string]any
+	if err := json.Unmarshal([]byte(`{"model":"merged","messages":[{"content":[{"type":"text","text":"history"}]}],"tools":[{"function":{"parameters":{"enum":["a","b"]}}}],"n":1,"empty":null}`), &input); err != nil {
+		t.Fatal(err)
+	}
+	first, second := cloneRoutePayload(input), cloneRoutePayload(input)
+	if !reflect.DeepEqual(first, input) {
+		t.Fatal("clone changed decoded JSON values")
+	}
+	first["model"] = "member"
+	first["messages"].([]any)[0].(map[string]any)["content"].([]any)[0].(map[string]any)["text"] = "changed"
+	first["tools"].([]any)[0].(map[string]any)["function"].(map[string]any)["parameters"].(map[string]any)["enum"].([]any)[0] = "changed"
+	if !reflect.DeepEqual(second, input) {
+		t.Fatal("attempt mutation leaked into original or sibling attempt")
+	}
+}
+
+func BenchmarkRoutePayloadClone(b *testing.B) {
+	history := make([]any, 100)
+	for i := range history {
+		history[i] = map[string]any{"role": "user", "content": strings.Repeat("x", 10<<10)}
+	}
+	input := map[string]any{"model": "merged", "messages": history}
+	b.Run("json_roundtrip", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			raw, _ := json.Marshal(input)
+			var output map[string]any
+			_ = json.Unmarshal(raw, &output)
+			if len(output) != 2 {
+				b.Fatal("invalid clone")
+			}
+		}
+	})
+	b.Run("container_copy", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if len(cloneRoutePayload(input)) != 2 {
+				b.Fatal("invalid clone")
+			}
+		}
+	})
+}
+
 func TestBufferedRequestBodyReleasesAfterParsingAcrossClones(t *testing.T) {
 	for _, input := range []string{`{"value":"ok"}`, `{"value":"ok"} {}`, `{"value":`} {
 		budget := &bodyBudget{}

@@ -73,7 +73,7 @@ func (rt *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (result
 		return rt.serveSystemOne(ctx, w, external, payload, route, ids)
 	}
 
-	bodies, err := rt.prepareRouteBodies(external, route, payload)
+	bodies, bodyLimits, err := rt.prepareRouteBodiesWithLimits(external, route, payload)
 	if err != nil {
 		protocol.WriteError(w, external, http.StatusBadRequest, err.Error(), "invalid_request_error", "")
 		return provider.UsageReport{Status: "error", Error: err.Error()}, nil
@@ -97,16 +97,7 @@ func (rt *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (result
 		return provider.UsageReport{Status: "error", Error: "upstream error"}, nil
 	}
 	defer resp.Body.Close()
-	var sent map[string]any
-	if json.Unmarshal(bodies[upstreamRoute.Tier], &sent) == nil {
-		limits := map[string]int{}
-		for _, key := range []string{"max_tokens", "max_completion_tokens", "max_output_tokens"} {
-			if n, ok := sent[key].(float64); ok && n > 0 && n <= 1<<30 && n == float64(int(n)) {
-				limits[key] = int(n)
-			}
-		}
-		defer func() { result.EffectiveLimits = limits }()
-	}
+	defer func() { result.EffectiveLimits = bodyLimits[upstreamRoute.Tier] }()
 
 	w.Header().Set("x-request-id", ids.Request)
 	if resp.StatusCode/100 != 2 {
@@ -239,6 +230,11 @@ func (rt *Runtime) serveSystemOne(ctx context.Context, w http.ResponseWriter, ex
 }
 
 func (rt *Runtime) prepareRouteBodies(from protocol.Protocol, route Route, input map[string]any) (map[Tier][]byte, error) {
+	bodies, _, err := rt.prepareRouteBodiesWithLimits(from, route, input)
+	return bodies, err
+}
+
+func (rt *Runtime) prepareRouteBodiesWithLimits(from protocol.Protocol, route Route, input map[string]any) (map[Tier][]byte, map[Tier]map[string]int, error) {
 	tiers := make([]Tier, 0, len(route.KeyTiers)+1)
 	seen := make(map[Tier]bool, len(route.KeyTiers)+1)
 	addTier := func(tier Tier) {
@@ -253,9 +249,10 @@ func (rt *Runtime) prepareRouteBodies(from protocol.Protocol, route Route, input
 		addTier(tier)
 	}
 	if len(tiers) == 0 {
-		return nil, errors.New("no usable upstream tier")
+		return nil, nil, errors.New("no usable upstream tier")
 	}
 	bodies := make(map[Tier][]byte, len(tiers))
+	limits := make(map[Tier]map[string]int, len(tiers))
 	for _, tier := range tiers {
 		proto := route.ProtocolFor(tier)
 		baseURL := rt.cfg.Upstream.Zen
@@ -267,18 +264,35 @@ func (rt *Runtime) prepareRouteBodies(from protocol.Protocol, route Route, input
 			if tier != route.Tier {
 				continue
 			}
-			return nil, fmt.Errorf("prepare %s upstream request: %w", tier, err)
+			return nil, nil, fmt.Errorf("prepare %s upstream request: %w", tier, err)
 		}
 		if effort := rt.cfg.ForcedEffort(jsonutil.StringAt(upstreamPayload, "model")); effort != "" {
 			protocol.ForcedEffort(proto, upstreamPayload, effort)
 		}
 		encoded, err := json.Marshal(upstreamPayload)
 		if err != nil {
-			return nil, errors.New("request contains unsupported JSON values")
+			return nil, nil, errors.New("request contains unsupported JSON values")
 		}
 		bodies[tier] = encoded
+		for _, key := range []string{"max_tokens", "max_completion_tokens", "max_output_tokens"} {
+			var n float64
+			switch value := upstreamPayload[key].(type) {
+			case float64:
+				n = value
+			case int:
+				n = float64(value)
+			case json.Number:
+				n, _ = value.Float64()
+			}
+			if n > 0 && n <= 1<<30 && n == float64(int(n)) {
+				if limits[tier] == nil {
+					limits[tier] = map[string]int{}
+				}
+				limits[tier][key] = int(n)
+			}
+		}
 	}
-	return bodies, nil
+	return bodies, limits, nil
 }
 
 // copyErrorResponse relays an upstream error to the client and returns the

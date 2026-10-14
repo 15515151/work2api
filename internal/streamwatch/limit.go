@@ -10,9 +10,28 @@ type responseLimitKey struct{}
 type bufferedResponseLimitKey struct{}
 
 const DefaultMaxLineBytes = 40 << 20
+const DefaultMaxEventBytes = DefaultMaxLineBytes
 const DefaultResponseBytes = 128 << 20
 
 var ErrResponseTooLarge = errors.New("upstream response exceeds configured byte limit")
+var ErrSSEEventTooLarge = errors.New("upstream SSE event exceeds byte limit")
+
+// SSEEventBudget bounds one event, not an entire response. Counting all lines
+// also covers comments and repeated/unknown fields. ScanLines strips CRLF, so
+// reserve two delimiter bytes per line conservatively.
+type SSEEventBudget struct{ bytes int }
+
+func (b *SSEEventBudget) AddLine(line string) error {
+	if line == "" {
+		b.bytes = 0
+		return nil
+	}
+	if len(line)+2 > DefaultMaxEventBytes-b.bytes {
+		return ErrSSEEventTooLarge
+	}
+	b.bytes += len(line) + 2
+	return nil
+}
 
 func WithResponseLimit(ctx context.Context, limit int64) context.Context {
 	if limit == 0 {

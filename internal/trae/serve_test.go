@@ -27,6 +27,7 @@ import (
 	"work2api/internal/core/protocol"
 	"work2api/internal/core/provider"
 	"work2api/internal/store"
+	"work2api/internal/streamwatch"
 	"work2api/internal/trae/auth"
 	"work2api/internal/trae/upstream"
 )
@@ -746,6 +747,23 @@ func TestNativeStreamCompletion(t *testing.T) {
 				t.Fatalf("invalid %s response: %s (%v)", target, converted, err)
 			}
 		})
+	}
+}
+
+func TestPreparedTraeLimitsMatchWireAndBoundMultilineEvents(t *testing.T) {
+	input := []byte(`{"model":"m","max_tokens":77,"messages":[{"role":"user","content":"hello"}]}`)
+	wire, limits := upstream.PrepareBodyResolvedWithLimits(input, "solo", "m")
+	var body map[string]any
+	if json.Unmarshal(wire, &body) != nil || limits["max_tokens"] != 77 || body["max_tokens"] != float64(77) {
+		t.Fatal("limits differ from wire", limits)
+	}
+	if string(input) != `{"model":"m","max_tokens":77,"messages":[{"role":"user","content":"hello"}]}` {
+		t.Fatal("caller body mutated")
+	}
+	line := "data: " + strings.Repeat("x", 1024) + "\n"
+	events := newEvents(strings.NewReader(strings.Repeat(line, streamwatch.DefaultMaxEventBytes/len(line)+1)))
+	if _, err := events.next(); !errors.Is(err, streamwatch.ErrSSEEventTooLarge) {
+		t.Fatal("multiline event unbounded", err)
 	}
 }
 

@@ -3,6 +3,7 @@ package protocol
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http/httptest"
 	"reflect"
@@ -19,6 +20,75 @@ import (
 type terminalOnlyReader struct {
 	wire  string
 	reads int
+}
+
+func TestResponsesUsageObservesNativeTerminalWithoutDecodingContent(t *testing.T) {
+	for _, tc := range []struct{ status, kind, reason, want string }{
+		{"completed", "custom_tool_call", "", "tool_calls"},
+		{"completed", "web_search_call", "", "stop"},
+		{"incomplete", "custom_tool_call", "max_output_tokens", "length"},
+		{"incomplete", "message", "content_filter", "content_filter"},
+		{"failed", "message", "", "error"},
+	} {
+		body, _ := json.Marshal(map[string]any{"status": tc.status, "output": []any{map[string]any{"type": tc.kind, "content": []any{map[string]any{"type": "unknown_native_block"}}}}, "incomplete_details": map[string]any{"reason": tc.reason}, "usage": map[string]any{"input_tokens": 5, "output_tokens": 2, "total_tokens": 7}})
+		u, known := ResponseUsage(Responses, body)
+		if !known || u.Input != 5 || u.Output != 2 || u.FinishReason != tc.want {
+			t.Fatal(tc, u, known)
+		}
+	}
+}
+
+func BenchmarkResponsesTerminalObservation(b *testing.B) {
+	items := make([]any, 100)
+	for i := range items {
+		items[i] = map[string]any{"type": "message", "content": []any{map[string]any{"type": "output_text", "text": strings.Repeat("x", 10<<10)}}}
+	}
+	body, _ := json.Marshal(map[string]any{"status": "completed", "output": items, "usage": map[string]any{"input_tokens": 10, "output_tokens": 10, "total_tokens": 20}})
+	for _, legacy := range []bool{true, false} {
+		name := "terminal-only"
+		if legacy {
+			name = "full-response-decode"
+		}
+		b.Run(name, func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				if legacy {
+					var p map[string]any
+					_ = json.Unmarshal(body, &p)
+					_, _ = decodeBridgeResponse(Responses, p)
+				} else {
+					_, _ = ResponseUsage(Responses, body)
+				}
+			}
+		})
+	}
+}
+
+func TestSSEEventLimitsPreserveUnlimitedAggregateAndTerminalCutoff(t *testing.T) {
+	oversized := strings.Repeat("x", streamwatch.DefaultMaxEventBytes+1)
+	observer := newStreamUsageObserver(Chat)
+	if _, err := observer.Write([]byte(oversized)); !errors.Is(err, streamwatch.ErrSSEEventTooLarge) {
+		t.Fatal("unterminated event not bounded", err)
+	}
+	if len(observer.buffer) != 0 {
+		t.Fatal("oversized event retained")
+	}
+	line := "data: " + strings.Repeat("x", 1024) + "\n"
+	manyLines := strings.Repeat(line, streamwatch.DefaultMaxEventBytes/len(line)+1)
+	if err := readSSE(strings.NewReader(manyLines), func(string, string) error { return nil }); !errors.Is(err, streamwatch.ErrSSEEventTooLarge) {
+		t.Fatal("multiline event not bounded", err)
+	}
+	observer = newStreamUsageObserver(Chat)
+	for i := 0; i < 1025; i++ {
+		if _, err := observer.Write([]byte(":" + strings.Repeat("x", 40<<10) + "\n\n")); err != nil {
+			t.Fatal("aggregate stream bounded", err)
+		}
+	}
+	terminal := "data: [DONE]\n\n"
+	accepted, err := observer.Write([]byte(terminal + oversized))
+	if err != nil || accepted != len(terminal) || !observer.NormalTermination() {
+		t.Fatal("post-terminal garbage inspected", accepted, err)
+	}
 }
 
 func TestGenerationParserExcludesProtocolMetadataAndDoneSnapshots(t *testing.T) {

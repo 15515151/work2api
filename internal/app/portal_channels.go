@@ -166,17 +166,7 @@ func (s *Server) portalQoderOAuth(w http.ResponseWriter, r *http.Request) {
 		s.portalTasks[reservation] = task
 		s.portalMu.Unlock()
 		claim := func(localID string) error {
-			s.portalMu.Lock()
-			valid := false
-			for _, t := range s.portalTasks {
-				if t == task && !time.Now().After(t.expires) {
-					valid = true
-					break
-				}
-			}
-			s.portalMu.Unlock()
-			if !valid {
-				s.portalMu.Unlock()
+			if !s.portalTaskLive(task) {
 				return fmt.Errorf("登录任务已取消或过期")
 			}
 			a, _ := qa.Get(localID)
@@ -257,4 +247,17 @@ func (s *Server) portalQoderOAuth(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeAPIErr(w, errBody(404, "未知操作", "not_found"))
 	}
+}
+
+// Reservation and upstream login IDs share task identity. Invalid tasks must
+// use the same balanced locking path as successful authorization.
+func (s *Server) portalTaskLive(task *portalContributionTask) bool {
+	s.portalMu.Lock()
+	defer s.portalMu.Unlock()
+	for _, current := range s.portalTasks {
+		if current == task && !time.Now().After(current.expires) {
+			return true
+		}
+	}
+	return false
 }

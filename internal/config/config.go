@@ -102,6 +102,11 @@ const DefaultMaxResponseBytes = 128 << 20
 const DefaultRequestBodyReadTimeoutSeconds = 120
 const DefaultRequestBodyBudget = 256 << 20
 
+// Structure protection is independent of execution quotas. Strings (including
+// large prompts and image data) do not contribute internal punctuation.
+const DefaultMaxJSONItems = 1000000
+const DefaultMaxJSONDepth = 512
+
 func init() {
 	if wd, err := os.Getwd(); err == nil {
 		PackageRoot = wd
@@ -179,8 +184,8 @@ func Load(args []string) *Config {
 		BodyReadConcurrency:    positiveEnvInt("BODY_READ_CONCURRENCY", 4),
 		RequestBodyBudget:      int64(max(0, envInt("REQUEST_BODY_BUDGET", int(bodyBudget)))),
 		MaxResponseBytes:       responseLimit,
-		MaxJSONItems:           max(0, envInt("MAX_JSON_ITEMS", 0)),
-		MaxJSONDepth:           max(0, envInt("MAX_JSON_DEPTH", 0)),
+		MaxJSONItems:           max(0, envInt("MAX_JSON_ITEMS", DefaultMaxJSONItems)),
+		MaxJSONDepth:           max(0, envInt("MAX_JSON_DEPTH", DefaultMaxJSONDepth)),
 		LogLevel:               strings.ToUpper(*logLevel),
 		LogToFile:              env("LOG_TO_FILE", "1") != "0",
 

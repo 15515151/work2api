@@ -21,6 +21,7 @@ type eventReader struct {
 	scanner *bufio.Scanner
 	event   string
 	data    []string
+	budget  streamwatch.SSEEventBudget
 }
 
 func newEvents(reader io.Reader) *eventReader {
@@ -31,6 +32,10 @@ func newEvents(reader io.Reader) *eventReader {
 func (r *eventReader) next() (*upstream.SOLOEvent, error) {
 	for r.scanner.Scan() {
 		line := r.scanner.Text()
+		if err := r.budget.AddLine(line); err != nil {
+			r.data = nil
+			return nil, err
+		}
 		if line == "" {
 			if len(r.data) > 0 {
 				name, data := r.event, strings.Join(r.data, "\n")
@@ -178,14 +183,9 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 			return report, err
 		}
 		streamwatch.StartAttempt(ctx)
-		// Inspect the prepared wire body, not inferred client defaults.
-		var sent map[string]any
-		if json.Unmarshal(upstream.PrepareBodyResolved(encoded, identity.Variant, identityModel), &sent) == nil {
-			if n, ok := sent["max_tokens"].(float64); ok && n > 0 && n <= 1<<30 && n == float64(int(n)) {
-				report.EffectiveLimits = map[string]int{"max_tokens": int(n)}
-			}
-		}
-		stream, status, errorBody, headers, sendErr := r.client(ctx).ChatStreamWithHeaders(identity, encoded, identityModel)
+		prepared, limits := upstream.PrepareBodyResolvedWithLimits(encoded, identity.Variant, identityModel)
+		report.EffectiveLimits = limits
+		stream, status, errorBody, headers, sendErr := r.client(ctx).ChatPreparedStreamWithHeaders(identity, prepared)
 		streamwatch.AttemptHeaders(ctx, status, headers)
 		streamwatch.AttemptResult(ctx, status)
 		if sendErr != nil {
@@ -201,7 +201,7 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 					}
 					attempt++ // the same-identity retry shares the total dispatch budget
 					streamwatch.StartAttempt(ctx)
-					stream, status, errorBody, headers, sendErr = r.client(ctx).ChatStreamWithHeaders(identity, encoded, identityModel)
+					stream, status, errorBody, headers, sendErr = r.client(ctx).ChatPreparedStreamWithHeaders(identity, prepared)
 					streamwatch.AttemptHeaders(ctx, status, headers)
 					streamwatch.AttemptResult(ctx, status)
 					if sendErr != nil {

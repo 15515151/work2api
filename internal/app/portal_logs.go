@@ -68,7 +68,7 @@ func (s *Server) portalUsageRecords(w http.ResponseWriter, r *http.Request) {
 	user := portalCtx(r).ID
 	page, size := logPage(r)
 	q := r.URL.Query()
-	rows, total, err := s.o.db.UsageRequests(&user, size, (page-1)*size, q.Get("protocol"), q.Get("model"), nil, q.Get("status"), "")
+	rows, total, err := s.o.db.UsageRequestsContext(r.Context(), &user, size, (page-1)*size, q.Get("protocol"), q.Get("model"), nil, q.Get("status"), "")
 	if err != nil {
 		writeAPIErr(w, errBody(500, "查询调用日志失败", "server_error"))
 		return

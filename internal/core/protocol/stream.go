@@ -178,7 +178,7 @@ func ForwardStream(ctx context.Context, w http.ResponseWriter, reader io.Reader,
 	for {
 		n, readErr := reader.Read(buffer)
 		if n > 0 {
-			accepted, _ := observer.Write(buffer[:n])
+			accepted, observeErr := observer.Write(buffer[:n])
 			written, err := writer.Write(buffer[:accepted])
 			if err != nil {
 				copyErr = err
@@ -186,6 +186,10 @@ func ForwardStream(ctx context.Context, w http.ResponseWriter, reader io.Reader,
 			}
 			if written != accepted {
 				copyErr = io.ErrShortWrite
+				break
+			}
+			if observeErr != nil {
+				copyErr = observeErr
 				break
 			}
 			if observer.NormalTermination() || observer.ErrorTermination() {
@@ -252,6 +256,22 @@ func newStreamUsageObserver(protocol Protocol) *streamUsageObserver {
 }
 
 func (observer *streamUsageObserver) Write(data []byte) (int, error) {
+	// Bound append overshoot even when a caller supplies a large single write.
+	const fragment = 64 << 10
+	accepted := 0
+	for len(data) > 0 {
+		n := min(len(data), fragment)
+		written, err := observer.writeFragment(data[:n])
+		accepted += written
+		if err != nil || written < n || observer.normal || observer.error {
+			return accepted, err
+		}
+		data = data[n:]
+	}
+	return accepted, nil
+}
+
+func (observer *streamUsageObserver) writeFragment(data []byte) (int, error) {
 	previous := len(observer.buffer)
 	observer.buffer = append(observer.buffer, data...)
 	consumed := 0
@@ -259,6 +279,11 @@ func (observer *streamUsageObserver) Write(data []byte) (int, error) {
 	for {
 		index, width := nextSSEBoundary(observer.buffer[consumed+observer.scan:])
 		if index < 0 {
+			if len(observer.buffer)-consumed > streamwatch.DefaultMaxEventBytes {
+				observer.parseErr = streamwatch.ErrSSEEventTooLarge
+				observer.buffer = nil
+				return max(0, consumed-previous), observer.parseErr
+			}
 			// Only the last three bytes can form a delimiter with the next
 			// fragment; don't rescan a long unfinished frame from its start.
 			observer.scan = max(0, len(observer.buffer)-consumed-3)
@@ -267,6 +292,11 @@ func (observer *streamUsageObserver) Write(data []byte) (int, error) {
 		// consume is synchronous and does not retain frame bytes; the string
 		// parser owns its copy. Do not clone the same frame before parsing it.
 		end := consumed + observer.scan + index + width
+		if end-consumed > streamwatch.DefaultMaxEventBytes {
+			observer.parseErr = streamwatch.ErrSSEEventTooLarge
+			observer.buffer = nil
+			return max(0, consumed-previous), observer.parseErr
+		}
 		frame := observer.buffer[consumed:end]
 		observer.consume(frame)
 		consumed = end
@@ -312,7 +342,7 @@ func (observer *streamUsageObserver) ErrorTermination() bool { return observer.e
 func (observer *streamUsageObserver) ParseError() error { return observer.parseErr }
 
 func (observer *streamUsageObserver) consume(frame []byte) {
-	_ = readSSE(strings.NewReader(string(frame)), func(eventName, data string) error {
+	err := readSSE(strings.NewReader(string(frame)), func(eventName, data string) error {
 		events, err := observer.parser.Parse(eventName, data)
 		if err != nil {
 			if observer.parseErr == nil {
@@ -336,6 +366,9 @@ func (observer *streamUsageObserver) consume(frame []byte) {
 		}
 		return nil
 	})
+	if err != nil && observer.parseErr == nil {
+		observer.parseErr = err
+	}
 }
 
 func nextSSEBoundary(data []byte) (int, int) {
@@ -360,6 +393,7 @@ func readSSE(reader io.Reader, handler func(eventName, data string) error) error
 	scanner.Buffer(buffer, streamwatch.DefaultMaxLineBytes)
 	var eventName string
 	var dataLines []string
+	var budget streamwatch.SSEEventBudget
 	flush := func() error {
 		if len(dataLines) == 0 {
 			eventName = ""
@@ -372,6 +406,9 @@ func readSSE(reader io.Reader, handler func(eventName, data string) error) error
 	}
 	for scanner.Scan() {
 		line := strings.TrimSuffix(scanner.Text(), "\r")
+		if err := budget.AddLine(line); err != nil {
+			return err
+		}
 		if line == "" {
 			if err := flush(); err != nil {
 				return err

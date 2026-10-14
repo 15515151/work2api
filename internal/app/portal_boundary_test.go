@@ -605,6 +605,29 @@ func TestStalePasswordChangeCannotOverwriteReset(t *testing.T) {
 
 type backupSourceProbe struct{ path string }
 
+func TestQoderContributionTaskValidityUsesBalancedLock(t *testing.T) {
+	s := &Server{portalTasks: map[string]*portalContributionTask{}}
+	task := &portalContributionTask{expires: time.Now().Add(time.Minute)}
+	if s.portalTaskLive(task) {
+		t.Fatal("removed task is live")
+	}
+	s.portalTasks["reservation"] = task
+	if !s.portalTaskLive(task) {
+		t.Fatal("valid task rejected")
+	}
+	delete(s.portalTasks, "reservation")
+	s.portalTasks["login-id"] = task
+	if !s.portalTaskLive(task) {
+		t.Fatal("task remapping lost identity")
+	}
+	task.expires = time.Now().Add(-time.Minute)
+	if s.portalTaskLive(task) {
+		t.Fatal("expired task is live")
+	}
+	s.portalMu.Lock()
+	s.portalMu.Unlock()
+}
+
 func (*backupSourceProbe) Name() string                                   { return "fixture-source" }
 func (*backupSourceProbe) Prefix() string                                 { return "fixture-source/" }
 func (*backupSourceProbe) Ready() bool                                    { return false }

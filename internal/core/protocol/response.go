@@ -491,11 +491,29 @@ func ResponseUsage(protocol Protocol, body []byte) (Usage, bool) {
 			result.FinishReason = canonicalAnthropicStop(reason)
 		}
 	case Responses:
-		if jsonutil.StringAt(payload, "status") != "" {
-			if response, err := decodeBridgeResponse(protocol, payload); err == nil {
-				result.FinishReason = response.Stop
-			}
-		}
+		result.FinishReason = responsesFinishReason(payload)
 	}
 	return result, len(usage) > 0
+}
+
+// Usage observation must not decode or join response content. Native output
+// items that the conversion bridge cannot express still have valid terminal
+// status and usage (including custom tools).
+func responsesFinishReason(payload map[string]any) string {
+	switch jsonutil.StringAt(payload, "status") {
+	case "incomplete":
+		return canonicalResponsesIncomplete(jsonutil.StringAt(payload, "incomplete_details", "reason"))
+	case "failed", "cancelled":
+		return "error"
+	case "completed":
+		for _, raw := range jsonutil.SliceAt(payload, "output") {
+			item, _ := raw.(map[string]any)
+			if kind := jsonutil.StringAt(item, "type"); kind == "function_call" || kind == "custom_tool_call" {
+				return "tool_calls"
+			}
+		}
+		return "stop"
+	default:
+		return ""
+	}
 }

@@ -628,9 +628,20 @@ func (d *DB) MaintainUsage(ctx context.Context, days, maxRows, contentDays int, 
 		}
 	}
 	if maxRows > 0 {
-		if err := loop(`DELETE FROM usage_logs WHERE id IN (SELECT id FROM usage_logs WHERE id <=
-   (SELECT MAX(id) FROM (SELECT id FROM usage_logs ORDER BY id DESC LIMIT -1 OFFSET ?)) ORDER BY id LIMIT 64)`, maxRows); err != nil {
+		// Pin this maintenance round's cutoff once. New requests are retained
+		// and considered by the next round, rather than repeating a large
+		// OFFSET scan for every 64 deleted rows.
+		var cutoff sql.NullInt64
+		d.mu.Lock()
+		err := d.db.QueryRowContext(ctx, "SELECT id FROM usage_logs ORDER BY id DESC LIMIT 1 OFFSET ?", maxRows).Scan(&cutoff)
+		d.mu.Unlock()
+		if err != nil && err != sql.ErrNoRows {
 			return err
+		}
+		if cutoff.Valid {
+			if err := loop(`DELETE FROM usage_logs WHERE id IN (SELECT id FROM usage_logs WHERE id <= ? ORDER BY id LIMIT 64)`, cutoff.Int64); err != nil {
+				return err
+			}
 		}
 	}
 	const hasContent = "(content_bytes>0 OR (content_bytes IS NULL AND (COALESCE(input_content,'')<>'' OR COALESCE(output_content,'')<>'' OR COALESCE(reasoning_content,'')<>'')))"

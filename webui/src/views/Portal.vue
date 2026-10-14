@@ -23,11 +23,18 @@ const models = ref<string[]>([]), modelNames = ref<Record<string,string>>({})
 const policy = ref<{mode:'auto'|'manual';include:string[];exclude:string[]}>({mode:'auto',include:[],exclude:[]})
 const disabledModels = ref<string[]>([])
 const userDrafts = ref<Record<number,string[]>>({})
+const expandedUsers = ref(new Set<number>())
+const scopedByUser = computed(() => Object.fromEntries(Object.entries(data.value.user_model_grants || {}).map(([id,grants]) => [id,grants.filter(g=>!g.account_uids.includes('*'))])))
+const userModelOptions = computed(() => Object.fromEntries(data.value.users.map(u => {
+ const scoped = new Set((scopedByUser.value[u.id] || []).map(g=>g.model))
+ return [u.id,models.value.filter(m=>!scoped.has(m))]
+})))
+function toggleUserModels(id:number,event:Event){const next=new Set(expandedUsers.value);if((event.target as HTMLDetailsElement).open)next.add(id);else next.delete(id);expandedUsers.value=next}
 const adminsExist = computed(() => data.value.users.some(u => ['admin','owner'].includes(u.role)))
 function parseModels(raw: unknown): string[] { if (Array.isArray(raw)) return raw.filter((v):v is string=>typeof v==='string');try {return parseModels(JSON.parse(String(raw || '[]')))}catch{return []} }
 function contributionLabel(uid:string) { const a=data.value.accounts?.find(a=>a.uid===uid); return a?.alias || a?.nickname || uid.slice(0,8) }
 function username(id:number) {return data.value.users.find(u=>u.id===id)?.username || `用户 ${id}`}
-function scopedGrants(id:number) {return (data.value.user_model_grants?.[id] || []).filter(g=>!g.account_uids.includes('*'))}
+function scopedGrants(id:number) {return scopedByUser.value[id] || []}
 let loadVersion = 0
 async function load() {
  const version = ++loadVersion
@@ -98,9 +105,9 @@ async function copyInvite(invite: PortalInvite, link = false) {
    <WButton :disabled="busy || loading || !loaded" @click="savePolicy">保存默认规则</WButton>
   </section>
   <section class="glass rounded-xl p-5 space-y-3"><h2 class="font-semibold">用户额外授权</h2><p class="text-small text-faint">在默认模型和本人账号之外增加调用权限。限定账号授权仅适用于指定账号。</p>
-   <details v-for="u in data.users.filter(u=>u.role==='user')" :key="u.id" class="rounded-lg border border-line p-3"><summary class="cursor-pointer text-small">{{ u.username }} · 额外授权 {{ userDrafts[u.id]?.length || 0 }}<span v-if="scopedGrants(u.id).length"> · 限定账号授权 {{ scopedGrants(u.id).length }}</span></summary>
+   <details v-for="u in data.users.filter(u=>u.role==='user')" :key="u.id" class="rounded-lg border border-line p-3" @toggle="toggleUserModels(u.id,$event)"><summary class="cursor-pointer text-small">{{ u.username }} · 额外授权 {{ userDrafts[u.id]?.length || 0 }}<span v-if="scopedGrants(u.id).length"> · 限定账号授权 {{ scopedGrants(u.id).length }}</span></summary>
     <div v-for="g in scopedGrants(u.id)" :key="g.model" class="mt-3 flex flex-wrap items-center gap-2 text-small"><code class="break-all">{{ g.model }}</code><span class="text-faint">限定 {{ g.account_uids.length }} 个账号</span><WButton size="sm" :disabled="busy || loading || !loaded" @click="removeScoped(u.id,g.model)">移除授权</WButton></div>
-    <ModelAccessPicker v-model="userDrafts[u.id]" :options="models.filter(m=>!scopedGrants(u.id).some(g=>g.model===m))" :names="modelNames" :disabled="busy || loading || !loaded" class="mt-3" /><WButton size="sm" :disabled="busy || loading || !loaded" class="mt-3" @click="saveUser(u.id)">保存额外授权</WButton>
+    <ModelAccessPicker v-if="expandedUsers.has(u.id)" v-model="userDrafts[u.id]" :options="userModelOptions[u.id] || []" :names="modelNames" :disabled="busy || loading || !loaded" class="mt-3" /><WButton size="sm" :disabled="busy || loading || !loaded" class="mt-3" @click="saveUser(u.id)">保存额外授权</WButton>
    </details><p v-if="!data.users.some(u=>u.role==='user')" class="text-small text-faint">暂无普通用户。</p>
   </section>
   <section class="glass rounded-xl p-5 space-y-3"><h2 class="font-semibold">全局禁用用户模型</h2><p class="text-small text-faint">对默认权限、本人账号、额外授权和现有用户 Key 均生效。管理员 Key 保持其原有配置。</p><ModelAccessPicker v-model="disabledModels" :options="models" :names="modelNames" :disabled="busy || loading || !loaded" /><WButton :disabled="busy || loading || !loaded" @click="mutate(()=>api.saveSettings({portal_disabled_models:JSON.stringify(disabledModels)}),'禁用规则已保存')">保存禁用规则</WButton></section>

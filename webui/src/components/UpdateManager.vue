@@ -9,12 +9,14 @@ import WInput from './ui/WInput.vue'
 import WToggle from './ui/WToggle.vue'
 const status=ref<UpdateStatus|null>(null),error=ref(''),busy=ref(false),migration=ref(false),policyDirty=ref(false)
 const policy=reactive<UpdatePolicy>({mode:'off',every_hours:6,start_hour:2,end_hour:4,allow_republished:false})
-let disposed=false,timer:ReturnType<typeof setInterval>|undefined,loading=false
+let disposed=false,timer:ReturnType<typeof setTimeout>|undefined,loading=false,failures=0
 const phaseLabel=computed(()=>({idle:'未检查',checking:'检查中',checked:'检查完成',downloading:'下载校验中',ready:'待安装',installing:'准备安装',backup_ready:'备份完成',verifying:'新版验证中',accepting:'准备开放',acceptance_unknown:'需要核实开放状态',complete:'更新完成',rolled_back:'已恢复原版本',recovery_required:'需要人工恢复',failed:'更新失败',current:'已是相同产物'} as Record<string,string>)[status.value?.phase || ''] || status.value?.phase)
 const inProgress=computed(()=>['checking','downloading','installing','backup_ready','verifying','accepting'].includes(status.value?.phase || ''))
 const recoveryBlocked=computed(()=>['acceptance_unknown','recovery_required'].includes(status.value?.phase || ''))
 const deploymentLabel=computed(()=>({source:'源码自编译',binary:'Release 二进制',systemd:'systemd 服务',docker:'Docker 容器'} as Record<string,string>)[status.value?.deployment.kind || ''] || '未识别')
-async function load(initial=false){if(loading)return;loading=true;try{const result=await api.updateStatus();if(disposed)return;status.value=result;error.value='';if(initial||!policyDirty.value)Object.assign(policy,result.policy)}catch(e:any){if(!disposed)error.value=e?.response?.data?.error?.message || '无法读取更新状态；更新期间服务可能暂时重启，请稍后重试或重新登录'}finally{loading=false}}
+function schedule(){if(timer)clearTimeout(timer);if(disposed || document.hidden)return;timer=setTimeout(()=>{void load()},failures?Math.min(300000,60000*2**Math.min(failures-1,3)):inProgress.value?5000:60000)}
+function visibilityChanged(){if(document.hidden){if(timer)clearTimeout(timer)}else{void load()}}
+async function load(initial=false){if(loading || disposed)return;loading=true;try{const result=await api.updateStatus();if(disposed)return;status.value=result;error.value='';failures=0;if(initial||!policyDirty.value)Object.assign(policy,result.policy)}catch(e:any){failures++;if(!disposed)error.value=e?.response?.data?.error?.message || '无法读取更新状态；更新期间服务可能暂时重启，请稍后重试或重新登录'}finally{loading=false;schedule()}}
 async function action(kind:'check'|'download'|'install'|'policy'){
  if(busy.value || inProgress.value)return
  if(kind==='install'&&!confirm('安装将等待现有调用结束，备份后切换版本。期间暂停接收新请求，管理登录可能失效。是否继续？'))return
@@ -27,8 +29,8 @@ async function action(kind:'check'|'download'|'install'|'policy'){
   await load()
  }catch(e:any){error.value=e?.response?.data?.error?.message || '更新操作失败，请查看状态后重试'}finally{busy.value=false}
 }
-onMounted(()=>{load(true);timer=setInterval(()=>{load()},5000)})
-onUnmounted(()=>{disposed=true;if(timer)clearInterval(timer)})
+onMounted(()=>{void load(true);document.addEventListener('visibilitychange',visibilityChanged)})
+onUnmounted(()=>{disposed=true;if(timer)clearTimeout(timer);document.removeEventListener('visibilitychange',visibilityChanged)})
 </script>
 <template>
  <WCard title="版本更新">
