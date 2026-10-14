@@ -92,11 +92,23 @@ var inputTooLargeMarkers = []string{
 	"context window",
 	"request entity too large",
 	"input too large",
+	"max_tokens",
+	"token limit",
+	"exceeds",
+	"too large",
+	"payload too large",
+	"body too large",
+	"message too long",
+	"history too long",
 	"输入过长",
 	"内容过长",
 	"上下文过长",
 	"上下文长度",
 	"超出模型上限",
+	"超过上限",
+	"过长",
+	"超长",
+	"超限",
 }
 
 func MsgIndicatesInputTooLarge(s string) bool {
@@ -120,7 +132,7 @@ func Classify(status int, body string) ErrKind {
 	if code == 4008 || status == http.StatusPaymentRequired {
 		return ErrPlanLimit
 	}
-	if status >= 400 && status < 500 && MsgIndicatesInputTooLarge(body) {
+	if status >= 400 && MsgIndicatesInputTooLarge(body) {
 		return ErrInputTooLarge
 	}
 	if status == http.StatusUnauthorized {

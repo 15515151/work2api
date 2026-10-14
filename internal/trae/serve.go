@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"strings"
 	"time"
 
@@ -211,6 +212,11 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 				}
 			}
 			if stream == nil {
+				snip := string(errorBody)
+				if len(snip) > 500 {
+					snip = snip[:500]
+				}
+				log.Printf("trae reject model=%s status=%d kind=%s code=%d body=%q", model, status, kind, upstream.BusinessCode(errorBody), snip)
 				lastRejection = rejectionError(kind, status, upstream.BusinessCode(errorBody))
 				lastRetryDelay = 0
 				if kind == upstream.ErrSoftRate {
@@ -256,6 +262,7 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 			var rejection *upstream.SOLOStreamError
 			if errors.As(err, &rejection) {
 				kind := rejection.Kind()
+				log.Printf("trae stream-error model=%s kind=%s code=%d msg=%q", model, kind, rejection.Code, rejection.Msg)
 				lastRejection = rejectionError(kind, 0, rejection.Code)
 				lastRetryDelay = 0
 				if kind == upstream.ErrSoftRate {
@@ -267,7 +274,13 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 				}
 				return returnRejection()
 			}
-			return report, err
+			log.Printf("trae first-event model=%s err=%v", model, err)
+			lastRejection = rejectionError(upstream.ErrServer, 502, 0)
+			r.cool(ref.LocalID, upstream.ErrServer)
+			if attempt < 2 {
+				continue
+			}
+			return returnRejection()
 		}
 		// Cancellation closes both sides and the HTTP body; no detached reader
 		// survives the downstream consumer or service shutdown.
