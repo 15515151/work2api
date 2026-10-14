@@ -61,7 +61,7 @@ async function changePassword() {
         {{ me.eligible_accounts ? '账号已添加，但暂未找到符合权限的模型。请检查账号状态，或联系管理员刷新目录与确认禁用规则。' : '可以先创建跟随权限的 Key；管理员开放模型或账号就绪后即可使用。贡献账号是可选操作。' }}
       </div>
       <p v-if="me.own_models.length && !me.default_models.length" class="mt-4 text-small text-muted">你已经可以使用本人账号。当前没有默认开放资源，不影响本人调用。</p>
-      <p class="mt-3 text-micro text-faint">撤回共享后，账号保留为「仅本人使用」，不会再供其他用户调用。额度、冷却或授权失效仍可能影响调用。</p>
+      <p class="mt-3 text-micro text-faint">撤回贡献后，账号保留为「仅本人使用」，不会再供其他用户调用。额度、冷却或授权失效仍可能影响调用。</p>
       <div class="mt-4 flex flex-wrap gap-2">
         <WButton v-if="!me.eligible_accounts" variant="primary" @click="router.push('/contribute')">添加我的账号</WButton>
         <WButton variant="subtle" @click="router.push('/models')">查看可用模型</WButton>

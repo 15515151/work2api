@@ -13,11 +13,88 @@ import (
 	"unicode/utf8"
 	"work2api/internal/core/provider"
 	"work2api/internal/jsonutil"
+	"work2api/internal/streamwatch"
 )
 
 type terminalOnlyReader struct {
 	wire  string
 	reads int
+}
+
+func TestGenerationParserExcludesProtocolMetadataAndDoneSnapshots(t *testing.T) {
+	for _, tc := range []struct {
+		protocol Protocol
+		frames   []string
+		count    int
+	}{
+		{Chat, []string{`{"choices":[{"delta":{"role":"assistant"}}]}`, `{"choices":[{"delta":{"reasoning_content":"think"}}]}`, `{"choices":[{"delta":{"content":"answer"}}]}`, `{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"completion_tokens":20}}`}, 2},
+		{Anthropic, []string{`{"type":"message_start","message":{"id":"m","model":"m","usage":{"input_tokens":1}}}`, `{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"think"}}`, `{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"answer"}}`, `{"type":"content_block_delta","index":1,"delta":{"type":"signature_delta","signature":"opaque"}}`, `{"type":"message_stop"}`}, 2},
+		{Responses, []string{`{"type":"response.created","response":{"id":"r","model":"m"}}`, `{"type":"response.reasoning_summary_text.delta","item_id":"think","delta":"think"}`, `{"type":"response.output_text.delta","delta":"answer"}`, `{"type":"response.function_call_arguments.delta","item_id":"call","delta":"{}"}`, `{"type":"response.output_text.done","text":"answer"}`, `{"type":"response.completed","response":{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"answer"}]}]}}`}, 3},
+	} {
+		t.Run(string(tc.protocol), func(t *testing.T) {
+			ctx, timing := streamwatch.WithTiming(context.Background())
+			p := newStreamUsageObserver(tc.protocol).parser
+			p.generationCtx = ctx
+			for _, frame := range tc.frames {
+				if _, err := p.Parse("", frame); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if timing.Snapshot().GenerationEvents != tc.count {
+				t.Fatal(timing.Snapshot())
+			}
+		})
+	}
+}
+
+func TestClientToolPreparationCopiesOnlyChangedHistory(t *testing.T) {
+	ordinary := map[string]any{"type": "message", "content": "unchanged"}
+	custom := map[string]any{"type": "custom_tool_call", "name": "patch", "input": "raw"}
+	body := map[string]any{"tools": []any{map[string]any{"type": "custom", "name": "patch"}}, "input": []any{ordinary, custom}}
+	before, _ := json.Marshal(body)
+	out, _, _, err := PrepareClientTools(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, _ := json.Marshal(body)
+	if !bytes.Equal(before, after) {
+		t.Fatal("original request mutated")
+	}
+	history := out["input"].([]any)
+	if reflect.ValueOf(history[0]).Pointer() != reflect.ValueOf(ordinary).Pointer() {
+		t.Fatal("ordinary history copied")
+	}
+	if reflect.ValueOf(history[1]).Pointer() == reflect.ValueOf(custom).Pointer() {
+		t.Fatal("rewritten tool aliases original")
+	}
+	plain := map[string]any{"input": []any{ordinary}}
+	prepared, _, _, err := PrepareClientTools(plain)
+	if err != nil || reflect.ValueOf(prepared).Pointer() != reflect.ValueOf(plain).Pointer() {
+		t.Fatal("ordinary request did not use fast path")
+	}
+}
+
+func BenchmarkClientToolPreparationLargeHistory(b *testing.B) {
+	for _, custom := range []bool{false, true} {
+		b.Run(fmt.Sprintf("custom=%t", custom), func(b *testing.B) {
+			history := make([]any, 1000)
+			for i := range history {
+				history[i] = map[string]any{"type": "message", "content": strings.Repeat("x", 1024)}
+			}
+			body := map[string]any{"input": history}
+			if custom {
+				body["tools"] = []any{map[string]any{"type": "custom", "name": "patch"}}
+				history[999] = map[string]any{"type": "custom_tool_call", "name": "patch", "input": "raw"}
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, _, _, err := PrepareClientTools(body); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
 }
 
 func (r *terminalOnlyReader) Read(p []byte) (int, error) {

@@ -242,6 +242,8 @@ func (o *Runtime) serveConverted(w http.ResponseWriter, r *http.Request, payload
 	streamMode := clientStream && canStream
 	if !streamMode {
 		conv.SetNonstream()
+	} else if messages, ok := conv.(*adapters.AnthropicStreamConverter); ok {
+		messages.SetStreamingLogPolicy(provider.LogCapturePolicy{Enabled: principal.UserID == 0, Limit: o.cfg.UsageContentMaxBytes})
 	}
 	// Only open the SSE header stream when actually streaming; otherwise the
 	// non-stream branches below respond with writeJSON and must own the header.

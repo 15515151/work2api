@@ -4,7 +4,8 @@ import { api } from '@/api/client'
 import type { AppInfo, ModelInfo } from '@/types'
 import { toast } from '@/lib/toast'
 import { confirm } from '@/lib/confirm'
-import { int, credits, dt } from '@/lib/format'
+import { int, dt } from '@/lib/format'
+import ChannelCosts from '@/components/ChannelCosts.vue'
 import WPage from '@/components/ui/WPage.vue'
 import WCard from '@/components/ui/WCard.vue'
 import WTable, { type Column } from '@/components/ui/WTable.vue'
@@ -22,15 +23,13 @@ const apps = ref<AppInfo[]>([])
 const loading = ref(true)
 
 const cols: Column[] = [
-  { key: 'id', label: 'ID', mono: true, nowrap: true },
   { key: 'name', label: '名称' },
   { key: 'username', label: '归属', nowrap: true },
   { key: 'key_prefix', label: '密钥', mono: true, nowrap: true },
   { key: 'allowed_models', label: '可用模型' },
   { key: 'requests', nowrap: true, label: '请求数', align: 'right', mono: true },
   { key: 'tokens', nowrap: true, label: 'Tokens', align: 'right', mono: true },
-  { key: 'credits', nowrap: true, label: '消耗额度', align: 'right', mono: true, hint: '该密钥累计消耗的额度' },
-  { key: 'created_at', label: '创建时间', mono: true, nowrap: true },
+  { key: 'channel_costs', label: '累计消耗', align: 'right', mono: true },
   { key: 'enabled', label: '状态', nowrap: true },
   { key: 'actions', label: '操作', align: 'right', minWidth: '14rem', nowrap: true },
 ]
@@ -64,13 +63,22 @@ function closeCreate() {
 const keyOpen = ref(false)
 const shownKey = ref('')
 const keyMsg = ref('')
-async function viewKey(app: any) {
+const keyTarget = ref<AppInfo | null>(null)
+let keyLoadVersion = 0
+async function viewKey(app: Record<string, any>) {
+  const version = ++keyLoadVersion
+  keyTarget.value = apps.value.find(item => item.id === app.id) || null
   shownKey.value = ''
   keyMsg.value = ''
   keyOpen.value = true
-  const res = await api.appKey(app.id)
-  if (res.key) shownKey.value = res.key
-  else keyMsg.value = res.message || '该密钥创建于旧版本，无法再明文查看，请重建。'
+  try {
+    const res = await api.appKey(app.id)
+    if (version !== keyLoadVersion || !keyOpen.value) return
+    if (res.key) shownKey.value = res.key
+    else keyMsg.value = res.message || '此密钥无法查看，请新建密钥并更新客户端配置。'
+  } catch (e: any) {
+    if (version === keyLoadVersion && keyOpen.value) keyMsg.value = e?.message || '密钥读取失败，请关闭后重试。'
+  }
 }
 
 async function copy(text: string) {
@@ -201,9 +209,8 @@ onMounted(load)
           </button>
         </template>
         <template #cell-requests="{ value }">{{ int(value) }}</template>
-        <template #cell-tokens="{ value }">{{ int(value) }}</template>
-        <template #cell-credits="{ value }">{{ credits(value) }}</template>
-        <template #cell-created_at="{ value }">{{ dt(value, 'YYYY-MM-DD') }}</template>
+        <template #cell-tokens="{ row }"><span :title="row.tokens_known === false ? '已记录的 Tokens 合计；部分请求未上报用量' : ''">{{ int(row.tokens) }}</span></template>
+        <template #cell-channel_costs="{ row }"><ChannelCosts :total="row.credits" :costs="row.channel_costs" /></template>
         <template #cell-enabled="{ row }">
           <WTag :tone="row.enabled ? 'live' : 'muted'" dot>{{ row.enabled ? '启用' : '停用' }}</WTag>
         </template>
@@ -249,7 +256,8 @@ onMounted(load)
     </WModal>
 
     <!-- 查看密钥 -->
-    <WModal v-model:open="keyOpen" size="sm" title="密钥明文">
+    <WModal v-model:open="keyOpen" size="sm" title="密钥详情">
+      <p v-if="keyTarget" class="mb-3 text-micro text-muted">{{ keyTarget.name }} · 创建于 {{ dt(keyTarget.created_at, 'YYYY-MM-DD') }}<span class="ml-2" :title="'密钥记录 ID：' + keyTarget.id">#{{ keyTarget.id }}</span></p>
       <WSpinner v-if="!shownKey && !keyMsg" label="读取中" />
       <div v-else-if="shownKey" class="flex items-center gap-2 rounded-lg border border-line bg-bg/50 p-3">
         <code class="mono flex-1 break-all text-small text-brand">{{ shownKey }}</code>

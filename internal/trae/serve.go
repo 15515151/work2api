@@ -288,7 +288,7 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 			usage, known, err = protocol.TranscodeStream(ctx, req.Writer, pipeReader, protocol.Chat, protocol.Protocol(req.Protocol), "trae/"+model)
 		} else {
 			var reply []byte
-			reply, usage, known, err = protocol.CollapseStreamWithUsage(pipeReader, protocol.Chat, "trae/"+model)
+			reply, usage, known, err = protocol.CollapseStreamWithUsageContext(ctx, pipeReader, protocol.Chat, "trae/"+model)
 			if err == nil {
 				reply, err = protocol.ConvertResponse(protocol.Chat, protocol.Protocol(req.Protocol), reply)
 			}

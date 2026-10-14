@@ -149,7 +149,7 @@ func (rt *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (result
 	if upstreamRoute.Anonymous || rt.catalog.IsFreeModel(upstreamRoute.ID) {
 		watch := streamwatch.NewWatch(resp.Body, ctx, 0, 0)
 		defer watch.Close()
-		responseBody, usage, known, err = protocol.CollapseStreamWithUsage(watch.Reader(resp.Body), upstreamRoute.Protocol, model)
+		responseBody, usage, known, err = protocol.CollapseStreamWithUsageContext(ctx, watch.Reader(resp.Body), upstreamRoute.Protocol, model)
 		if err != nil {
 			rt.logger.Warn("stream collapse failed", "component", "opencode.conversion", "request_id", ids.Request, "model", model, "error", err)
 			protocol.WriteError(w, external, http.StatusBadGateway, "unsupported upstream response", "upstream_error", ids.Request)

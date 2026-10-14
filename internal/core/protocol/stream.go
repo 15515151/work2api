@@ -60,6 +60,7 @@ func TranscodeStream(ctx context.Context, w http.ResponseWriter, reader io.Reade
 		return Usage{}, false, fmt.Errorf("response writer does not support streaming")
 	}
 	parser := &bridgeStreamParser{
+		generationCtx:     ctx,
 		protocol:          from,
 		tools:             map[string]bool{},
 		toolIDs:           map[string]string{},
@@ -169,6 +170,7 @@ func ForwardStream(ctx context.Context, w http.ResponseWriter, reader io.Reader,
 		return Usage{}, false, fmt.Errorf("response writer does not support streaming")
 	}
 	observer := newStreamUsageObserver(protocol)
+	observer.parser.generationCtx = ctx
 	buffer, release := streamwatch.BorrowLineBuffer()
 	defer release()
 	writer := &sseFlushWriter{writer: w, flusher: flusher}

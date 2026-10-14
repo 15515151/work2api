@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -23,7 +24,14 @@ func CollapseStream(reader io.Reader, protocol Protocol, model string) ([]byte, 
 // CollapseStreamWithUsage retains whether the upstream actually supplied usage;
 // synthesized zero counters in the encoded response are not an observation.
 func CollapseStreamWithUsage(reader io.Reader, protocol Protocol, model string) ([]byte, Usage, bool, error) {
+	return CollapseStreamWithUsageContext(context.Background(), reader, protocol, model)
+}
+
+// CollapseStreamWithUsageContext observes upstream generation even when the
+// client requests a single JSON response. It does not time JSON serialization.
+func CollapseStreamWithUsageContext(ctx context.Context, reader io.Reader, protocol Protocol, model string) ([]byte, Usage, bool, error) {
 	parser := &bridgeStreamParser{
+		generationCtx:     ctx,
 		protocol:          protocol,
 		tools:             map[string]bool{},
 		toolIDs:           map[string]string{},

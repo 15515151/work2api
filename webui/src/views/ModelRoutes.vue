@@ -92,7 +92,7 @@ onMounted(load)
       <p v-if="!available.length" class="text-small text-faint p-3">没有匹配的可添加模型。</p>
      </div>
     </div>
-    <p class="text-xs text-muted leading-relaxed">新增成员不会自动扩大已有受限 Key 的授权；重新保存 Key 的模型权限后，才授权其使用当前成员。用户调用仍需满足本人账号或共享池权限。</p>
+    <p class="text-xs text-muted leading-relaxed">新增成员不会自动扩大已有受限 Key 的授权；重新保存 Key 的模型权限后，才授权其使用当前成员。用户调用仍需满足当前模型和账号权限。</p>
     <div class="flex justify-end gap-2"><WButton :disabled="saving" @click="editing = false">取消</WButton><WButton type="submit" variant="primary" :loading="saving">保存配置</WButton></div>
    </form>
   </div>

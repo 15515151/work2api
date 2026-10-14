@@ -397,6 +397,9 @@ func (b *Bridge) CallQoderWithOpts(ctx context.Context, agent string, messages [
 	for {
 		emitted := false
 		err := current.callQoderWithOpts(ctx, agent, messages, model, tools, opts, func(d Delta) {
+			if d.Content != "" || d.Reasoning != "" || streamwatch.HasToolArguments(d.ToolCalls) {
+				streamwatch.Generation(ctx)
+			}
 			if !d.isEmpty() {
 				emitted = true
 			}

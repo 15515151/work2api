@@ -9,6 +9,36 @@ import (
 	"sync"
 )
 
+// bufferedRequestBody is shared by Request.WithContext clones. Closing it
+// drops the raw JSON buffer and returns its reservation exactly once.
+type bufferedRequestBody struct {
+	mu       sync.Mutex
+	reader   *bytes.Reader
+	budget   *bodyBudget
+	reserved int64
+}
+
+func (b *bufferedRequestBody) Read(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.reader == nil {
+		return 0, io.EOF
+	}
+	return b.reader.Read(p)
+}
+
+func (b *bufferedRequestBody) Close() error {
+	b.mu.Lock()
+	b.reader = nil
+	reserved := b.reserved
+	b.reserved = 0
+	b.mu.Unlock()
+	if reserved > 0 {
+		b.budget.release(reserved)
+	}
+	return nil
+}
+
 func isModelRoute(r *http.Request) bool {
 	return r.Method == "POST" && (r.URL.Path == "/v1/chat/completions" || r.URL.Path == "/v1/messages" || r.URL.Path == "/v1/responses")
 }

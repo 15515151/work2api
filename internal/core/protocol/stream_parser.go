@@ -1,14 +1,17 @@
 package protocol
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
 
 	"work2api/internal/jsonutil"
+	"work2api/internal/streamwatch"
 )
 
 type bridgeStreamParser struct {
+	generationCtx     context.Context
 	protocol          Protocol
 	started           bool
 	tools             map[string]bool
@@ -30,6 +33,7 @@ func (parser *bridgeStreamParser) Parse(eventName, data string) ([]bridgeStreamE
 	if err := json.Unmarshal([]byte(data), &value); err != nil {
 		return nil, fmt.Errorf("invalid upstream SSE JSON: %w", err)
 	}
+	parser.observeGeneration(eventName, value)
 	switch parser.protocol {
 	case Chat:
 		return parser.parseChatEvent(eventName, value), nil
@@ -39,6 +43,33 @@ func (parser *bridgeStreamParser) Parse(eventName, data string) ([]bridgeStreamE
 		return parser.parseResponses(eventName, value), nil
 	default:
 		return nil, fmt.Errorf("unsupported stream protocol %q", parser.protocol)
+	}
+}
+
+func (parser *bridgeStreamParser) observeGeneration(eventName string, value map[string]any) {
+	if parser.generationCtx == nil {
+		return
+	}
+	generated := false
+	kind := jsonutil.FirstString(jsonutil.StringAt(value, "type"), eventName)
+	switch parser.protocol {
+	case Chat:
+		generated = streamwatch.ChatGeneration(value)
+	case Anthropic:
+		if kind == "content_block_delta" {
+			delta := jsonutil.MapAt(value, "delta")
+			for _, key := range []string{"text", "thinking", "partial_json"} {
+				generated = generated || jsonutil.StringAt(delta, key) != ""
+			}
+		}
+	case Responses:
+		switch kind {
+		case "response.output_text.delta", "response.refusal.delta", "response.reasoning_summary_text.delta", "response.reasoning_text.delta", "response.function_call_arguments.delta", "response.custom_tool_call_input.delta":
+			generated = jsonutil.StringAt(value, "delta") != ""
+		}
+	}
+	if generated {
+		streamwatch.Generation(parser.generationCtx)
 	}
 }
 

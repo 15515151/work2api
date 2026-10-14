@@ -12,6 +12,22 @@ type NamespaceName struct{ Namespace, Name string }
 
 // PrepareClientTools lowers request-local identities without mutating history.
 func PrepareClientTools(body map[string]any) (map[string]any, map[string]bool, map[string]NamespaceName, error) {
+	needsNamespace := false
+	for _, raw := range jsonutil.SliceAt(body, "tools") {
+		item, _ := raw.(map[string]any)
+		needsNamespace = needsNamespace || jsonutil.StringAt(item, "type") == "namespace"
+	}
+	for _, raw := range jsonutil.SliceAt(body, "input") {
+		item, _ := raw.(map[string]any)
+		kind := jsonutil.StringAt(item, "type")
+		needsNamespace = needsNamespace || (kind == "function_call" || kind == "custom_tool_call") && jsonutil.StringAt(item, "namespace") != ""
+	}
+	choice := jsonutil.MapAt(body, "tool_choice")
+	needsNamespace = needsNamespace || jsonutil.StringAt(choice, "namespace") != "" || jsonutil.StringAt(choice, "type") == "namespace"
+	if !needsNamespace {
+		prepared, custom, err := PrepareCustomTools(body)
+		return prepared, custom, nil, err
+	}
 	out := copyCustomMap(body)
 	mapping := map[string]NamespaceName{}
 	used := map[string]bool{}
@@ -77,9 +93,8 @@ func PrepareClientTools(body map[string]any) (map[string]any, map[string]bool, m
 		out["tools"] = tools
 	}
 	if history, ok := body["input"].([]any); ok {
-		cloned := make([]any, len(history))
+		var cloned []any
 		for i, raw := range history {
-			cloned[i] = raw
 			item, ok := raw.(map[string]any)
 			if !ok {
 				continue
@@ -91,12 +106,17 @@ func PrepareClientTools(body map[string]any) (map[string]any, map[string]bool, m
 					return nil, nil, nil, err
 				}
 				copy := copyCustomMap(item)
+				if cloned == nil {
+					cloned = append([]any(nil), history...)
+				}
 				copy["name"] = flat
 				delete(copy, "namespace")
 				cloned[i] = copy
 			}
 		}
-		out["input"] = cloned
+		if cloned != nil {
+			out["input"] = cloned
+		}
 	}
 	if choice, ok := body["tool_choice"].(map[string]any); ok {
 		if namespace := jsonutil.StringAt(choice, "namespace"); namespace != "" {
