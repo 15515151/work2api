@@ -447,6 +447,8 @@ func (o *Runtime) OpenUpstreamScoped(ctx context.Context, acc *pool.Account, bod
 			d.FinishReason, d.ErrorKind, d.Started = "", "", false
 			d.EffectiveLimits = OutputLimits(attemptBody)
 			d.Compatibility = CompatibilityName(level)
+			d.BillingDomain = siterouting.ProfileSite(acc.Profile)
+			d.BillingCoefficient = o.Catalog.AccountCost(acc.Profile, acc.UID, model)
 		}
 		started, err := o.RunOnce(ctx, acc, attemptBody, sink)
 		if d := Diagnostic(ctx); d != nil {

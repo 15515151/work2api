@@ -96,12 +96,52 @@ func TestBudgetSamplesExcludeUnknownTokensErrorsAndOldHistory(t *testing.T) {
 	}
 	for _, s := range samples {
 		if s.Recent {
-			if s.Tokens != 1500 || s.Credits != 4 || s.Calls != 2 || s.LegacyCalls != 1 || s.ZeroTokens != 200 || s.ZeroCalls != 1 || s.UnknownCalls != 1 {
+			if s.Tokens != 1500 || s.Credits != 4 || s.Calls != 2 || s.LegacyCalls != 1 || s.ZeroTokens != 200 || s.ZeroCalls != 1 || s.UnknownCalls != 1 || s.UnknownTokens != 300 {
 				t.Fatalf("recent=%#v", s)
 			}
 		} else if s.Tokens != 3000 || s.Credits != 2 || s.Calls != 1 {
 			t.Fatalf("fallback=%#v", s)
 		}
+	}
+}
+
+func TestBudgetSamplesPreserveBillingSnapshots(t *testing.T) {
+	db, err := New(filepath.Join(t.TempDir(), "budget-prices.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	known := true
+	paid := 1.0
+	zero := 0.0
+	for _, price := range []*float64{nil, &zero, &paid} {
+		id, err := db.LogUsageWithID(UsageParams{Model: "m", AccountUID: "a", InputTokens: 1000, TokensKnown: &known, Credits: &paid, Status: "ok", Diagnostics: &UsageDiagnostics{BillingDomain: "domestic", BillingCoefficient: price}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := db.UpdateUsagePerformance([]int64{id}, UsagePerformance{HTTPStatus: 200, TotalMS: 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	samples, err := db.UsageBudgetSamples(float64(time.Now().Unix()) + 1)
+	if err != nil || len(samples) != 3 {
+		t.Fatalf("samples=%#v err=%v", samples, err)
+	}
+	seen := map[string]bool{}
+	for _, sample := range samples {
+		if sample.Domain != "domestic" || sample.Calls != 1 {
+			t.Fatal(sample)
+		}
+		if sample.Coefficient == nil {
+			seen["unknown"] = true
+		} else if *sample.Coefficient == 0 {
+			seen["zero"] = true
+		} else if *sample.Coefficient == 1 {
+			seen["one"] = true
+		}
+	}
+	if len(seen) != 3 {
+		t.Fatal(seen)
 	}
 }
 

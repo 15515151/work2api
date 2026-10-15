@@ -9,6 +9,7 @@ import (
 	"errors"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"sort"
 	"strconv"
@@ -71,15 +72,17 @@ type Registry struct {
 	db     Settings
 	client *http.Client
 
-	refreshMu  sync.Mutex
-	mu         sync.Mutex
-	models     []map[string]any
-	modelIndex map[string]map[string]any
-	reasoning  map[string]map[string]any
-	fetchedAt  float64
-	lastFail   float64
-	stale      bool
-	source     string
+	refreshMu    sync.Mutex
+	mu           sync.Mutex
+	models       []map[string]any
+	modelIndex   map[string]map[string]any
+	accountCosts map[[2]string]map[string]float64
+	promotions   map[[2]string]promotionSnapshot
+	reasoning    map[string]map[string]any
+	fetchedAt    float64
+	lastFail     float64
+	stale        bool
+	source       string
 	// catalogCache 按 (profile, uid, url) 保存各来源的成功快照：单一路失败
 	// 不砍掉另一来源的专属模型（上游 0.6.3 _catalog_cache 同款）。
 	catalogCache map[[3]string][]fetchedModel
@@ -177,6 +180,7 @@ func (r *Registry) ClearCatalogSnapshots() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.catalogCache = map[[3]string][]fetchedModel{}
+	r.promotions = nil
 }
 
 // IDs returns the current model ids.
@@ -211,6 +215,27 @@ func (r *Registry) CreditsByRegion(model string) map[string]float64 {
 			return out
 		}
 		return nil
+	}
+	return nil
+}
+
+// AccountCosts preserves account-specific offers instead of borrowing whichever
+// account supplied the merged regional catalog. It never fetches the network.
+func (r *Registry) AccountCosts(profile, uid string) map[string]float64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := map[string]float64{}
+	for id, cost := range r.accountCosts[[2]string{profile, uid}] {
+		out[id] = cost
+	}
+	return out
+}
+
+func (r *Registry) AccountCost(profile, uid, model string) *float64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if value, ok := r.accountCosts[[2]string{profile, uid}][model]; ok {
+		return &value
 	}
 	return nil
 }
@@ -420,6 +445,17 @@ func (r *Registry) fetchFromUpstreamContext(ctx context.Context) []fetchedModel 
 			accounts = []*pool.Account{a}
 		}
 	}
+	live := make(map[[2]string]bool, len(accounts))
+	for _, a := range accounts {
+		live[[2]string{a.Profile, a.UID}] = true
+	}
+	r.mu.Lock()
+	for key := range r.promotions {
+		if !live[key] {
+			delete(r.promotions, key)
+		}
+	}
+	r.mu.Unlock()
 	if len(accounts) == 0 {
 		return nil
 	}
@@ -700,52 +736,35 @@ func (r *Registry) fetchOneContext(ctx context.Context, account *pool.Account) [
 		}
 		return nil
 	}
+	r.refreshPromotionMetadata(ctx, account, sources[0], headers)
 	out := make([]fetchedModel, 0, len(order))
 	for _, id := range order {
 		out = append(out, merged[id])
 	}
+	costs := map[string]float64{}
+	for _, model := range out {
+		if cost, ok := model.entry["credits"].(float64); ok && cost >= 0 && !math.IsNaN(cost) && !math.IsInf(cost, 0) {
+			costs[model.id] = cost
+		}
+	}
+	r.mu.Lock()
+	if r.accountCosts == nil {
+		r.accountCosts = map[[2]string]map[string]float64{}
+	}
+	r.accountCosts[[2]string{account.Profile, account.UID}] = costs
+	r.mu.Unlock()
 	return out
 }
 
 // fetchCatalogURL 拉取单路目录并共享 CLI 白名单/禁用标志/元数据解析。
 // 失败返回 nil（HTTP 错误、业务错误码、畸形响应、无 cli 白名单均算失败）。
 func (r *Registry) fetchCatalogURL(ctx context.Context, url string, headers map[string]string, account *pool.Account) []fetchedModel {
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
-	resp, err := r.client.Do(req)
-	if err != nil || resp == nil {
-		return nil
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		log.Printf("models api status %d (%s)", resp.StatusCode, account.Profile)
-		return nil
-	}
-	var data map[string]any
-	if json.NewDecoder(io.LimitReader(resp.Body, 2<<20)).Decode(&data) != nil {
-		return nil
-	}
-	// 业务错误码（上游按 code 字段报错时 HTTP 仍是 200）：不信任其中的模型清单。
-	if code, hasCode := data["code"]; hasCode {
-		switch c := code.(type) {
-		case float64:
-			if c != 0 {
-				return nil
-			}
-		case string:
-			if c != "0" {
-				return nil
-			}
-		case nil:
-		default:
-			return nil
-		}
-	}
-	d, _ := data["data"].(map[string]any)
+	d := r.fetchCatalogDocument(ctx, url, headers)
 	if d == nil {
 		return nil
+	}
+	if strings.HasSuffix(url, "/v3/config") {
+		r.savePromotionMetadata(account, d)
 	}
 	modelsRaw, _ := d["models"].([]any)
 	agents, _ := d["agents"].([]any)
@@ -787,10 +806,49 @@ func (r *Registry) fetchCatalogURL(ctx context.Context, url string, headers map[
 		e["profile"] = account.Profile
 		out = append(out, fetchedModel{id: mid, entry: e, reasoning: reasoning})
 	}
-	// 空目录（cli 白名单存在但为空 / 全部被 disabled 过滤）是合法响应：
-	// 「该来源一个模型都不给」，必须作为成功结果覆盖成功快照（含清空），
-	// 与失败 nil 严格区分——否则上游下架的模型会借快照永远留存。
+	// An authoritative empty whitelist revokes its previous source snapshot.
 	return out
+}
+
+func (r *Registry) fetchCatalogDocument(ctx context.Context, url string, headers map[string]string) map[string]any {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := r.client.Do(req)
+	if err != nil || resp == nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		log.Printf("models api status %d", resp.StatusCode)
+		return nil
+	}
+	var data map[string]any
+	if json.NewDecoder(io.LimitReader(resp.Body, 2<<20)).Decode(&data) != nil {
+		return nil
+	}
+	// 业务错误码（上游按 code 字段报错时 HTTP 仍是 200）：不信任其中的模型清单。
+	if code, hasCode := data["code"]; hasCode {
+		switch c := code.(type) {
+		case float64:
+			if c != 0 {
+				return nil
+			}
+		case string:
+			if c != "0" {
+				return nil
+			}
+		case nil:
+		default:
+			return nil
+		}
+	}
+	d, _ := data["data"].(map[string]any)
+	if d == nil {
+		return nil
+	}
+	return d
 }
 
 func entry(mid, name string, ctx, maxtok int) map[string]any {

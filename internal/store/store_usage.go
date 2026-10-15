@@ -12,10 +12,13 @@ import (
 // BudgetSample contains aggregate billing evidence only, never prompt content.
 type BudgetSample struct {
 	AccountUID, Model              string
+	Domain                         string
+	Coefficient                    *float64
 	Recent                         bool
 	Credits, Tokens, ZeroTokens    float64
 	Calls, ZeroCalls, UnknownCalls int
 	LegacyCalls                    int
+	UnknownTokens                  float64
 }
 
 // UsageBudgetSamples groups the last 30 days into a 7-day window and its older
@@ -32,11 +35,15 @@ func (d *DB) UsageBudgetSamples(now float64) ([]BudgetSample, error) {
 	 COUNT(CASE WHEN credits>0 THEN 1 END),
 	 COALESCE(SUM(CASE WHEN credits=0 THEN total_tokens ELSE 0 END),0),
 	 COUNT(CASE WHEN credits=0 THEN 1 END),COUNT(CASE WHEN credits IS NULL THEN 1 END),
-	 COUNT(CASE WHEN tokens_known IS NULL THEN 1 END)
+	 COUNT(CASE WHEN tokens_known IS NULL THEN 1 END),
+	 COALESCE(SUM(CASE WHEN credits IS NULL THEN total_tokens ELSE 0 END),0),
+	 COALESCE(json_extract(diagnostics,'$.billing_domain'),''),
+	 json_extract(diagnostics,'$.billing_coefficient')
 	 FROM usage_logs WHERE ts>=? AND ts<=? AND status='ok' AND total_tokens>0
 	 AND (tokens_known=1 OR (tokens_known IS NULL AND credits>0
 	 AND input_tokens>=0 AND output_tokens>=0 AND total_tokens=input_tokens+output_tokens))
-	 GROUP BY account_uid,model,ts>=?`, now-7*86400, now-30*86400, now, now-7*86400)
+	 GROUP BY account_uid,model,ts>=?,json_extract(diagnostics,'$.billing_domain'),
+	 json_extract(diagnostics,'$.billing_coefficient')`, now-7*86400, now-30*86400, now, now-7*86400)
 	if err != nil {
 		return nil, err
 	}
@@ -44,7 +51,7 @@ func (d *DB) UsageBudgetSamples(now float64) ([]BudgetSample, error) {
 	out := []BudgetSample{}
 	for rows.Next() {
 		var s BudgetSample
-		if err := rows.Scan(&s.AccountUID, &s.Model, &s.Recent, &s.Credits, &s.Tokens, &s.Calls, &s.ZeroTokens, &s.ZeroCalls, &s.UnknownCalls, &s.LegacyCalls); err != nil {
+		if err := rows.Scan(&s.AccountUID, &s.Model, &s.Recent, &s.Credits, &s.Tokens, &s.Calls, &s.ZeroTokens, &s.ZeroCalls, &s.UnknownCalls, &s.LegacyCalls, &s.UnknownTokens, &s.Domain, &s.Coefficient); err != nil {
 			return nil, err
 		}
 		out = append(out, s)
@@ -132,17 +139,19 @@ type UsageParams struct {
 
 // UsageDiagnostics contains protocol facts only, never prompts or credentials.
 type UsageDiagnostics struct {
-	ContentCleared  bool               `json:"content_cleared,omitempty"`
-	TokenDetails    *UsageTokenDetails `json:"token_details,omitempty"`
-	RequestedModel  string             `json:"requested_model,omitempty"`
-	PhysicalModel   string             `json:"physical_model,omitempty"`
-	FinishReason    string             `json:"finish_reason,omitempty"`
-	RequestedLimits map[string]int     `json:"requested_output_limits,omitempty"`
-	EffectiveLimits map[string]int     `json:"effective_output_limits,omitempty"`
-	Compatibility   string             `json:"compatibility,omitempty"`
-	ErrorKind       string             `json:"error_kind,omitempty"`
-	Started         bool               `json:"upstream_started"`
-	Performance     *UsagePerformance  `json:"performance,omitempty"`
+	BillingDomain      string             `json:"billing_domain,omitempty"`
+	BillingCoefficient *float64           `json:"billing_coefficient,omitempty"`
+	ContentCleared     bool               `json:"content_cleared,omitempty"`
+	TokenDetails       *UsageTokenDetails `json:"token_details,omitempty"`
+	RequestedModel     string             `json:"requested_model,omitempty"`
+	PhysicalModel      string             `json:"physical_model,omitempty"`
+	FinishReason       string             `json:"finish_reason,omitempty"`
+	RequestedLimits    map[string]int     `json:"requested_output_limits,omitempty"`
+	EffectiveLimits    map[string]int     `json:"effective_output_limits,omitempty"`
+	Compatibility      string             `json:"compatibility,omitempty"`
+	ErrorKind          string             `json:"error_kind,omitempty"`
+	Started            bool               `json:"upstream_started"`
+	Performance        *UsagePerformance  `json:"performance,omitempty"`
 }
 
 // UsageTokenDetails stores observed counts, never estimates. Nil means unreported.

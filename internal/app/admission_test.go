@@ -236,7 +236,7 @@ func TestBudgetPredictionFallbackAndUnknownBalances(t *testing.T) {
 	samples := []store.BudgetSample{{AccountUID: "old", Model: "m", Recent: true, Credits: 1, Tokens: 1000, Calls: 1}, {AccountUID: "old", Model: "m", Credits: 4, Tokens: 4000, Calls: 4}}
 	out := estimateBudgets(d, samples)
 	pools := out["providers"].([]map[string]any)[0]["pools"].([]map[string]any)
-	if out["predicted_tokens"] != int64(20000) || pools[0]["window_days"] != 30 || pools[1]["scope"] != "billing_domain" {
+	if out["predicted_tokens"] != int64(20000) || len(pools) != 1 || pools[0]["window_days"] != 30 || pools[0]["account_count"] != 2 {
 		t.Fatalf("fallback=%#v", out)
 	}
 	newPool.Domain = "different"
@@ -263,6 +263,135 @@ func TestBudgetPredictionFallbackAndUnknownBalances(t *testing.T) {
 	row["enabled"] = false
 	if provider.CreditBudget(row, "domain", "label", "credits", 100).Reason == "" {
 		t.Fatal("disabled account budget included")
+	}
+}
+
+func TestBudgetPredictionPoolsSameTariffsBeforeApplyingModelMix(t *testing.T) {
+	balance := 100.0
+	accounts := []provider.BudgetPool{}
+	for _, uid := range []string{"a", "b", "new"} {
+		accounts = append(accounts, provider.BudgetPool{AccountID: uid, Domain: "domestic", DomainLabel: "国内", Unit: "积分", Remaining: &balance, Models: []string{"cheap", "expensive"}, ModelCosts: map[string]float64{"cheap": .1, "expensive": 1}})
+	}
+	data := map[string]provider.AdminData{"workbuddy": {Budgets: accounts}}
+	samples := []store.BudgetSample{{AccountUID: "a", Model: "cheap", Recent: true, Credits: 9, Tokens: 9000, Calls: 9}, {AccountUID: "b", Model: "expensive", Recent: true, Credits: 10, Tokens: 1000, Calls: 1}}
+	out := estimateBudgets(data, samples)
+	pools := out["providers"].([]map[string]any)[0]["pools"].([]map[string]any)
+	if len(pools) != 1 || pools[0]["account_count"] != 3 || pools[0]["remaining"] != 300.0 || out["predicted_tokens"] != int64(157894) {
+		t.Fatalf("group=%#v", out)
+	}
+	details := pools[0]["models"].([]map[string]any)
+	if len(details) != 2 || details[0]["token_share"] != .9 || details[1]["token_share"] != .1 {
+		t.Fatal(details)
+	}
+	// The model distribution belongs to the billing group, not the account.
+	samples[0].AccountUID, samples[1].AccountUID = samples[1].AccountUID, samples[0].AccountUID
+	if estimateBudgets(data, samples)["predicted_tokens"] != out["predicted_tokens"] {
+		t.Fatal("account assignment changed estimate")
+	}
+	// Adding the first versioned record must not blank an otherwise usable
+	// historical estimate while the new versioned sample set warms up.
+	price := .1
+	samples[0].Tokens = 8000
+	samples[0].Credits = 8
+	samples[0].Calls = 8
+	samples = append(samples, store.BudgetSample{AccountUID: "a", Model: "cheap", Domain: "domestic", Coefficient: &price, Recent: true, Credits: 1, Tokens: 1000, Calls: 1})
+	if estimateBudgets(data, samples)["predicted_tokens"] != out["predicted_tokens"] {
+		t.Fatal("first stamped request erased historical estimate")
+	}
+	// Model-restricted balances cannot finance another account's model mix.
+	accounts[2].Models = []string{"cheap"}
+	if len(groupedBudgets("workbuddy", accounts)) != 2 {
+		t.Fatal("different applicability merged")
+	}
+}
+
+func TestBudgetPredictionExtraFreeCatalogDoesNotSplitPaidBalances(t *testing.T) {
+	balance := 100.0
+	standard := provider.BudgetPool{AccountID: "active", Domain: "domestic", Unit: "积分", Remaining: &balance, Models: []string{"deepseek", "glm", "shared-free"}, FreeModels: []string{"shared-free"}, ModelCosts: map[string]float64{"deepseek": .11, "glm": .1, "shared-free": 0}}
+	extra := standard
+	extra.AccountID = "new"
+	extra.Models = []string{"deepseek", "glm", "shared-free", "extra-free"}
+	extra.FreeModels = []string{"shared-free", "extra-free"}
+	extra.ModelCosts = map[string]float64{"deepseek": .11, "glm": .1, "shared-free": 0, "extra-free": 0}
+	data := map[string]provider.AdminData{"workbuddy": {Budgets: []provider.BudgetPool{extra, standard}}}
+	samples := []store.BudgetSample{
+		{AccountUID: "new", Model: "deepseek", Recent: true, Credits: .2, Tokens: 12000, Calls: 1},
+		{AccountUID: "active", Model: "deepseek", Credits: 10, Tokens: 1e6, Calls: 100},
+		{AccountUID: "active", Model: "glm", Recent: true, Credits: 10, Tokens: 1e6, Calls: 100},
+		{AccountUID: "new", Model: "extra-free", Recent: true, ZeroTokens: 1e12, ZeroCalls: 100},
+	}
+	out := estimateBudgets(data, samples)
+	channel := out["providers"].([]map[string]any)[0]
+	groups := channel["pools"].([]map[string]any)
+	if len(groups) != 1 || groups[0]["remaining"] != 200.0 || groups[0]["status"] != "estimated" {
+		t.Fatalf("extra free model split balance/calibration: %#v", out)
+	}
+	if !reflect.DeepEqual(channel["free_models"], []string{"extra-free", "shared-free"}) || len(groups[0]["models"].([]map[string]any)) != 2 {
+		t.Fatal("free capability lost or free tokens inflated mix", out)
+	}
+	// Expanding paid applicability is different: restricted balances stay separate.
+	extra.FreeModels = []string{"shared-free"}
+	extra.ModelCosts["extra-free"] = 1
+	if len(groupedBudgets("workbuddy", []provider.BudgetPool{standard, extra})) != 2 {
+		t.Fatal("paid applicability merged")
+	}
+	// An unavailable account cannot advertise its exclusive free capability.
+	extra.FreeModels = []string{"shared-free", "extra-free"}
+	extra.ModelCosts["extra-free"] = 0
+	extra.Reason = "disabled"
+	out = estimateBudgets(map[string]provider.AdminData{"workbuddy": {Budgets: []provider.BudgetPool{extra, standard}}}, samples)
+	if got := out["providers"].([]map[string]any)[0]["free_models"]; !reflect.DeepEqual(got, []string{"shared-free"}) {
+		t.Fatal("disabled free capability exposed", got)
+	}
+}
+
+func TestBudgetPredictionUsesRecentMixWithPerModelFallback(t *testing.T) {
+	balance := 100.0
+	data := map[string]provider.AdminData{"workbuddy": {Budgets: []provider.BudgetPool{{AccountID: "a", Domain: "domestic", Remaining: &balance, Models: []string{"cheap", "expensive", "unknown"}}}}}
+	samples := []store.BudgetSample{
+		{AccountUID: "a", Model: "cheap", Recent: true, Credits: 9, Tokens: 9000, Calls: 5},
+		{AccountUID: "a", Model: "expensive", Recent: false, Credits: 10, Tokens: 1000, Calls: 5},
+		{AccountUID: "a", Model: "expensive", Recent: true, UnknownTokens: 1000, UnknownCalls: 1},
+	}
+	out := estimateBudgets(data, samples)
+	if out["predicted_tokens"] != int64(52631) {
+		t.Fatalf("model fallback=%#v", out)
+	}
+	samples = append(samples, store.BudgetSample{AccountUID: "a", Model: "unknown", Recent: true, UnknownTokens: 1000, UnknownCalls: 1})
+	out = estimateBudgets(data, samples)
+	if out["predicted_tokens"] != nil {
+		t.Fatal("missing model cost was silently excluded", out)
+	}
+	row := out["providers"].([]map[string]any)[0]["pools"].([]map[string]any)[0]
+	if !reflect.DeepEqual(row["missing_models"], []string{"unknown"}) {
+		t.Fatal(row)
+	}
+}
+
+func TestBudgetPredictionSeparatesOffersAndHistoricalPriceSnapshots(t *testing.T) {
+	balance := 10.0
+	price, discount := 1.0, .5
+	standard := provider.BudgetPool{AccountID: "regular", Domain: "domestic", Remaining: &balance, Models: []string{"m"}, ModelCosts: map[string]float64{"m": price}}
+	special := standard
+	special.AccountID = "offer"
+	special.ModelCosts = map[string]float64{"m": discount}
+	data := map[string]provider.AdminData{"workbuddy": {Budgets: []provider.BudgetPool{standard, special}}}
+	samples := []store.BudgetSample{
+		{AccountUID: "regular", Model: "m", Recent: true, Domain: "domestic", Coefficient: &price, Credits: 10, Tokens: 10000, Calls: 5},
+		{AccountUID: "offer", Model: "m", Recent: true, Domain: "domestic", Coefficient: &discount, Credits: 5, Tokens: 10000, Calls: 5},
+		{AccountUID: "offer", Model: "m", Recent: true, Domain: "domestic", Coefficient: &price, Credits: 1000, Tokens: 1e6, Calls: 99},
+		{AccountUID: "offer", Model: "m", Recent: false, Credits: 1000, Tokens: 1e6, Calls: 99},
+		{AccountUID: "regular", Model: "m", Recent: true, Domain: "international", Coefficient: &price, Credits: 1, Tokens: 1e9, Calls: 99},
+	}
+	out := estimateBudgets(data, samples)
+	if out["total_pools"] != 2 || out["predicted_tokens"] != int64(30000) {
+		t.Fatalf("tariff isolation=%#v", out)
+	}
+	// No current-price evidence means old-price and unversioned data must not
+	// be treated as proof that this offer still has a known consumption rate.
+	samples = samples[2:]
+	if estimateBudgets(data, samples)["predicted_tokens"] != nil {
+		t.Fatal("stale tariff evidence reused")
 	}
 }
 

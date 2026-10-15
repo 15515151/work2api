@@ -36,13 +36,15 @@ onMounted(load)
       <p v-else-if="!loading && !models.length" class="mt-4 text-small text-muted">暂无可用模型。可联系管理员配置默认开放模型，或在「我的账号」添加个人账号；已有账号可刷新其模型目录。</p>
       <p v-else-if="!loading && !filtered.length" class="mt-4 text-small text-faint">没有匹配的模型。</p>
     </div>
-    <div class="grid gap-3 sm:grid-cols-2">
+    <div class="model-grid">
       <ModelInfoCard v-for="model in filtered" :key="model.id" :model="model" :provider="channel(model)">
-        <div class="mt-auto flex flex-wrap items-center gap-2 border-t border-line pt-3 text-micro">
-          <span v-if="model.own_account" class="rounded bg-live/12 px-2 py-1 text-live">本人账号</span>
-          <span v-if="model.default_access" class="rounded bg-brand/12 px-2 py-1 text-brand">默认开放授权</span>
-          <WButton size="sm" variant="subtle" class="ml-auto" @click="copy(model.id)">复制调用名</WButton>
-        </div>
+        <template #footer>
+          <div class="flex flex-wrap items-center gap-2 border-t border-line pt-2.5 text-micro">
+            <span v-if="model.own_account" class="rounded bg-live/12 px-2 py-1 text-live">本人账号</span>
+            <span v-if="model.default_access" class="rounded bg-brand/12 px-2 py-1 text-brand">默认开放授权</span>
+            <WButton size="sm" variant="subtle" class="ml-auto" @click="copy(model.id)">复制调用名</WButton>
+          </div>
+        </template>
       </ModelInfoCard>
     </div>
   </div>

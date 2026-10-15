@@ -149,24 +149,6 @@ const stats = computed(() => {
   return { total, multi, tool, aa }
 })
 
-// 仅当本页存在带描述的模型时，才让无描述卡预留描述行高以对齐评测框；
-// 全都没描述时不预留，避免整片空白。
-const anyDesc = computed(() => entries.value.some((e) => String(e.model.description || '').trim()))
-// 思考强度档位同理：本页有带档位的模型时，无档位卡才补等高占位。
-const anyEfforts = computed(() =>
-  entries.value.some((e) => {
-    const r = e.model.reasoning || {}
-    return (Array.isArray(r.supportedEfforts) && r.supportedEfforts.length) || r.defaultEffort
-  }),
-)
-// 多站点成本分列同理：本页有"两站点不同价"的模型时才预留占位。
-const anyCost = computed(() =>
-  entries.value.some((e) => {
-    const cbr = e.model.credits_by_region as Record<string, number> | undefined
-    return cbr && Object.keys(cbr).length >= 2 && new Set(Object.values(cbr)).size >= 2
-  }),
-)
-
 onMounted(load)
 onBeforeUnmount(() => { loadVersion++ })
 </script>
@@ -218,8 +200,8 @@ onBeforeUnmount(() => { loadVersion++ })
         <span class="ml-auto text-small text-faint">{{ filtered.length }} / {{ entries.length }}</span>
       </div>
 
-      <div v-if="filtered.length" class="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-3">
-        <ModelCard v-for="e in filtered" :key="e.provider + '/' + e.model.id" :model="e.model" :provider="e.provider" :reserve-desc="anyDesc" :reserve-efforts="anyEfforts" :reserve-cost="anyCost" />
+      <div v-if="filtered.length" class="model-grid model-grid-admin">
+        <ModelCard v-for="e in filtered" :key="e.provider + '/' + e.model.id" :model="e.model" :provider="e.provider" />
       </div>
       <WEmpty v-else title="没有匹配的模型" hint="调整搜索或筛选条件，或刷新目录。" />
     </template>

@@ -2,6 +2,7 @@ package models
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +14,94 @@ import (
 
 	"work2api/internal/workbuddy/pool"
 )
+
+func TestPromotionRulesRespectDatesScopeAndTrialEnrollment(t *testing.T) {
+	var data map[string]any
+	err := json.Unmarshal([]byte(`{
+ "productFeaturesConfig":{"ModelTrialBanner":{"banners":[{"modelId":"trial","targetModelId":"paid","trialDays":14,"firstUseTimeKey":"trial.first_use"}]}},
+ "modelPromotions":[
+  {"enabled":true,"modelIds":["m"],"badge":{"label":"Night offer","icon":"do not retain"},"hover":{"textZh":"Official schedule","action":{"type":"selectModel"}},"priority":50,"schedule":{"timezone":"Asia/Shanghai","daily":[{"start":"08:00","end":"23:00"}]}},
+  {"enabled":true,"modelIds":["m"],"badge":{"label":"Night offer"},"hover":{"textZh":"Official schedule"},"priority":100,"discount":{"factor":0},"schedule":{"timezone":"Asia/Shanghai","daily":[{"start":"23:00","end":"08:00"}]}},
+  {"enabled":true,"modelIds":["m"],"badge":{"label":"Expired"},"schedule":{"validUntil":"2000-01-01T00:00:00Z"}},
+  {"enabled":true,"modelIds":["m"],"badge":{"label":"Future"},"schedule":{"validFrom":"2099-01-01T00:00:00Z"}},
+  {"enabled":true,"modelIds":["m"],"badge":{"label":"Invalid date"},"schedule":{"validUntil":"bad"}},
+  {"enabled":false,"modelIds":["m"],"badge":{"label":"Disabled"}},
+  {"enabled":true,"modelIds":["trial"],"badge":{"label":"Trial"},"schedule":{"validUntil":"2000-01-01T00:00:00Z"}}
+ ]}`), &data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := New(nil, nil)
+	r.savePromotionMetadata(&pool.Account{UID: "a", Profile: "cn-cli"}, data)
+	a := map[string]any{"uid": "a", "profile": "cn-cli", "enabled": true}
+	b := map[string]any{"uid": "b", "profile": "cn-cli", "enabled": true}
+	got := r.Promotions("m", []map[string]any{a, b})
+	if len(got) != 1 || got[0].Label != "Night offer" || !got[0].Partial || got[0].Region != "domestic" {
+		t.Fatalf("scope/date filtering or reminder dedup failed: %+v", got)
+	}
+	if len(r.Promotions("paid", []map[string]any{a})) != 0 {
+		t.Fatal("trial target became a paid fallback or inherited an offer")
+	}
+	trial := r.Promotions("trial", []map[string]any{a})
+	if len(trial) != 1 || trial[0].TrialDays != 14 {
+		t.Fatal("enrollment deadline incorrectly ended an existing personal trial", trial)
+	}
+	encoded, _ := json.Marshal(got)
+	if strings.Contains(string(encoded), "icon") || strings.Contains(string(encoded), "action") || strings.Contains(string(encoded), "factor") {
+		t.Fatal("client actions or price mutations leaked into display metadata")
+	}
+	if r.Promotions("m", []map[string]any{a})[0].Partial {
+		t.Fatal("unrelated accounts affected a scoped user's display")
+	}
+	b["enabled"] = false
+	if r.Promotions("m", []map[string]any{a, b})[0].Partial {
+		t.Fatal("disabled account counted as an applicable account")
+	}
+	got[0].Daily[0].Start = "mutated"
+	if r.Promotions("m", []map[string]any{a})[0].Daily[0].Start == "mutated" {
+		t.Fatal("caller mutated cached promotion schedule")
+	}
+	r.savePromotionMetadata(&pool.Account{UID: "a", Profile: "cn-cli"}, map[string]any{})
+	if len(r.Promotions("m", []map[string]any{a})) != 0 {
+		t.Fatal("successful empty metadata did not remove an old offer")
+	}
+	r.savePromotionMetadata(&pool.Account{UID: "a", Profile: "cn-cli"}, data)
+	snapshot := r.promotions[[2]string{"cn-cli", "a"}]
+	snapshot.expires = time.Now().Add(-time.Second)
+	r.promotions[[2]string{"cn-cli", "a"}] = snapshot
+	if len(r.Promotions("m", []map[string]any{a})) != 0 {
+		t.Fatal("expired metadata advertised an offer")
+	}
+}
+
+func TestDesktopPromotionQueryCannotChangeInferenceCatalog(t *testing.T) {
+	failed := false
+	var desktopCalls int
+	headers := map[string]string{"X-IDE-Type": "CLI", "x-client-platform": "cli", "Authorization": "Bearer synthetic"}
+	r := NewWithCatalogClient(nil, nil, &http.Client{Transport: isolatedCatalogTransport(func(req *http.Request) (*http.Response, error) {
+		desktopCalls++
+		if req.URL.Host != "copilot.tencent.com" || req.URL.Path != "/v3/config" || req.Header.Get("X-IDE-Type") != "WorkBuddy" || req.Header.Get("x-client-platform") != "" || req.Header.Get("Authorization") != "Bearer synthetic" {
+			t.Fatal("metadata request changed endpoint, dropped auth or retained CLI platform")
+		}
+		if failed {
+			return catalogResponse(req, 503, ""), nil
+		}
+		return catalogResponse(req, 200, `{"code":0,"data":{"models":[{"id":"desktop-only","credits":0}],"agents":[{"name":"cli","models":["desktop-only"]}],"modelPromotions":[{"enabled":true,"modelIds":["m"],"badge":{"label":"Offer"}}]}}`), nil
+	})})
+	a := &pool.Account{UID: "a", Profile: "cn-cli"}
+	r.refreshPromotionMetadata(context.Background(), a, "https://copilot.tencent.com/v3/config", headers)
+	if desktopCalls != 1 || headers["X-IDE-Type"] != "CLI" || headers["x-client-platform"] != "cli" {
+		t.Fatal("inference headers were mutated or metadata was not fetched")
+	}
+	if len(r.models) != 0 || len(r.AccountCosts("cn-cli", "a")) != 0 || len(r.promotions[[2]string{"cn-cli", "a"}].models["m"]) != 1 {
+		t.Fatal("desktop whitelist/price contaminated inference catalog, or offer missing")
+	}
+	failed = true
+	r.refreshPromotionMetadata(context.Background(), a, "https://copilot.tencent.com/v3/config", headers)
+	if desktopCalls != 2 || len(r.models) != 0 {
+		t.Fatal("metadata failure changed the model catalog")
+	}
+}
 
 func TestCachedModelIndexRefreshAndSnapshot(t *testing.T) {
 	r := &Registry{models: []map[string]any{{"id": "old", "max_output_tokens": 100, "credits_by_region": map[string]float64{"domestic": 1}}}}
@@ -250,6 +339,50 @@ func (c isolatedCatalogCredential) CatalogHeaders() (map[string]string, error) {
 func catalogResponse(r *http.Request, status int, b string) *http.Response {
 	return &http.Response{StatusCode: status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(b)), Request: r}
 }
+func TestAccountBillingCostsStaySeparateAndFollowCatalogRefresh(t *testing.T) {
+	revoked := false
+	p := pool.New(map[string]pool.Credential{
+		"regular": isolatedCatalogCredential{catalogTestCredential{profile: "cn-cli"}, "regular"},
+		"offer":   isolatedCatalogCredential{catalogTestCredential{profile: "cn-work"}, "offer"},
+	}, "")
+	r := NewWithCatalogClient(p, nil, &http.Client{Transport: isolatedCatalogTransport(func(req *http.Request) (*http.Response, error) {
+		if revoked {
+			return catalogResponse(req, 200, catalogBody()), nil
+		}
+		price := "1"
+		if req.Header.Get("X-Test-UID") == "offer" {
+			price = "0"
+		}
+		body := strings.Replace(catalogBody("m"), `"name":"m"`, `"name":"m","credits":`+price, 1)
+		return catalogResponse(req, 200, body), nil
+	})})
+	for _, account := range p.Accounts() {
+		if len(r.fetchOneContext(context.Background(), account)) != 1 {
+			t.Fatal("catalog missing")
+		}
+	}
+	regular, offer := r.AccountCost("cn-cli", "regular", "m"), r.AccountCost("cn-work", "offer", "m")
+	if regular == nil || *regular != 1 || offer == nil || *offer != 0 {
+		t.Fatal(regular, offer)
+	}
+	snapshot := r.AccountCosts("cn-work", "offer")
+	snapshot["m"] = 999
+	*offer = 999
+	if got := r.AccountCost("cn-work", "offer", "m"); got == nil || *got != 0 {
+		t.Fatal("snapshot mutated internal prices")
+	}
+	if r.AccountCost("cn-cli", "offer", "m") != nil {
+		t.Fatal("profile mixed")
+	}
+	revoked = true
+	for _, account := range p.Accounts() {
+		r.fetchOneContext(context.Background(), account)
+	}
+	if r.AccountCost("cn-cli", "regular", "m") != nil {
+		t.Fatal("revoked quote retained")
+	}
+}
+
 func TestFreshSourceOverridesFailedSourceSnapshot(t *testing.T) {
 	phase := 0
 	tr := &dualTransport{respond: func(path string) (int, string) {

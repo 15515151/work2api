@@ -109,6 +109,7 @@ func (r *Runtime) AttachModelAccounts(entries []map[string]any) {
 			}
 		}
 		e["accounts"] = supporters
+		e["promotions"] = r.Catalog.Promotions(id, supporters)
 	}
 }
 func AccountLabel(a map[string]any) string {
@@ -216,7 +217,9 @@ func (r *Runtime) AdminData(ctx context.Context) provider.AdminData {
 		}))
 		profile, _ := a["profile"].(string)
 		site := siterouting.ProfileSite(profile)
-		budget := provider.CreditBudget(a, profile, AccountLabel(a)+" · "+SiteLabel(site)+" · "+profile, "积分", float64(time.Now().Unix()))
+		budget := provider.CreditBudget(a, site, AccountLabel(a), "积分", float64(time.Now().Unix()))
+		budget.DomainLabel = SiteLabel(site)
+		budget.ModelCosts = r.Catalog.AccountCosts(profile, a["uid"].(string))
 		for _, model := range models {
 			id, _ := model["id"].(string)
 			for _, supporter := range model["accounts"].([]map[string]any) {
@@ -224,7 +227,7 @@ func (r *Runtime) AdminData(ctx context.Context) provider.AdminData {
 					continue
 				}
 				budget.Models = append(budget.Models, id)
-				if cost, ok := r.Catalog.CreditsByRegion(id)[site]; ok && cost == 0 {
+				if cost, ok := budget.ModelCosts[id]; ok && cost == 0 {
 					budget.FreeModels = append(budget.FreeModels, id)
 				}
 			}

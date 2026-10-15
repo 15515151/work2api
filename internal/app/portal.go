@@ -667,6 +667,16 @@ func (s *Server) portalModels(w http.ResponseWriter, r *http.Request) {
 				item[field] = value
 			}
 		}
+		if model["provider"] == "workbuddy" {
+			physical := strings.TrimPrefix(id, "workbuddy/")
+			supporters := []map[string]any{}
+			for uid := range p.ModelScopes[physical] {
+				if a := s.o.wb.Pool.Get(uid); a != nil {
+					supporters = append(supporters, map[string]any{"uid": uid, "profile": a.Profile, "enabled": a.Enabled})
+				}
+			}
+			item["promotions"] = s.o.wb.Catalog.Promotions(physical, supporters)
+		}
 		items = append(items, item)
 	}
 	sort.Slice(items, func(i, j int) bool { return str2(items[i]["id"]) < str2(items[j]["id"]) })

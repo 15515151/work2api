@@ -8,6 +8,8 @@ import "math"
 // in FreeModels. Channels without trustworthy billing must give a Reason.
 type BudgetPool struct {
 	AccountID, Domain, Label, Unit string
+	DomainLabel                    string
+	ModelCosts                     map[string]float64 // catalog coefficients, not per-token prices
 	Remaining                      *float64
 	Models, FreeModels             []string
 	Stale, Deferred                bool

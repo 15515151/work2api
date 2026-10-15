@@ -317,9 +317,11 @@ export interface Overview {
         samples: number
         legacy_samples: number
         scope: string
-        free_tokens_observed: number
-        zero_cost_unconfirmed_tokens: number
-        unknown_cost_calls: number
+        account_count: number
+        known_balances: number
+        accounts: { label: string; remaining: number | null; included: boolean; reason: string; stale: boolean; deferred: boolean }[]
+        models: { model: string; token_share: number; credits_per_million_tokens: number | null; samples: number; window_days: number }[]
+        missing_models: string[]
       }[]
     }[]
   }
