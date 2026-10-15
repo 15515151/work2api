@@ -499,18 +499,89 @@ func TestCacheUnknownAndObservedZeroRemainDistinct(t *testing.T) {
 			response := bridgeResponse{Usage: Usage{Input: 10, Output: 2, Total: 12, CachedKnown: known}}
 			doc := encodeBridgeResponse(target, response)
 			usage := doc["usage"].(map[string]any)
+			// Every detail object here is optional and describes an observation.
+			// An unreported count omits the object instead of claiming zero:
+			// Codex decodes the Responses detail objects as complete structures
+			// and rejects one without cached_tokens.
+			container, key := "prompt_tokens_details", "cached_tokens"
+			switch target {
+			case Anthropic:
+				container, key = "", "cache_read_input_tokens"
+			case Responses:
+				container = "input_tokens_details"
+			}
 			var cached any
-			if target == Anthropic {
-				cached = usage["cache_read_input_tokens"]
-			} else if target == Chat {
-				cached = usage["prompt_tokens_details"].(map[string]any)["cached_tokens"]
+			if container == "" {
+				cached = usage[key]
 			} else {
-				cached = usage["input_tokens_details"].(map[string]any)["cached_tokens"]
+				details, present := usage[container].(map[string]any)
+				if present != known {
+					t.Fatalf("%s cache known=%v, details=%v", target, known, usage[container])
+				}
+				cached = details[key]
 			}
 			if (cached != nil) != known {
 				t.Fatalf("%s cached known=%v, value=%v", target, known, cached)
 			}
 		}
+	}
+}
+
+// Preserve reversible namespace/custom lowering; skip unavailable optional tools.
+func TestConvertRequestSkipsOnlyUnavailableOptionalTools(t *testing.T) {
+	body := map[string]any{"model": "trae/m", "input": "hi", "tools": []any{
+		map[string]any{"type": "namespace", "name": "files", "tools": []any{map[string]any{"type": "function", "name": "read", "parameters": map[string]any{"type": "object"}}}},
+		map[string]any{"type": "custom", "name": "apply_patch"},
+		map[string]any{"type": "web_search"},
+	}, "tool_choice": "auto"}
+	prepared, custom, namespace, err := PrepareClientTools(body)
+	if err != nil || !custom["apply_patch"] || len(namespace) != 1 {
+		t.Fatal("client lowering failed", err)
+	}
+	out, err := ConvertRequest(Responses, Chat, prepared)
+	if err != nil || len(jsonutil.SliceAt(out, "tools")) != 2 {
+		t.Fatal("converted tools lost", out, err)
+	}
+	if len(jsonutil.SliceAt(body, "tools")) != 3 {
+		t.Fatal("caller tools mutated")
+	}
+	for _, choice := range []any{"required", map[string]any{"type": "web_search"}, map[string]any{"type": "function", "name": "missing"}} {
+		bad := map[string]any{"input": "hi", "tools": []any{map[string]any{"type": "web_search"}}, "tool_choice": choice}
+		if _, err := ConvertRequest(Responses, Chat, bad); err == nil {
+			t.Fatal("forced unavailable tool silently discarded", choice)
+		}
+	}
+	for _, tool := range []any{nil, map[string]any{"name": "missing-type"}, map[string]any{"type": "custom", "name": "raw"}} {
+		if _, err := ConvertRequest(Responses, Chat, map[string]any{"input": "hi", "tools": []any{tool}}); err == nil {
+			t.Fatal("unprepared/malformed tool discarded", tool)
+		}
+	}
+}
+
+// Codex aborts the whole turn with "failed to parse ResponseCompleted: missing
+// field `cached_tokens`" when Responses usage carries an empty
+// input_tokens_details, which is exactly what an upstream without cache
+// reporting (Trae) used to produce. Unreported detail objects must be absent.
+func TestResponsesUsageOmitsUnreportedDetails(t *testing.T) {
+	doc := encodeBridgeResponse(Responses, bridgeResponse{Usage: Usage{Input: 5, Output: 2, Total: 7}})
+	usage := doc["usage"].(map[string]any)
+	if _, present := usage["input_tokens_details"]; present {
+		t.Fatalf("empty input_tokens_details emitted: %v", usage)
+	}
+	if _, present := usage["output_tokens_details"]; present {
+		t.Fatalf("unreported reasoning detail emitted: %v", usage)
+	}
+	if usage["input_tokens"] != 5 || usage["output_tokens"] != 2 || usage["total_tokens"] != 7 {
+		t.Fatalf("token totals changed: %v", usage)
+	}
+
+	observed := encodeBridgeResponse(Responses, bridgeResponse{Usage: Usage{Input: 5, Output: 2, Total: 7, CachedKnown: true, ReasoningKnown: true}})
+	observedUsage := observed["usage"].(map[string]any)
+	if observedUsage["input_tokens_details"].(map[string]any)["cached_tokens"] != 0 {
+		t.Fatalf("observed zero cache dropped: %v", observedUsage)
+	}
+	if observedUsage["output_tokens_details"].(map[string]any)["reasoning_tokens"] != 0 {
+		t.Fatalf("observed zero reasoning dropped: %v", observedUsage)
 	}
 }
 

@@ -86,6 +86,10 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 	if body["response_format"] != nil {
 		return report, provider.NewAPIError(400, "该 Trae 路径尚未验证结构化输出，请移除 response_format", "unsupported_parameter")
 	}
+	body, err = protocol.FunctionToolSubset(body, protocol.Chat)
+	if err != nil {
+		return report, provider.NewAPIError(400, err.Error(), "invalid_request_error")
+	}
 	toolNames := map[string]bool{}
 	if raw := body["tools"]; raw != nil {
 		tools, ok := raw.([]any)
