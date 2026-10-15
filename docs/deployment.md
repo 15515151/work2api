@@ -8,7 +8,11 @@
 
 ### 方式 A：下载 Release 二进制
 
-正式发布需在 Actions 手动运行 `Release binaries and GHCR image`，填写版本号（`vX.Y.Z`）；普通提交或推送 tag 不会自动发布。工作流交叉编译 Windows / Linux / macOS（amd64 + arm64）并发布到 [Releases](https://github.com/YuapXc/work2api/releases)，每个包附 `.sha256` 校验和。已有版本标签时构建该标签指向的提交；新版本号则构建手动运行时选定的分支或标签对应提交。下载对应平台的压缩包，校验后解压即用：
+正式发布需在 Actions 手动运行 `Release binaries and GHCR image`，填写版本号（`vX.Y.Z`）；普通提交或推送 tag 不会自动发布。工作流交叉编译 Windows / Linux / macOS（amd64 + arm64）并发布到 [Releases](https://github.com/YuapXc/work2api/releases)，每个包附 `.sha256` 校验和。已有版本标签时构建该标签指向的提交；新版本号则构建手动运行时选定的分支或标签对应提交。
+
+Release 标题固定为版本号，说明由 CI 自动列出上一已发布且属于当前提交历史的版本以来的非合并提交标题，并附完整对比链接；正式版不以预发布版作为比较基线。首次发布列出全部非合并提交。同版本重发也会更新标题与说明，无需手写 Release notes。
+
+下载对应平台的压缩包，校验后解压即用：
 
 ```powershell
 # Windows：校验后运行

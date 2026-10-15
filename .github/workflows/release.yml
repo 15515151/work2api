@@ -207,6 +207,12 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Check out source and release history
+        uses: actions/checkout@v4
+        with:
+          # Use this workflow's notes generator even when rebuilding an older tag.
+          ref: ${{ github.sha }}
+          fetch-depth: 0
       - name: Download release files
         uses: actions/download-artifact@v4
         with:
@@ -220,6 +226,7 @@ jobs:
           RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
           RELEASE_SHA: ${{ needs.prepare.outputs.source_sha }}
         run: |
+          python3 .github/scripts/release-notes.py release-notes.md
           release_type=()
           if [[ "$RELEASE_TAG" == *-* ]]; then
             release_type+=(--prerelease)
@@ -227,7 +234,7 @@ jobs:
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" release-files/* --clobber --repo "$GITHUB_REPOSITORY"
             # tag 被删重建时旧 release 会失去 tag 引用变成 draft，这里显式转正
-            gh release edit "$RELEASE_TAG" --draft=false --repo "$GITHUB_REPOSITORY"
+            gh release edit "$RELEASE_TAG" --draft=false --title "$RELEASE_TAG" --notes-file release-notes.md --repo "$GITHUB_REPOSITORY"
           else
-            gh release create "$RELEASE_TAG" release-files/* "${release_type[@]}" --generate-notes --title "$RELEASE_TAG" --target "$RELEASE_SHA" --repo "$GITHUB_REPOSITORY"
+            gh release create "$RELEASE_TAG" release-files/* "${release_type[@]}" --notes-file release-notes.md --title "$RELEASE_TAG" --target "$RELEASE_SHA" --repo "$GITHUB_REPOSITORY"
           fi
