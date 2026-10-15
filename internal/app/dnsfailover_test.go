@@ -925,3 +925,39 @@ func TestWorkBuddySSEMetadataRetention(t *testing.T) {
 		}
 	}
 }
+
+func TestResponsesFallbackReusesSuccessfulCompatibility(t *testing.T) {
+	o, account := newDNSFailoverOrch(t, &failingUpstream{})
+	client := &channelRetryUpstream{body: `{"code":11128,"msg":"Illegal API invocation from an unapproved channel"}`}
+	o.wb.UpstreamClient = client
+	o.cfg.ChannelIdentityCompat = true
+	o.wb.Catalog = models.NewWithCatalogClient(o.wb.Pool, o.db, &http.Client{Transport: catalogTransport{}})
+	o.wb.Catalog.Refresh()
+	principal := &Principal{AppID: 17, EffectiveModel: "test-model"}
+	server := &Server{o: o}
+	const banner = "You are Claude Code, Anthropic's official CLI for Claude."
+	raw := map[string]any{"model": "test-model", "instructions": banner, "input": []any{map[string]any{"role": "user", "content": "stable first turn"}}}
+	chat := map[string]any{"model": "test-model", "max_tokens": 50, "messages": []any{map[string]any{"role": "system", "content": banner}, map[string]any{"role": "user", "content": "stable first turn"}}}
+	previous := 0
+	for turn, want := range []int{2, 1} {
+		request := httptest.NewRequest("POST", "/v1/responses", nil)
+		prepared, finish, err := server.prepareProviderRequest(request, raw, principal)
+		if err != nil {
+			t.Fatal(err)
+		}
+		key := requestSessionKey(prepared, principal, "test-model", nil)
+		if key == "" {
+			t.Fatal("missing fallback identity")
+		}
+		_, err = o.openUpstreamScoped(prepared.Context(), account, chat, "test-model", key, func(string) error { return nil }, nil, map[string]bool{account.UID: true})
+		finish()
+		if err != nil || client.calls-previous != want {
+			t.Fatalf("turn %d attempts=%d want=%d err=%v", turn, client.calls-previous, want, err)
+		}
+		previous = client.calls
+		raw["input"] = []any{map[string]any{"role": "user", "content": "stable first turn"}, map[string]any{"role": "assistant", "content": "answer"}, map[string]any{"role": "user", "content": "next turn"}}
+	}
+	if client.bodies[2]["messages"].([]any)[0].(map[string]any)["content"] != "You are a coding assistant." {
+		t.Fatal("second turn resent rejected template")
+	}
+}
