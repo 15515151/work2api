@@ -3,6 +3,7 @@ package protocol
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http/httptest"
 	"reflect"
@@ -13,11 +14,157 @@ import (
 	"unicode/utf8"
 	"work2api/internal/core/provider"
 	"work2api/internal/jsonutil"
+	"work2api/internal/streamwatch"
 )
 
 type terminalOnlyReader struct {
 	wire  string
 	reads int
+}
+
+func TestResponsesUsageObservesNativeTerminalWithoutDecodingContent(t *testing.T) {
+	for _, tc := range []struct{ status, kind, reason, want string }{
+		{"completed", "custom_tool_call", "", "tool_calls"},
+		{"completed", "web_search_call", "", "stop"},
+		{"incomplete", "custom_tool_call", "max_output_tokens", "length"},
+		{"incomplete", "message", "content_filter", "content_filter"},
+		{"failed", "message", "", "error"},
+	} {
+		body, _ := json.Marshal(map[string]any{"status": tc.status, "output": []any{map[string]any{"type": tc.kind, "content": []any{map[string]any{"type": "unknown_native_block"}}}}, "incomplete_details": map[string]any{"reason": tc.reason}, "usage": map[string]any{"input_tokens": 5, "output_tokens": 2, "total_tokens": 7}})
+		u, known := ResponseUsage(Responses, body)
+		if !known || u.Input != 5 || u.Output != 2 || u.FinishReason != tc.want {
+			t.Fatal(tc, u, known)
+		}
+	}
+}
+
+func BenchmarkResponsesTerminalObservation(b *testing.B) {
+	items := make([]any, 100)
+	for i := range items {
+		items[i] = map[string]any{"type": "message", "content": []any{map[string]any{"type": "output_text", "text": strings.Repeat("x", 10<<10)}}}
+	}
+	body, _ := json.Marshal(map[string]any{"status": "completed", "output": items, "usage": map[string]any{"input_tokens": 10, "output_tokens": 10, "total_tokens": 20}})
+	for _, legacy := range []bool{true, false} {
+		name := "terminal-only"
+		if legacy {
+			name = "full-response-decode"
+		}
+		b.Run(name, func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				if legacy {
+					var p map[string]any
+					_ = json.Unmarshal(body, &p)
+					_, _ = decodeBridgeResponse(Responses, p)
+				} else {
+					_, _ = ResponseUsage(Responses, body)
+				}
+			}
+		})
+	}
+}
+
+func TestSSEEventLimitsPreserveUnlimitedAggregateAndTerminalCutoff(t *testing.T) {
+	oversized := strings.Repeat("x", streamwatch.DefaultMaxEventBytes+1)
+	observer := newStreamUsageObserver(Chat)
+	if _, err := observer.Write([]byte(oversized)); !errors.Is(err, streamwatch.ErrSSEEventTooLarge) {
+		t.Fatal("unterminated event not bounded", err)
+	}
+	if len(observer.buffer) != 0 {
+		t.Fatal("oversized event retained")
+	}
+	line := "data: " + strings.Repeat("x", 1024) + "\n"
+	manyLines := strings.Repeat(line, streamwatch.DefaultMaxEventBytes/len(line)+1)
+	if err := readSSE(strings.NewReader(manyLines), func(string, string) error { return nil }); !errors.Is(err, streamwatch.ErrSSEEventTooLarge) {
+		t.Fatal("multiline event not bounded", err)
+	}
+	observer = newStreamUsageObserver(Chat)
+	for i := 0; i < 1025; i++ {
+		if _, err := observer.Write([]byte(":" + strings.Repeat("x", 40<<10) + "\n\n")); err != nil {
+			t.Fatal("aggregate stream bounded", err)
+		}
+	}
+	terminal := "data: [DONE]\n\n"
+	accepted, err := observer.Write([]byte(terminal + oversized))
+	if err != nil || accepted != len(terminal) || !observer.NormalTermination() {
+		t.Fatal("post-terminal garbage inspected", accepted, err)
+	}
+}
+
+func TestGenerationParserExcludesProtocolMetadataAndDoneSnapshots(t *testing.T) {
+	for _, tc := range []struct {
+		protocol Protocol
+		frames   []string
+		count    int
+	}{
+		{Chat, []string{`{"choices":[{"delta":{"role":"assistant"}}]}`, `{"choices":[{"delta":{"reasoning_content":"think"}}]}`, `{"choices":[{"delta":{"content":"answer"}}]}`, `{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"completion_tokens":20}}`}, 2},
+		{Anthropic, []string{`{"type":"message_start","message":{"id":"m","model":"m","usage":{"input_tokens":1}}}`, `{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"think"}}`, `{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"answer"}}`, `{"type":"content_block_delta","index":1,"delta":{"type":"signature_delta","signature":"opaque"}}`, `{"type":"message_stop"}`}, 2},
+		{Responses, []string{`{"type":"response.created","response":{"id":"r","model":"m"}}`, `{"type":"response.reasoning_summary_text.delta","item_id":"think","delta":"think"}`, `{"type":"response.output_text.delta","delta":"answer"}`, `{"type":"response.function_call_arguments.delta","item_id":"call","delta":"{}"}`, `{"type":"response.output_text.done","text":"answer"}`, `{"type":"response.completed","response":{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"answer"}]}]}}`}, 3},
+	} {
+		t.Run(string(tc.protocol), func(t *testing.T) {
+			ctx, timing := streamwatch.WithTiming(context.Background())
+			p := newStreamUsageObserver(tc.protocol).parser
+			p.generationCtx = ctx
+			for _, frame := range tc.frames {
+				if _, err := p.Parse("", frame); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if timing.Snapshot().GenerationEvents != tc.count {
+				t.Fatal(timing.Snapshot())
+			}
+		})
+	}
+}
+
+func TestClientToolPreparationCopiesOnlyChangedHistory(t *testing.T) {
+	ordinary := map[string]any{"type": "message", "content": "unchanged"}
+	custom := map[string]any{"type": "custom_tool_call", "name": "patch", "input": "raw"}
+	body := map[string]any{"tools": []any{map[string]any{"type": "custom", "name": "patch"}}, "input": []any{ordinary, custom}}
+	before, _ := json.Marshal(body)
+	out, _, _, err := PrepareClientTools(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, _ := json.Marshal(body)
+	if !bytes.Equal(before, after) {
+		t.Fatal("original request mutated")
+	}
+	history := out["input"].([]any)
+	if reflect.ValueOf(history[0]).Pointer() != reflect.ValueOf(ordinary).Pointer() {
+		t.Fatal("ordinary history copied")
+	}
+	if reflect.ValueOf(history[1]).Pointer() == reflect.ValueOf(custom).Pointer() {
+		t.Fatal("rewritten tool aliases original")
+	}
+	plain := map[string]any{"input": []any{ordinary}}
+	prepared, _, _, err := PrepareClientTools(plain)
+	if err != nil || reflect.ValueOf(prepared).Pointer() != reflect.ValueOf(plain).Pointer() {
+		t.Fatal("ordinary request did not use fast path")
+	}
+}
+
+func BenchmarkClientToolPreparationLargeHistory(b *testing.B) {
+	for _, custom := range []bool{false, true} {
+		b.Run(fmt.Sprintf("custom=%t", custom), func(b *testing.B) {
+			history := make([]any, 1000)
+			for i := range history {
+				history[i] = map[string]any{"type": "message", "content": strings.Repeat("x", 1024)}
+			}
+			body := map[string]any{"input": history}
+			if custom {
+				body["tools"] = []any{map[string]any{"type": "custom", "name": "patch"}}
+				history[999] = map[string]any{"type": "custom_tool_call", "name": "patch", "input": "raw"}
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, _, _, err := PrepareClientTools(body); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
 }
 
 func (r *terminalOnlyReader) Read(p []byte) (int, error) {
@@ -380,40 +527,34 @@ func TestCacheUnknownAndObservedZeroRemainDistinct(t *testing.T) {
 	}
 }
 
-// Codex advertises tool groups the Chat/Anthropic lanes cannot express
-// (namespace bundles and web_search) next to its function tools. Those entries
-// must be skipped so the request stays convertible, while every function tool
-// survives with its schema intact.
-func TestConvertRequestSkipsUnsupportedToolTypes(t *testing.T) {
-	body := map[string]any{
-		"model": "trae/m",
-		"input": []any{map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "hi"}}}},
-		"tools": []any{
-			map[string]any{"type": "function", "name": "exec_command", "description": "run", "parameters": map[string]any{"type": "object", "properties": map[string]any{"cmd": map[string]any{"type": "string"}}}},
-			map[string]any{"type": "namespace", "name": "multi_agent_v1", "description": "agents", "tools": []any{
-				map[string]any{"type": "function", "name": "spawn_agent", "parameters": map[string]any{"type": "object"}},
-			}},
-			map[string]any{"type": "web_search", "external_web_access": false},
-			map[string]any{"type": "function", "name": "view_image", "parameters": map[string]any{"type": "object"}},
-		},
-		"tool_choice": "auto",
+// Preserve reversible namespace/custom lowering; skip unavailable optional tools.
+func TestConvertRequestSkipsOnlyUnavailableOptionalTools(t *testing.T) {
+	body := map[string]any{"model": "trae/m", "input": "hi", "tools": []any{
+		map[string]any{"type": "namespace", "name": "files", "tools": []any{map[string]any{"type": "function", "name": "read", "parameters": map[string]any{"type": "object"}}}},
+		map[string]any{"type": "custom", "name": "apply_patch"},
+		map[string]any{"type": "web_search"},
+	}, "tool_choice": "auto"}
+	prepared, custom, namespace, err := PrepareClientTools(body)
+	if err != nil || !custom["apply_patch"] || len(namespace) != 1 {
+		t.Fatal("client lowering failed", err)
 	}
-	out, err := ConvertRequest(Responses, Chat, body)
-	if err != nil {
-		t.Fatalf("Codex tool set rejected: %v", err)
+	out, err := ConvertRequest(Responses, Chat, prepared)
+	if err != nil || len(jsonutil.SliceAt(out, "tools")) != 2 {
+		t.Fatal("converted tools lost", out, err)
 	}
-	tools, _ := out["tools"].([]any)
-	if len(tools) != 2 {
-		t.Fatalf("expected only function tools to survive, got %v", tools)
+	if len(jsonutil.SliceAt(body, "tools")) != 3 {
+		t.Fatal("caller tools mutated")
 	}
-	names := []string{}
-	for _, raw := range tools {
-		tool, _ := raw.(map[string]any)
-		function, _ := tool["function"].(map[string]any)
-		names = append(names, jsonutil.StringAt(function, "name"))
+	for _, choice := range []any{"required", map[string]any{"type": "web_search"}, map[string]any{"type": "function", "name": "missing"}} {
+		bad := map[string]any{"input": "hi", "tools": []any{map[string]any{"type": "web_search"}}, "tool_choice": choice}
+		if _, err := ConvertRequest(Responses, Chat, bad); err == nil {
+			t.Fatal("forced unavailable tool silently discarded", choice)
+		}
 	}
-	if len(names) != 2 || names[0] != "exec_command" || names[1] != "view_image" {
-		t.Fatalf("function tools lost or reordered: %v", names)
+	for _, tool := range []any{nil, map[string]any{"name": "missing-type"}, map[string]any{"type": "custom", "name": "raw"}} {
+		if _, err := ConvertRequest(Responses, Chat, map[string]any{"input": "hi", "tools": []any{tool}}); err == nil {
+			t.Fatal("unprepared/malformed tool discarded", tool)
+		}
 	}
 }
 

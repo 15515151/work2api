@@ -84,6 +84,7 @@ export interface KeyInfo {
   credits: number | null
   tokens_known?: boolean
   credits_known?: boolean
+	channel_costs?: {provider:string;credits:number|null;partial?:boolean}[]
   allowed_models: string[] | null
   model_policy: "follow" | "fixed"
 }
@@ -146,7 +147,7 @@ export const api = {
   shareContribution: (id: number) => call<{ ok: boolean }>('POST', `/portal/api/contributions/${id}/share`, { accepted: true }),
   usage: () =>
     call<{
-       today: { requests: number; input_tokens: number | null; output_tokens: number | null; daily_limit_requests: number; daily_limit_input: number; daily_limit_output: number }
+       today: { requests: number; input_tokens: number | null; output_tokens: number | null; recorded_input_tokens?:number; recorded_output_tokens?:number; tokens_known?:boolean; daily_limit_requests: number; daily_limit_input: number; daily_limit_output: number }
       keys: KeyInfo[]
     }>('GET', '/portal/api/usage'),
 }

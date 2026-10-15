@@ -216,6 +216,8 @@ export interface UsageDiagnostics {
     account_wait_ms: number
     total_ms: number
     first_byte_ms?: number
+	first_generation_ms?: number
+	generation_ms?: number
     execution_ms?: number
     attempts: number
     upstream_429: number
@@ -404,7 +406,10 @@ export interface AppInfo {
   created_at: number
   requests: number
   tokens: number
+	tokens_known?: boolean
   credits: number
+	credits_known?: boolean
+	channel_costs?: {provider:string;credits:number|null;partial?:boolean}[]
   user_id?: number | null
   username?: string
   model_policy?: "follow" | "fixed"

@@ -167,6 +167,31 @@ func TestAttemptStagesBoundedAndDetached(t *testing.T) {
 	}
 }
 
+func TestGenerationIgnoresNonGeneratingChatFramesAndResetsOnRetry(t *testing.T) {
+	ctx, timing := WithTiming(context.Background())
+	StartAttempt(ctx)
+	for _, delta := range []map[string]any{{"role": "assistant"}, {"content": ""}, {"tool_calls": []any{map[string]any{"id": "call", "function": map[string]any{"name": "lookup"}}}}} {
+		if ChatGeneration(map[string]any{"choices": []any{map[string]any{"delta": delta}}}) {
+			t.Fatal("metadata counted as generation")
+		}
+	}
+	for _, delta := range []map[string]any{{"content": "answer"}, {"reasoning_content": "think"}, {"tool_calls": []any{map[string]any{"function": map[string]any{"arguments": "{}"}}}}} {
+		if !ChatGeneration(map[string]any{"choices": []any{map[string]any{"delta": delta}}}) {
+			t.Fatal("valid model delta not recognized")
+		}
+		Generation(ctx)
+	}
+	snapshot := timing.Snapshot()
+	if snapshot.GenerationEvents != 3 || snapshot.LastGeneration < snapshot.FirstGeneration {
+		t.Fatal(snapshot)
+	}
+	StartAttempt(ctx)
+	snapshot = timing.Snapshot()
+	if snapshot.GenerationEvents != 0 || snapshot.FirstGeneration != 0 || snapshot.LastGeneration != 0 {
+		t.Fatal("old attempt contaminated timing")
+	}
+}
+
 func TestAttemptCorrelationIDIsBoundedAndWhitelisted(t *testing.T) {
 	ctx, timing := WithTiming(context.Background())
 	StartAttempt(ctx)

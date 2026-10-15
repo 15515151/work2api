@@ -338,7 +338,7 @@ func openAIUsage(usage Usage) map[string]any {
 // responsesUsage renders the Responses usage object. Codex decodes
 // input_tokens_details and output_tokens_details as complete structures, so a
 // detail object is emitted only when the upstream actually reported its
-// contents. Trae, for example, never sends cache or reasoning counters; an
+// contents. When an upstream omits cache or reasoning counters, an
 // empty input_tokens_details used to fail the whole response.completed parse
 // with "missing field `cached_tokens`".
 func responsesUsage(usage Usage) map[string]any {
@@ -511,11 +511,29 @@ func ResponseUsage(protocol Protocol, body []byte) (Usage, bool) {
 			result.FinishReason = canonicalAnthropicStop(reason)
 		}
 	case Responses:
-		if jsonutil.StringAt(payload, "status") != "" {
-			if response, err := decodeBridgeResponse(protocol, payload); err == nil {
-				result.FinishReason = response.Stop
-			}
-		}
+		result.FinishReason = responsesFinishReason(payload)
 	}
 	return result, len(usage) > 0
+}
+
+// Usage observation must not decode or join response content. Native output
+// items that the conversion bridge cannot express still have valid terminal
+// status and usage (including custom tools).
+func responsesFinishReason(payload map[string]any) string {
+	switch jsonutil.StringAt(payload, "status") {
+	case "incomplete":
+		return canonicalResponsesIncomplete(jsonutil.StringAt(payload, "incomplete_details", "reason"))
+	case "failed", "cancelled":
+		return "error"
+	case "completed":
+		for _, raw := range jsonutil.SliceAt(payload, "output") {
+			item, _ := raw.(map[string]any)
+			if kind := jsonutil.StringAt(item, "type"); kind == "function_call" || kind == "custom_tool_call" {
+				return "tool_calls"
+			}
+		}
+		return "stop"
+	default:
+		return ""
+	}
 }

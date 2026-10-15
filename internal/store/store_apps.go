@@ -11,17 +11,18 @@ import (
 
 // App is a returned application-key row with usage stats.
 type App struct {
-	ID           int64   `json:"id"`
-	Name         string  `json:"name"`
-	KeyPrefix    string  `json:"key_prefix"`
-	Note         string  `json:"note"`
-	Enabled      bool    `json:"enabled"`
-	CreatedAt    float64 `json:"created_at"`
-	Requests     int64   `json:"requests"`
-	Tokens       int64   `json:"tokens"`
-	Credits      float64 `json:"credits"`
-	TokensKnown  bool    `json:"tokens_known"`
-	CreditsKnown bool    `json:"credits_known"`
+	ID           int64            `json:"id"`
+	Name         string           `json:"name"`
+	KeyPrefix    string           `json:"key_prefix"`
+	Note         string           `json:"note"`
+	Enabled      bool             `json:"enabled"`
+	CreatedAt    float64          `json:"created_at"`
+	Requests     int64            `json:"requests"`
+	Tokens       int64            `json:"tokens"`
+	Credits      float64          `json:"credits"`
+	TokensKnown  bool             `json:"tokens_known"`
+	CreditsKnown bool             `json:"credits_known"`
+	ChannelCosts []AppChannelCost `json:"channel_costs"`
 	// UserID 0 = private/admin key (pre-portal keys stay private — HANDOFF §4).
 	UserID int64 `json:"user_id"`
 	// AllowedModels is the per-key model allowlist (JSON array of model ids);
@@ -29,6 +30,59 @@ type App struct {
 	AllowedModels []string `json:"allowed_models"`
 	ModelPolicy   string   `json:"model_policy"`
 	Username      string   `json:"username,omitempty"`
+}
+
+// AppChannelCost keeps provider-specific billing units separate. Nil means
+// no calls reported a cost. Partial sums keep recorded values visible.
+type AppChannelCost struct {
+	Provider string   `json:"provider"`
+	Credits  *float64 `json:"credits"`
+	Partial  bool     `json:"partial,omitempty"`
+}
+
+func (d *DB) appChannelCostsLocked(app *App) error {
+	rows, err := d.db.Query(`SELECT CASE
+		WHEN physical LIKE 'qoder/%' THEN 'qoder'
+		WHEN physical LIKE 'trae/%' THEN 'trae'
+		WHEN physical LIKE 'opencode/%' THEN 'opencode'
+		WHEN physical LIKE 'workbuddy/%' OR instr(physical,'/')=0 THEN 'workbuddy'
+		ELSE 'unknown' END AS provider,
+		COALESCE(SUM(credits),0), COUNT(CASE WHEN credits IS NULL THEN 1 END)=0,
+		COUNT(*), COALESCE(SUM(total_tokens),0), COUNT(CASE WHEN tokens_known=0 THEN 1 END)=0, COUNT(credits)
+		FROM (SELECT COALESCE(NULLIF(json_extract(diagnostics,'$.physical_model'),''),model) AS physical, credits, total_tokens, tokens_known
+		FROM usage_logs WHERE app_id=? AND COALESCE(user_id,0)=?)
+		GROUP BY provider ORDER BY provider`, app.ID, app.UserID)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	app.ChannelCosts = []AppChannelCost{}
+	app.TokensKnown, app.CreditsKnown = true, true
+	for rows.Next() {
+		var item AppChannelCost
+		var value float64
+		var known bool
+		var count, tokens int64
+		var reported int64
+		var tokensKnown bool
+		if err := rows.Scan(&item.Provider, &value, &known, &count, &tokens, &tokensKnown, &reported); err != nil {
+			return err
+		}
+		item.Partial = !known
+		if reported > 0 {
+			item.Credits = &value
+		}
+		app.ChannelCosts = append(app.ChannelCosts, item)
+		app.Requests += count
+		app.Tokens += tokens
+		app.Credits += value // legacy API only; the UI uses channel_costs
+		app.TokensKnown = app.TokensKnown && tokensKnown
+		app.CreditsKnown = app.CreditsKnown && known && item.Provider != "unknown"
+	}
+	if len(app.ChannelCosts) > 1 {
+		app.CreditsKnown = false
+	}
+	return rows.Err()
 }
 
 func (d *DB) HasEncryptedAppKeys() (bool, error) {
@@ -70,14 +124,9 @@ func (d *DB) ListApps() ([]App, error) {
 	}
 	// per-app usage stats
 	for i := range apps {
-		var c, t int64
-		var cr float64
-		if err := d.db.QueryRow(
-			"SELECT COUNT(l.id), COALESCE(SUM(l.total_tokens),0), COALESCE(SUM(l.credits),0), COUNT(CASE WHEN l.tokens_known=0 THEN 1 END)=0, COUNT(CASE WHEN l.credits IS NULL THEN 1 END)=0 FROM usage_logs l WHERE l.app_id = ? AND COALESCE(l.user_id,0) = ?",
-			apps[i].ID, apps[i].UserID).Scan(&c, &t, &cr, &apps[i].TokensKnown, &apps[i].CreditsKnown); err != nil {
+		if err := d.appChannelCostsLocked(&apps[i]); err != nil {
 			return nil, err
 		}
-		apps[i].Requests, apps[i].Tokens, apps[i].Credits = c, t, cr
 	}
 	return apps, nil
 }
@@ -285,14 +334,9 @@ func (d *DB) UserApps(userID int64) ([]App, error) {
 		return nil, err
 	}
 	for i := range apps {
-		var c, t int64
-		var cr float64
-		if err := d.db.QueryRow(
-			"SELECT COUNT(l.id), COALESCE(SUM(l.total_tokens),0), COALESCE(SUM(l.credits),0), COUNT(CASE WHEN l.tokens_known=0 THEN 1 END)=0, COUNT(CASE WHEN l.credits IS NULL THEN 1 END)=0 FROM usage_logs l WHERE l.user_id = ? AND l.app_id = ?",
-			userID, apps[i].ID).Scan(&c, &t, &cr, &apps[i].TokensKnown, &apps[i].CreditsKnown); err != nil {
+		if err := d.appChannelCostsLocked(&apps[i]); err != nil {
 			return nil, err
 		}
-		apps[i].Requests, apps[i].Tokens, apps[i].Credits = c, t, cr
 	}
 	return apps, nil
 }

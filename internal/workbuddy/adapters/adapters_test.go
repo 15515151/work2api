@@ -8,8 +8,52 @@ import (
 	"strings"
 	"testing"
 
+	"work2api/internal/core/provider"
 	"work2api/internal/workbuddy/upstream"
 )
+
+func TestMessagesStreamingCaptureDoesNotTruncateWireOrNonstream(t *testing.T) {
+	text := strings.Repeat("正文", 20)
+	thinking := strings.Repeat("思考", 20)
+	args := `{"value":"` + text + `"}`
+	chunk := map[string]any{"choices": []any{map[string]any{"delta": map[string]any{
+		"content": text, "reasoning_content": thinking,
+		"tool_calls": []any{map[string]any{"index": 0, "id": "call_1", "function": map[string]any{"name": "test", "arguments": args}}},
+	}}}}
+	for _, p := range []provider.LogCapturePolicy{{Enabled: true, Limit: 7}, {Enabled: false, Limit: 7}, {Enabled: true, Limit: 0}} {
+		c := NewAnthropicStreamConverter("m")
+		c.SetStreamingLogPolicy(p)
+		wire := c.FeedChunk(chunk)
+		for _, s := range []string{text, thinking, args} {
+			encoded, _ := json.Marshal(s)
+			if !strings.Contains(wire, string(encoded)) {
+				t.Fatal("full wire delta missing")
+			}
+		}
+		if !p.Enabled {
+			if c.TextContent() != "" || c.Reasoning() != "" || c.toolLogBytes != 0 {
+				t.Fatal("disabled capture retained content")
+			}
+		} else if p.Limit > 0 {
+			if len(c.TextContent()) > p.Limit || len(c.Reasoning()) > p.Limit || c.toolLogBytes > p.Limit {
+				t.Fatal("capture exceeded policy")
+			}
+		} else if c.TextContent() != text || c.Reasoning() != thinking || c.toolUses[0].args.String() != args {
+			t.Fatal("unlimited setting lost content")
+		}
+		full := NewAnthropicStreamConverter("m")
+		full.SetStreamingLogPolicy(p)
+		full.SetNonstream()
+		full.FeedChunk(chunk)
+		if full.TextContent() != text || full.Reasoning() != thinking || full.toolUses[0].args.String() != args {
+			t.Fatal("nonstream content truncated")
+		}
+		content := full.GetNonstreamResponse()["content"].([]any)
+		if len(content) != 3 || content[2].(map[string]any)["input"].(map[string]any)["value"] != text {
+			t.Fatal("nonstream tool input changed")
+		}
+	}
+}
 
 func TestUpstreamRefusalSurvivesAdapters(t *testing.T) {
 	for _, first := range []bool{true, false} {

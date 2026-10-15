@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -59,9 +60,23 @@ type restoreManifest struct {
 	Files   map[string]string `json:"sha256"`
 }
 
+// The snapshot generator and reader share this manifest budget, independently
+// of small control/plan JSON files. Large account pools legitimately exceed 1MiB.
+const MaxBackupManifestBytes = 64 << 20
+
 // Validate every byte before writing live paths. Restore only a locally pinned
 // coherent backup, while both instances are stopped and data locks are held.
 func RestoreBackup(archive, digest, target, data, db string) error {
+	return restoreBackup(archive, digest, target, data, db, false)
+}
+
+// ValidateBackup exercises the same archive, digest and path checks without
+// touching live state. Run it before the old service leaves its update gate.
+func ValidateBackup(archive, digest, target, data, db string) error {
+	return restoreBackup(archive, digest, target, data, db, true)
+}
+
+func restoreBackup(archive, digest, target, data, db string, validateOnly bool) error {
 	if !ValidHash(digest) {
 		return errors.New("备份摘要无效")
 	}
@@ -129,7 +144,25 @@ func RestoreBackup(archive, digest, target, data, db string) error {
 		}
 		hashes[name] = hex.EncodeToString(hash.Sum(nil))
 	}
-	if err = ReadJSON(filepath.Join(staging, "manifest.json"), &manifest); err != nil {
+	manifestFile, err := os.Open(filepath.Join(staging, "manifest.json"))
+	if err != nil {
+		return err
+	}
+	info, err := manifestFile.Stat()
+	if err != nil || info.Size() > MaxBackupManifestBytes {
+		manifestFile.Close()
+		return errors.New("备份清单超过允许大小")
+	}
+	decoder := json.NewDecoder(io.LimitReader(manifestFile, MaxBackupManifestBytes+1))
+	err = decoder.Decode(&manifest)
+	if err == nil {
+		var extra any
+		if e := decoder.Decode(&extra); e != io.EOF {
+			err = errors.New("备份清单含多余数据")
+		}
+	}
+	manifestFile.Close()
+	if err != nil {
 		return err
 	}
 	if manifest.Version != 1 || manifest.Sources["database.sqlite"] != db {
@@ -183,6 +216,9 @@ func RestoreBackup(archive, digest, target, data, db string) error {
 			}
 		}
 		targets[destination] = filepath.Join(staging, filepath.FromSlash(name))
+	}
+	if validateOnly {
+		return nil
 	}
 	// Startup may create files after a migration. Remove extra service-owned data
 	// only, preserving locks, logs, backup archives and the updater itself.

@@ -8,6 +8,7 @@ import RequestLogTable from '../../src/components/RequestLogTable.vue'
 import RequestLogDetail from '../../src/components/RequestLogDetail.vue'
 import WModal from '../../src/components/ui/WModal.vue'
 import WButton from '../../src/components/ui/WButton.vue'
+import ChannelCosts from '../../src/components/ChannelCosts.vue'
 import WInput from '../../src/components/ui/WInput.vue'
 defineProps<{ me: Me }>()
 const records=ref<UsageRecord[]>([])
@@ -48,9 +49,6 @@ async function load() {
 }
 onMounted(()=>{load();loadLogs()})
 
-function quota(cur: number | null, limit: number) {
-  return limit > 0 ? `${fmtTokens(cur)} / ${fmtTokens(limit)}` : `${fmtTokens(cur)} · 不限额`
-}
 </script>
 
 <template>
@@ -58,19 +56,19 @@ function quota(cur: number | null, limit: number) {
     <p v-if="error" class="text-small text-fault">{{ error }} <button class="text-brand" @click="load">重试</button></p>
     <div class="glass rounded-2xl p-6">
       <h1 class="text-base font-semibold">今日用量</h1>
-      <p class="mt-1 text-micro text-faint">同一账号的所有 Key 合并统计，按本地时间每日 0 点重置。</p>
+      <p class="mt-1 text-micro text-faint">汇总本人所有 Key 的今日调用。</p>
       <div v-if="!loading && !error" class="mt-5 grid grid-cols-1 gap-3 sm:grid-cols-3">
         <div class="rounded-xl border border-line bg-elevated/50 p-4">
           <div class="text-micro text-faint">请求数</div>
-          <div class="mono mt-1 text-xl font-semibold">{{ quota(today.requests, today.daily_limit_requests) }}</div>
+          <div class="mono mt-1 text-xl font-semibold">{{ fmtTokens(today.requests) }}</div>
         </div>
         <div class="rounded-xl border border-line bg-elevated/50 p-4">
           <div class="text-micro text-faint">输入 tokens</div>
-          <div class="mono mt-1 text-xl font-semibold">{{ quota(today.input_tokens, today.daily_limit_input) }}</div>
+          <div class="mono mt-1 text-xl font-semibold" :title="today.tokens_known === false ? '已记录的输入 Tokens 合计；部分请求未上报用量' : ''">{{ fmtTokens(today.recorded_input_tokens ?? today.input_tokens) }}</div>
         </div>
         <div class="rounded-xl border border-line bg-elevated/50 p-4">
           <div class="text-micro text-faint">输出 tokens</div>
-          <div class="mono mt-1 text-xl font-semibold">{{ quota(today.output_tokens, today.daily_limit_output) }}</div>
+          <div class="mono mt-1 text-xl font-semibold" :title="today.tokens_known === false ? '已记录的输出 Tokens 合计；部分请求未上报用量' : ''">{{ fmtTokens(today.recorded_output_tokens ?? today.output_tokens) }}</div>
         </div>
       </div>
     </div>
@@ -88,7 +86,7 @@ function quota(cur: number | null, limit: number) {
               <th class="py-2 pr-4 font-medium">状态</th>
               <th class="py-2 pr-4 text-right font-medium">请求数</th>
               <th class="py-2 pr-4 text-right font-medium">Tokens</th>
-              <th class="py-2 text-right font-medium">渠道积分（不可跨渠道比较）</th>
+              <th class="py-2 text-right font-medium">累计消耗</th>
             </tr>
           </thead>
           <tbody>
@@ -100,8 +98,8 @@ function quota(cur: number | null, limit: number) {
                 </span>
               </td>
               <td class="mono py-2.5 pr-4 text-right">{{ k.requests }}</td>
-              <td class="mono py-2.5 pr-4 text-right">{{ fmtTokens(k.tokens_known === false ? null : k.tokens) }}</td>
-              <td class="mono py-2.5 text-right">{{ k.credits_known === false || k.credits == null ? '未知' : k.credits.toFixed(2) }}</td>
+              <td class="mono py-2.5 pr-4 text-right" :title="k.tokens_known === false ? '已记录的 Tokens 合计；部分请求未上报用量' : ''">{{ fmtTokens(k.tokens) }}</td>
+              <td class="mono py-2.5 text-right"><ChannelCosts :total="k.credits" :costs="k.channel_costs" /></td>
             </tr>
           </tbody>
         </table>
@@ -109,7 +107,7 @@ function quota(cur: number | null, limit: number) {
     </div>
     <div class="glass rounded-2xl p-5">
       <h2 class="font-semibold">我的调用记录</h2>
-      <p class="mt-1 text-micro text-faint">只展示本人 Key 的调用，重试合并为一次请求；不保存门户调用的对话正文，不展示其他账号信息。</p>
+      <p class="mt-1 text-micro text-faint">查看本人 Key 的调用记录。</p>
       <div class="my-4 flex flex-wrap gap-2">
        <WInput v-model="model" placeholder="模型 ID（精确匹配）" class="max-w-xs" @enter="loadLogs(true)" />
        <select v-model="protocol" class="rounded-lg border border-line bg-bg p-2 text-small" aria-label="筛选协议"><option value="">全部协议</option><option value="chat">Chat</option><option value="anthropic">Messages</option><option value="responses">Responses</option></select>

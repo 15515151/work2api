@@ -405,15 +405,10 @@ func decodeBridgeRequest(protocol Protocol, input map[string]any) (bridgeRequest
 				return request, fmt.Errorf("messages[%d] has unsupported role %q", i, role)
 			}
 		}
-		for _, raw := range jsonutil.SliceAt(input, "tools") {
+		for i, raw := range jsonutil.SliceAt(input, "tools") {
 			tool, ok := raw.(map[string]any)
 			if !ok || jsonutil.StringAt(tool, "type") != "function" {
-				// Chat clients may advertise tools this lane cannot express
-				// (for example Codex's namespace and web_search entries).
-				// Skipping them keeps the request convertible; the surviving
-				// function tools still work, and the client sees the missing
-				// tool only if the model tries to call it.
-				continue
+				return request, fmt.Errorf("tools[%d] must be a function tool", i)
 			}
 			function := jsonutil.MapAt(tool, "function")
 			request.Tools = append(request.Tools, bridgeTool{
@@ -490,14 +485,10 @@ func decodeBridgeRequest(protocol Protocol, input map[string]any) (bridgeRequest
 		default:
 			return request, fmt.Errorf("input must be a string or array")
 		}
-		for _, raw := range jsonutil.SliceAt(input, "tools") {
+		for i, raw := range jsonutil.SliceAt(input, "tools") {
 			tool, ok := raw.(map[string]any)
 			if !ok || jsonutil.StringAt(tool, "type") != "function" {
-				// Responses clients may advertise tools this lane cannot
-				// express (Codex sends namespace groups and web_search
-				// alongside its function tools). Skipping them keeps the
-				// request convertible instead of failing the whole turn.
-				continue
+				return request, fmt.Errorf("tools[%d] must be a function tool", i)
 			}
 			request.Tools = append(request.Tools, bridgeTool{
 				Name:        jsonutil.StringAt(tool, "name"),
@@ -704,7 +695,7 @@ func encodeChatRequest(request bridgeRequest) (map[string]any, error) {
 		if budget := reasoningBudget(request.Reasoning); budget <= 0 {
 			return
 		}
-		encoded := map[string]any{"role": "assistant", "content": ""}
+		encoded := map[string]any{"role": "assistant", "content": nil}
 		carryBudget(encoded)
 		if encoded["reasoning_budget_tokens"] == nil {
 			return
@@ -733,7 +724,7 @@ func encodeChatRequest(request bridgeRequest) (map[string]any, error) {
 			if len(results) > 0 {
 				return nil, fmt.Errorf("messages[%d]: assistant message contains tool results", i)
 			}
-			encoded := map[string]any{"role": "assistant", "content": ""}
+			encoded := map[string]any{"role": "assistant", "content": nil}
 			carryBudget(encoded)
 			if value, ok := bridgeReasoningText(reasoning); ok {
 				encoded["reasoning_content"] = value
@@ -1075,4 +1066,85 @@ func encodeAnthropicRequest(request bridgeRequest) map[string]any {
 		}
 	}
 	return output
+}
+
+// FunctionToolSubset drops unavailable optional tools only. Tools which need
+// reversible lowering must be prepared by PrepareClientTools first.
+func FunctionToolSubset(input map[string]any, from Protocol) (map[string]any, error) {
+	if from != Chat && from != Responses {
+		return input, nil
+	}
+	rawTools, exists := input["tools"]
+	tools, ok := rawTools.([]any)
+	if exists && rawTools != nil && !ok {
+		return nil, fmt.Errorf("tools must be an array")
+	}
+	var kept []any
+	dropped := false
+	count := 0
+	for i, raw := range tools {
+		tool, ok := raw.(map[string]any)
+		kind := jsonutil.StringAt(tool, "type")
+		if !ok || kind == "" {
+			return nil, fmt.Errorf("tools[%d] must specify a type", i)
+		}
+		if kind == "namespace" || kind == "custom" {
+			return nil, fmt.Errorf("tools[%d] requires client tool preparation", i)
+		}
+		if kind != "function" {
+			if !dropped {
+				kept = append([]any{}, tools[:i]...)
+				dropped = true
+			}
+			continue
+		}
+		count++
+		if dropped {
+			kept = append(kept, raw)
+		}
+	}
+	switch choice := input["tool_choice"].(type) {
+	case string:
+		if choice == "required" && count == 0 {
+			return nil, fmt.Errorf("tool_choice requires an available tool")
+		}
+	case map[string]any:
+		kind := jsonutil.StringAt(choice, "type")
+		if kind == "function" {
+			name := jsonutil.StringAt(choice, "name")
+			if from == Chat {
+				name = jsonutil.StringAt(choice, "function", "name")
+			}
+			found := false
+			for _, raw := range tools {
+				tool, _ := raw.(map[string]any)
+				candidate := jsonutil.StringAt(tool, "name")
+				if from == Chat {
+					candidate = jsonutil.StringAt(tool, "function", "name")
+				}
+				if tool["type"] == "function" && name != "" && name == candidate {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return nil, fmt.Errorf("tool_choice selects an unavailable function")
+			}
+		} else if kind != "auto" && kind != "none" && kind != "" {
+			return nil, fmt.Errorf("tool_choice selects an unsupported tool type: %s", kind)
+		}
+	}
+	if !dropped {
+		return input, nil
+	}
+	out := make(map[string]any, len(input))
+	for k, v := range input {
+		out[k] = v
+	}
+	if len(kept) == 0 {
+		delete(out, "tools")
+	} else {
+		out["tools"] = kept
+	}
+	return out, nil
 }

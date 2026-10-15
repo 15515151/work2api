@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"strings"
 )
@@ -15,6 +16,10 @@ const requestLogCTE = `WITH scoped AS (SELECT id, CASE
  final AS (SELECT usage_logs.*,grouped.logged_attempts FROM usage_logs JOIN grouped ON usage_logs.id=grouped.final_id) `
 
 func (d *DB) UsageRequests(userID *int64, limit, offset int, protocol, model string, appName *string, status, search string) ([]map[string]any, int, error) {
+	return d.UsageRequestsContext(context.Background(), userID, limit, offset, protocol, model, appName, status, search)
+}
+
+func (d *DB) UsageRequestsContext(ctx context.Context, userID *int64, limit, offset int, protocol, model string, appName *string, status, search string) ([]map[string]any, int, error) {
 	if limit < 1 || limit > 100 {
 		limit = 20
 	}
@@ -40,18 +45,24 @@ func (d *DB) UsageRequests(userID *int64, limit, offset int, protocol, model str
 	args = append(args, filters...)
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	var total int
-	if err := d.db.QueryRow(cte+"SELECT COUNT(*) FROM final "+where, args...).Scan(&total); err != nil {
-		return nil, 0, err
-	}
 	params := append(append([]any{}, args...), limit, offset)
-	rows, err := d.db.Query(cte+"SELECT "+usageLightCols+",logged_attempts FROM final "+where+" ORDER BY id DESC LIMIT ? OFFSET ?", params...)
+	rows, err := d.db.QueryContext(ctx, cte+"SELECT "+usageLightCols+",logged_attempts,COUNT(*) OVER() AS filtered_total FROM final "+where+" ORDER BY id DESC LIMIT ? OFFSET ?", params...)
 	if err != nil {
 		return nil, 0, err
 	}
-	defer rows.Close()
 	result, err := scanRows(rows)
+	rows.Close()
+	var total int
+	// Empty pages beyond the end still report their true filtered total.
+	// Normal pages perform grouping once instead of two complete CTE scans.
+	if err == nil && len(result) == 0 && offset > 0 {
+		err = d.db.QueryRowContext(ctx, cte+"SELECT COUNT(*) FROM final "+where, args...).Scan(&total)
+	}
 	for _, row := range result {
+		if count, ok := row["filtered_total"].(int64); ok {
+			total = int(count)
+		}
+		delete(row, "filtered_total")
 		decodeUsageDiagnostics(row)
 		row["credit_known"] = row["credits"] != nil
 	}

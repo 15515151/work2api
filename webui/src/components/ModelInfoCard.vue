@@ -16,8 +16,14 @@ const reasoning = computed(() => {
 })
 const ctx = computed(() => m.value.context_length ?? m.value.context)
 const maxOut = computed(() => m.value.max_output_tokens ?? m.value.max_output)
-const bench = computed(() => m.value.benchmark || null)
-const fmtScore = (v: number | null | undefined) => (v == null ? '—' : Number(v).toFixed(1))
+const bench = computed(() => {
+  const data = m.value.benchmark
+  return data && [data.intelligence_index, data.coding_index, data.math_index].some(knownScore) ? data : null
+})
+function knownScore(v: unknown): boolean {
+  return (typeof v === 'number' || typeof v === 'string' && v.trim() !== '') && Number.isFinite(Number(v))
+}
+const fmtScore = (v: unknown) => knownScore(v) ? Number(v).toFixed(1) : '—'
 
 // 每站点成本系数（credits_by_region）。同模型两站点不同价时分列展示并标出更便宜的
 // 那个（成本优先选号会用它）。全相同或只有一个站点则回退单值 m.credits。

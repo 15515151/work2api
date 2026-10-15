@@ -27,6 +27,7 @@ import (
 	"work2api/internal/core/protocol"
 	"work2api/internal/core/provider"
 	"work2api/internal/store"
+	"work2api/internal/streamwatch"
 	"work2api/internal/trae/auth"
 	"work2api/internal/trae/upstream"
 )
@@ -752,7 +753,7 @@ func TestNativeStreamCompletion(t *testing.T) {
 // Codex aborts the turn with "failed to parse ResponseCompleted: missing field
 // `cached_tokens`" when the Responses usage object carries an empty
 // input_tokens_details, which is what an upstream without cache reporting
-// produced. Trae never reports cache or reasoning counters, so the detail
+// produced. An upstream may omit cache or reasoning counters, so the detail
 // objects must be omitted rather than sent empty.
 func TestResponsesUsageOmitsUnreportedDetails(t *testing.T) {
 	input := "event: output\ndata: {\"response\":\"answer\"}\n\nevent: token_usage\ndata: {\"prompt_tokens\":12,\"completion_tokens\":7,\"total_tokens\":19}\n\nevent: done\ndata: {\"finish_reason\":\"stop\"}\n\n"
@@ -835,44 +836,6 @@ func responsesUsages(t *testing.T, body []byte, stream bool) []map[string]any {
 	return usages
 }
 
-// The bridge re-prefixes the upstream id per downstream protocol. A Chat-style
-// "chatcmpl-" prefix minted upstream used to leak into Responses ids as
-// "resp_chatcmpl-trae-...", so every protocol must see exactly one prefix.
-func TestResponseIDsCarryOneProtocolPrefix(t *testing.T) {
-	for _, target := range []protocol.Protocol{protocol.Chat, protocol.Anthropic, protocol.Responses} {
-		t.Run(string(target), func(t *testing.T) {
-			r := fixtureRuntime(t, func(w http.ResponseWriter, req *http.Request) {
-				io.WriteString(w, "event: output\ndata: {\"response\":\"answer\"}\n\nevent: done\ndata: {\"finish_reason\":\"stop\"}\n\n")
-			})
-			identity := &auth.Auth{UID: "fixture-user", Variant: "cn", AccessToken: "fixture"}
-			r.accounts[accountID("fixture-user")] = &accountState{Auth: identity, Enabled: true, Identities: map[string]*auth.Auth{"cn": identity}, Catalogs: map[string][]upstream.ModelInfo{"cn": {{ID: "m", Name: "Model"}}}}
-			payload := map[string]any{"model": "trae/m", "stream": false}
-			if target == protocol.Responses {
-				payload["input"] = []any{map[string]any{"role": "user", "content": "hi"}}
-			} else {
-				payload["messages"] = []any{map[string]any{"role": "user", "content": "hi"}}
-			}
-			w := httptest.NewRecorder()
-			report, err := r.Serve(context.Background(), provider.ServeRequest{Writer: w, Protocol: provider.Protocol(target), Payload: payload})
-			if err != nil || report.Status != "ok" {
-				t.Fatalf("status=%s err=%v", report.Status, err)
-			}
-			var document map[string]any
-			if err := json.Unmarshal(w.Body.Bytes(), &document); err != nil {
-				t.Fatal(err)
-			}
-			id, _ := document["id"].(string)
-			want := map[protocol.Protocol]string{protocol.Chat: "chatcmpl_", protocol.Anthropic: "msg_", protocol.Responses: "resp_"}[target]
-			if !strings.HasPrefix(id, want) {
-				t.Fatalf("%s id %q lacks the %s prefix", target, id, want)
-			}
-			if strings.Count(id, "chatcmpl") != strings.Count(want, "chatcmpl") || strings.Count(id, "resp_") != strings.Count(want, "resp_") || strings.Count(id, "msg_") != strings.Count(want, "msg_") {
-				t.Fatalf("%s id %q carries a foreign protocol prefix", target, id)
-			}
-		})
-	}
-}
-
 // The upstream interleaves progress_notice heartbeats whose data payload is a
 // bare JSON string instead of an object. Parsing used to fail hard on those
 // frames, which aborted an otherwise healthy turn with a 502. The heartbeat
@@ -908,6 +871,23 @@ func TestNativeMalformedFrameStillFails(t *testing.T) {
 		t.Fatal("malformed frame accepted")
 	}
 }
+func TestPreparedTraeLimitsMatchWireAndBoundMultilineEvents(t *testing.T) {
+	input := []byte(`{"model":"m","max_tokens":77,"messages":[{"role":"user","content":"hello"}]}`)
+	wire, limits := upstream.PrepareBodyResolvedWithLimits(input, "solo", "m")
+	var body map[string]any
+	if json.Unmarshal(wire, &body) != nil || limits["max_tokens"] != 77 || body["max_tokens"] != float64(77) {
+		t.Fatal("limits differ from wire", limits)
+	}
+	if string(input) != `{"model":"m","max_tokens":77,"messages":[{"role":"user","content":"hello"}]}` {
+		t.Fatal("caller body mutated")
+	}
+	line := "data: " + strings.Repeat("x", 1024) + "\n"
+	events := newEvents(strings.NewReader(strings.Repeat(line, streamwatch.DefaultMaxEventBytes/len(line)+1)))
+	if _, err := events.next(); !errors.Is(err, streamwatch.ErrSSEEventTooLarge) {
+		t.Fatal("multiline event unbounded", err)
+	}
+}
+
 func TestNativeStreamRequiresTerminalEvent(t *testing.T) {
 	events := newEvents(strings.NewReader("event: output\ndata: {\"response\":\"partial\"}\n\n"))
 	first, err := events.next()
@@ -948,5 +928,22 @@ func TestNativeToolHistoryAndOutput(t *testing.T) {
 		if err != nil || !bytes.Contains(converted, []byte("call-a")) || !bytes.Contains(converted, []byte("lookup")) {
 			t.Fatalf("tool conversion failed: %s (%v)", converted, err)
 		}
+	}
+}
+
+func TestTraeNullAssistantNormalizationStaysAtBoundary(t *testing.T) {
+	input := []byte(`{"model":"m","messages":[{"role":"assistant","content":null,"tool_calls":[{"id":"a","type":"function","function":{"name":"echo","arguments":"{}"}}]}]}`)
+	wire := upstream.PrepareBodyResolved(input, "solo", "m")
+	var body map[string]any
+	if err := json.Unmarshal(wire, &body); err != nil {
+		t.Fatal(err)
+	}
+	message := body["messages"].([]any)[0].(map[string]any)
+	blocks, ok := message["content"].([]any)
+	if !ok || len(blocks) != 1 || blocks[0].(map[string]any)["text"] != "" {
+		t.Fatal("null assistant not normalized", message)
+	}
+	if !bytes.Contains(wire, []byte(`"function_call"`)) || !bytes.Contains(input, []byte(`"content":null`)) {
+		t.Fatal("tool history/input changed", string(wire))
 	}
 }

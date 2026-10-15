@@ -618,7 +618,7 @@ func (s *Server) adminUsageRecent(w http.ResponseWriter, r *http.Request) {
 	}
 	if q.Get("group") == "request" {
 		page, pageSize = logPage(r)
-		rows, total, err := s.o.db.UsageRequests(nil, pageSize, (page-1)*pageSize, q.Get("protocol"), q.Get("model"), appName, q.Get("status"), q.Get("search"))
+		rows, total, err := s.o.db.UsageRequestsContext(r.Context(), nil, pageSize, (page-1)*pageSize, q.Get("protocol"), q.Get("model"), appName, q.Get("status"), q.Get("search"))
 		if err != nil {
 			writeAPIErr(w, errBody(500, "查询调用日志失败", "server_error"))
 			return

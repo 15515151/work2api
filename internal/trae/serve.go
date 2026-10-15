@@ -21,6 +21,7 @@ type eventReader struct {
 	scanner *bufio.Scanner
 	event   string
 	data    []string
+	budget  streamwatch.SSEEventBudget
 }
 
 func newEvents(reader io.Reader) *eventReader {
@@ -31,6 +32,10 @@ func newEvents(reader io.Reader) *eventReader {
 func (r *eventReader) next() (*upstream.SOLOEvent, error) {
 	for r.scanner.Scan() {
 		line := r.scanner.Text()
+		if err := r.budget.AddLine(line); err != nil {
+			r.data = nil
+			return nil, err
+		}
 		if line == "" {
 			if len(r.data) > 0 {
 				name, data := r.event, strings.Join(r.data, "\n")
@@ -80,6 +85,10 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 	}
 	if body["response_format"] != nil {
 		return report, provider.NewAPIError(400, "该 Trae 路径尚未验证结构化输出，请移除 response_format", "unsupported_parameter")
+	}
+	body, err = protocol.FunctionToolSubset(body, protocol.Chat)
+	if err != nil {
+		return report, provider.NewAPIError(400, err.Error(), "invalid_request_error")
 	}
 	toolNames := map[string]bool{}
 	if raw := body["tools"]; raw != nil {
@@ -178,14 +187,9 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 			return report, err
 		}
 		streamwatch.StartAttempt(ctx)
-		// Inspect the prepared wire body, not inferred client defaults.
-		var sent map[string]any
-		if json.Unmarshal(upstream.PrepareBodyResolved(encoded, identity.Variant, identityModel), &sent) == nil {
-			if n, ok := sent["max_tokens"].(float64); ok && n > 0 && n <= 1<<30 && n == float64(int(n)) {
-				report.EffectiveLimits = map[string]int{"max_tokens": int(n)}
-			}
-		}
-		stream, status, errorBody, headers, sendErr := r.client(ctx).ChatStreamWithHeaders(identity, encoded, identityModel)
+		prepared, limits := upstream.PrepareBodyResolvedWithLimits(encoded, identity.Variant, identityModel)
+		report.EffectiveLimits = limits
+		stream, status, errorBody, headers, sendErr := r.client(ctx).ChatPreparedStreamWithHeaders(identity, prepared)
 		streamwatch.AttemptHeaders(ctx, status, headers)
 		streamwatch.AttemptResult(ctx, status)
 		if sendErr != nil {
@@ -201,7 +205,7 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 					}
 					attempt++ // the same-identity retry shares the total dispatch budget
 					streamwatch.StartAttempt(ctx)
-					stream, status, errorBody, headers, sendErr = r.client(ctx).ChatStreamWithHeaders(identity, encoded, identityModel)
+					stream, status, errorBody, headers, sendErr = r.client(ctx).ChatPreparedStreamWithHeaders(identity, prepared)
 					streamwatch.AttemptHeaders(ctx, status, headers)
 					streamwatch.AttemptResult(ctx, status)
 					if sendErr != nil {
@@ -288,7 +292,7 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 			usage, known, err = protocol.TranscodeStream(ctx, req.Writer, pipeReader, protocol.Chat, protocol.Protocol(req.Protocol), "trae/"+model)
 		} else {
 			var reply []byte
-			reply, usage, known, err = protocol.CollapseStreamWithUsage(pipeReader, protocol.Chat, "trae/"+model)
+			reply, usage, known, err = protocol.CollapseStreamWithUsageContext(ctx, pipeReader, protocol.Chat, "trae/"+model)
 			if err == nil {
 				reply, err = protocol.ConvertResponse(protocol.Chat, protocol.Protocol(req.Protocol), reply)
 			}
@@ -364,10 +368,7 @@ func (r *Runtime) coolWithDelay(id string, kind upstream.ErrKind, delay time.Dur
 }
 
 func normalizeStream(w io.Writer, events *eventReader, first *upstream.SOLOEvent, model string, initialUsage map[string]any) error {
-	// The bridge re-prefixes this id per downstream protocol. Emitting a bare
-	// provider-scoped token keeps that rewrite honest; a "chatcmpl-" prefix
-	// here used to survive into Responses ids as "resp_chatcmpl-trae-...".
-	id := fmt.Sprintf("trae-%d", time.Now().UnixNano())
+	id := fmt.Sprintf("chatcmpl-trae-%d", time.Now().UnixNano())
 	emit := func(delta map[string]any, finish any, usage map[string]any) error {
 		chunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []any{map[string]any{"index": 0, "delta": delta, "finish_reason": finish}}}
 		if usage != nil {

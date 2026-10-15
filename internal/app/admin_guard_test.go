@@ -102,7 +102,7 @@ func TestAgentCapacityDefaultsFollowRequestSize(t *testing.T) {
 		_ = os.Unsetenv(key)
 	}
 	cfg := config.Load(nil)
-	if cfg.MaxRequestBytes != 256<<20 || cfg.MaxResponseBytes != 128<<20 || cfg.RequestBodyBudget != 0 || cfg.MaxJSONItems != 0 || cfg.MaxJSONDepth != 0 || cfg.ModelMemoryGuard {
+	if cfg.MaxRequestBytes != 256<<20 || cfg.MaxResponseBytes != 128<<20 || cfg.RequestBodyBudget != 0 || cfg.MaxJSONItems != config.DefaultMaxJSONItems || cfg.MaxJSONDepth != config.DefaultMaxJSONDepth || cfg.ModelMemoryGuard {
 		t.Fatal("ordinary Agent requests retain restrictive defaults")
 	}
 	if cfg.ModelBufferBudgetBytes != 4*cfg.MaxResponseBytes*int64(cfg.MaxConcurrentRequests) {

@@ -191,6 +191,9 @@ func TestUsageTimingFinalizedAfterResponseAndRetainedAfterRestart(t *testing.T) 
 		streamwatch.QueueWait(r.Context(), 5*time.Millisecond, true)
 		streamwatch.StartAttempt(r.Context())
 		streamwatch.AttemptHeaders(r.Context(), 200)
+		streamwatch.Generation(r.Context())
+		time.Sleep(3 * time.Millisecond)
+		streamwatch.Generation(r.Context())
 		for i := 0; i < 2; i++ {
 			o.logUsage(logArgs{Ctx: r.Context(), T0: time.Now(), Status: "ok", Model: "test", Protocol: "chat"})
 		}
@@ -205,6 +208,9 @@ func TestUsageTimingFinalizedAfterResponseAndRetainedAfterRestart(t *testing.T) 
 		p := row["diagnostics"].(store.UsageDiagnostics).Performance
 		if p == nil || p.RequestID == "" || p.FirstByteMS == nil || p.ExecutionMS == nil || p.QueueMS != 10 || p.AccountWaitMS != 5 || p.Attempts != 1 || len(p.Stages) != 1 {
 			t.Fatal(p)
+		}
+		if p.FirstGenerationMS == nil || p.GenerationMS == nil || *p.GenerationMS < 1 {
+			t.Fatal("generation window not persisted", p)
 		}
 	}
 	// Reopen the exact database to prove this is not the in-memory ring.

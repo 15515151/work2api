@@ -46,13 +46,6 @@ function memorySize(value: number | null | undefined): string {
   return `${(value / 1048576).toFixed(1)} MiB`
 }
 
-function waitingLabel(reason: string): string {
-  return ({ upstream_pacing: '请求间隔', key_or_user_limit: '用户/Key 并发', shared_limit: '共享并发', memory_pressure: '内存保护', response_buffer_budget: '响应缓冲', execution_limit: '全局并发', account_busy: '账号名额', fairness: '公平调度' } as Record<string,string>)[reason] || reason
-}
-
-function rejectionLabel(reason: string): string {
-  return ({ model_queue_full: '模型队列满', key_queue_full: '密钥队列满', model_queue_timeout: '等待超时', request_capacity: '普通请求繁忙', heavy_admin_capacity: '重管理请求繁忙', body_read_capacity: '请求体读取繁忙', body_budget_exhausted: '请求体内存不足', shared_queue_full: '用户池队列满', response_buffer_budget: '单请求响应预算不足' } as Record<string,string>)[reason] || reason
-}
 const healthy = computed(() => (ov.value?.accounts || []).filter((a) => a.healthy).length)
 const serving = computed(() => providers.value.some((p) => p.name === 'workbuddy' ? healthy.value > 0 : p.ready))
 const pred = computed(() => ov.value?.prediction)
@@ -94,58 +87,34 @@ onUnmounted(() => timer && clearInterval(timer))
   <WPage title="概览" sub="网关运行状态与额度续航一览。">
     <div v-if="refreshFailed" class="mb-4 text-small text-warn">刷新失败，当前显示上次获取的数据。</div>
     <WCard v-if="ov?.admission" class="mb-4">
-      <div class="flex flex-wrap gap-4 text-small">
-        <span>模型执行 {{ ov.admission.running }}<template v-if="ov.admission.limits_disabled"> · 无本地并发限制</template><template v-else> / {{ ov.admission.capacity }}（硬上限）</template></span>
-        <span v-if="ov.admission.shared_capacity != null">用户池 {{ ov.admission.shared_running }} / {{ ov.admission.shared_capacity }}</span>
-        <span v-if="ov.admission.buffer_budget_bytes">响应预留 {{ ((ov.admission.buffer_reserved_bytes || 0) / 1048576).toFixed(0) }} / {{ (ov.admission.buffer_budget_bytes / 1048576).toFixed(0) }} MiB</span>
-        <span v-if="!ov.admission.limits_disabled && ov.admission.memory_pressure" class="text-warn">内存压力保护中，新请求等待恢复</span>
-        <span v-if="!ov.admission.limits_disabled">排队 {{ ov.admission.queued }} / {{ ov.admission.queue_capacity }}</span>
-        <span>最长等待 {{ (ov.admission.oldest_wait_ms / 1000).toFixed(1) }} 秒</span>
-        <span>请求体占用 {{ ((ov.request_body_bytes || 0) / 1048576).toFixed(1) }} MiB</span>
-      </div>
-      <div v-if="ov.admission.queued && ov.admission.waiting_reasons" class="mt-2 text-small text-faint">
-        当前等待：{{ Object.entries(ov.admission.waiting_reasons).map(([reason, count]) => `${waitingLabel(reason)} ${count}`).join(' · ') }}
-      </div>
-      <div v-if="Object.keys(ov.admission.rejected).length" class="mt-2 text-small text-faint">
-        本次启动以来的容量拒绝：{{ Object.entries(ov.admission.rejected).map(([reason, count]) => `${rejectionLabel(reason)} ${count}`).join(' · ') }}
-      </div>
+      <span class="text-small text-muted">正在执行 <span class="mono font-medium text-ink">{{ ov.admission.running }}</span> 个请求</span>
+      <p v-if="!ov.admission.limits_disabled && ov.admission.memory_pressure" class="mt-2 text-small text-warn">内存压力保护中，请求等待恢复。</p>
     </WCard>
     <WSpinner v-if="loading" center label="加载中" />
     <WCard v-if="ov?.call_metrics" class="mb-4" title="最近一小时调用">
-      <div class="flex flex-wrap gap-4 text-small">
-        <span>请求 {{ ov.call_metrics.requests }} · 失败 {{ ov.call_metrics.errors }} · 输出未完成 {{ ov.call_metrics.incomplete }}</span>
-        <span>上游尝试 {{ ov.call_metrics.attempts }} · 上游 429 {{ ov.call_metrics.upstream_429 }}</span>
-        <span>等待 P95 ≤ {{ ov.call_metrics.wait_p95_ms == null ? '—' : ov.call_metrics.wait_p95_ms + ' ms' }}</span>
-        <span>排队 / 账号等待 P95 ≤ {{ ov.call_metrics.queue_p95_ms ?? '—' }} / {{ ov.call_metrics.account_wait_p95_ms ?? '—' }} ms</span>
-        <span>执行阶段 P95 ≤ {{ ov.call_metrics.execution_p95_ms == null ? '—' : ov.call_metrics.execution_p95_ms + ' ms' }}</span>
-        <span>首响应 P95 ≤ {{ ov.call_metrics.first_byte_p95_ms == null ? '—' : ov.call_metrics.first_byte_p95_ms + ' ms' }}</span>
-        <span>总耗时 P95 ≤ {{ ov.call_metrics.total_p95_ms == null ? '—' : ov.call_metrics.total_p95_ms + ' ms' }}</span>
-      </div>
-      <p class="mt-2 text-micro text-faint">P95 为固定区间估算；首响应指首字节，包含等待与协议初始化，非模型首个 token。重启后重新统计。</p>
-      <details v-if="ov.call_metrics.recent?.some(call => call.attempt_stages?.length)" class="mt-3 text-small text-muted">
-        <summary class="cursor-pointer">最近调用的连接与重试记录</summary>
-        <div v-for="call in ov.call_metrics.recent.slice(0, 8)" :key="call.request_id" class="mt-2">
-          <span class="mono">{{ call.request_id.slice(0, 12) }}</span> · {{ call.attempts }} 次尝试 · HTTP {{ call.http_status }}
-          <div v-for="stage in call.attempt_stages" :key="stage.number" class="ml-3 text-micro text-faint">
-            第 {{ stage.number }} 次：{{ stage.headers_finished ? `连接/响应头 ${stage.header_wait_ms} ms · ${stage.http_status ? 'HTTP ' + stage.http_status : '连接失败'}` : '响应头阶段未完成' }}
-          </div>
-          <div v-if="call.attempts > (call.attempt_stages?.length || 0)" class="ml-3 text-micro text-faint">仅保留前 16 次尝试的阶段记录</div>
-        </div>
-        <p class="mt-2 text-micro text-faint">响应头耗时不包含完整生成时间；请求正文与凭据不进入这些记录。</p>
+      <div class="flex flex-wrap gap-4 text-small"><span>请求 {{ ov.call_metrics.requests }}</span><span>失败 {{ ov.call_metrics.errors }}</span><span>输出未完成 {{ ov.call_metrics.incomplete }}</span></div>
+      <details class="mt-3 text-small text-muted"><summary class="cursor-pointer">调用诊断</summary>
+        <div class="mt-2 flex flex-wrap gap-x-5 gap-y-2">
+          <span>上游尝试 {{ ov.call_metrics.attempts }}</span><span>上游限流 {{ ov.call_metrics.upstream_429 }}</span>
+          <span>等待 P95 ≤ {{ ov.call_metrics.wait_p95_ms == null ? '—' : ov.call_metrics.wait_p95_ms + ' ms' }}</span>
+          <span>上游执行 P95 ≤ {{ ov.call_metrics.execution_p95_ms == null ? '—' : ov.call_metrics.execution_p95_ms + ' ms' }}</span>
+          <span title="首字节，可能是协议事件；不是模型首生成">首响应 P95 ≤ {{ ov.call_metrics.first_byte_p95_ms == null ? '—' : ov.call_metrics.first_byte_p95_ms + ' ms' }}</span>
+          <span>总耗时 P95 ≤ {{ ov.call_metrics.total_p95_ms == null ? '—' : ov.call_metrics.total_p95_ms + ' ms' }}</span>
+        </div><p class="mt-2 text-micro text-faint">P95 为区间估算，统计随服务重启重新开始。逐次尝试见调用日志详情。</p>
       </details>
     </WCard>
     <WCard v-if="ov?.resource_metrics" class="mb-4">
       <details class="text-small">
         <summary class="cursor-pointer text-muted">资源与日志维护</summary>
         <dl class="mt-3 grid gap-x-6 gap-y-3 sm:grid-cols-2 lg:grid-cols-3">
-          <div><dt class="text-micro text-faint">Go 内存 / 堆对象</dt><dd class="mono mt-1">{{ memorySize(ov.resource_metrics.go_memory_in_use_bytes) }} / {{ memorySize(ov.resource_metrics.heap_objects_bytes) }}</dd></div>
+          <div><dt class="text-micro text-faint" title="Go 运行时内存，不等于进程或整机内存">Go 内存 / 堆对象</dt><dd class="mono mt-1">{{ memorySize(ov.resource_metrics.go_memory_in_use_bytes) }} / {{ memorySize(ov.resource_metrics.heap_objects_bytes) }}</dd></div>
           <div><dt class="text-micro text-faint">请求体内存 / Goroutines</dt><dd class="mono mt-1">{{ memorySize(ov.resource_metrics.request_body_bytes) }} / {{ int(ov.resource_metrics.goroutines) }}</dd></div>
           <div><dt class="text-micro text-faint">数据库 / WAL</dt><dd class="mono mt-1">{{ memorySize(ov.resource_metrics.database_bytes) }} / {{ memorySize(ov.resource_metrics.wal_bytes) }}</dd></div>
           <div><dt class="text-micro text-faint">日志写入平均耗时 / 失败</dt><dd class="mono mt-1">{{ ov.resource_metrics.usage.write_average_ms.toFixed(2) }} ms / {{ int(ov.resource_metrics.usage.write_errors) }}</dd></div>
           <div><dt class="text-micro text-faint">日志维护</dt><dd class="mt-1">{{ ov.resource_metrics.usage.maintenance_running ? '进行中' : '空闲' }} · {{ int(ov.resource_metrics.usage.maintenance_runs) }} 次 · 失败 {{ int(ov.resource_metrics.usage.maintenance_errors) }}</dd></div>
           <div><dt class="text-micro text-faint">上次维护耗时</dt><dd class="mono mt-1">{{ ov.resource_metrics.usage.maintenance_runs ? ov.resource_metrics.usage.maintenance_last_ms + ' ms' : '—' }}</dd></div>
         </dl>
-        <p class="mt-3 text-micro text-faint">资源采样缓存 10 秒，计数随服务重启重置；Go 内存不等于进程或整机占用。写入耗时包含锁等待，维护耗时包含分批清理。</p>
+
       </details>
     </WCard>
     <template v-if="ov">
@@ -177,7 +146,7 @@ onUnmounted(() => timer && clearInterval(timer))
               {{ pred?.predicted_tokens != null ? abbr(pred.predicted_tokens, 2) : '—' }}
             </div>
             <div class="mt-2 flex flex-wrap gap-x-6 gap-y-1 text-small text-muted">
-              <span>已知付费余额估算 · 覆盖 {{ pred?.estimated_pools ?? 0 }}/{{ pred?.total_pools ?? 0 }} 个账号计费池</span>
+              <span>按近期付费调用估算</span>
               <BudgetDetails :prediction="pred" />
             </div>
           </div>
@@ -185,7 +154,7 @@ onUnmounted(() => timer && clearInterval(timer))
 
         <div class="grid grid-cols-2 gap-4">
           <WStat label="可用渠道" :value="`${providers.filter((p) => p.name === 'workbuddy' ? healthy > 0 : p.ready).length}/${providers.length}`" :tone="serving ? 'live' : 'fault'" />
-          <WStat label="模型数" :value="int(ov?.model_count)" tone="route" :sub="ov?.model_source === 'providers' ? '全部渠道目录' : ov?.model_source === 'dynamic' ? '上游实时' : '内置'" />
+          <WStat label="模型数" :value="int(ov?.model_count)" tone="route" />
           <WStat label="今日请求" :value="int(ov?.usage?.today_requests)" tone="brand" />
           <WStat label="今日 Tokens" :value="abbr(ov?.usage?.today_tokens)" />
         </div>

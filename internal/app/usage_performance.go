@@ -41,6 +41,16 @@ func (s *Server) persistUsageTiming(rows *usageTimingRows, t streamwatch.TimingS
 		ms := t.FirstByte.Milliseconds()
 		value.FirstByteMS = &ms
 	}
+	if t.GenerationEvents > 0 {
+		first := t.FirstGeneration.Milliseconds()
+		value.FirstGenerationMS = &first
+		if t.GenerationEvents > 1 {
+			ms := (t.LastGeneration - t.FirstGeneration).Milliseconds()
+			if ms > 0 {
+				value.GenerationMS = &ms
+			}
+		}
+	}
 	if t.Attempts > 0 {
 		ms := max(int64(0), (duration - t.FirstAttempt - (t.Queue + t.Account - t.WaitAtAttempt)).Milliseconds())
 		value.ExecutionMS = &ms

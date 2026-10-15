@@ -60,94 +60,22 @@ func (e *SOLOStreamError) Kind() ErrKind {
 }
 func ParseSOLOLine(eventName, dataLine string) (*SOLOEvent, error) {
 	ev := &SOLOEvent{Event: strings.TrimSpace(eventName)}
-	trimmed := strings.TrimSpace(dataLine)
-	if trimmed == "" {
+	if strings.TrimSpace(dataLine) == "" {
 		return ev, nil
 	}
-	if trimmed == "[DONE]" {
-		if ev.Event == "" {
-			ev.Event = "done"
-		}
-		if ev.Event == "done" && ev.FinishReason == "" {
-			ev.FinishReason = "stop"
+	// A known control heartbeat may carry a JSON string. Do not extend this
+	// exemption to output/error/done or accept malformed JSON as model text.
+	if ev.Event == "progress_notice" {
+		var heartbeat any
+		if err := json.Unmarshal([]byte(dataLine), &heartbeat); err != nil {
+			return nil, err
 		}
 		return ev, nil
 	}
 	var raw map[string]any
-	if err := json.Unmarshal([]byte(trimmed), &raw); err != nil {
-		// Payloads that open with { or [ meant to be structured data: a
-		// parse failure there is corruption, not a shape variant, and must
-		// still fail the stream. Bare strings and other primitives fall
-		// through to the tolerant path below.
-		if strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") {
-			return nil, err
-		}
-		return parseNonObjectSOLOData(ev, trimmed), nil
+	if err := json.Unmarshal([]byte(dataLine), &raw); err != nil {
+		return nil, err
 	}
-	applySOLOData(ev, raw)
-	return ev, nil
-}
-
-// parseNonObjectSOLOData handles SSE data payloads that are not JSON objects.
-// Some models (e.g. doubao-seed-2.1-turbo) emit a bare JSON string on control
-// events; failing the whole stream on that shape mismatch turns a healthy
-// long-context reply into a 502. Unwrap one string layer and map the result
-// onto the event; unknown shapes are skipped without an error so the reader
-// advances to the next event.
-func parseNonObjectSOLOData(ev *SOLOEvent, trimmed string) *SOLOEvent {
-	var s string
-	if err := json.Unmarshal([]byte(trimmed), &s); err != nil {
-		plain := strings.TrimSpace(trimmed)
-		if plain == "[DONE]" {
-			if ev.Event == "" {
-				ev.Event = "done"
-			}
-			if ev.Event == "done" {
-				ev.FinishReason = "stop"
-			}
-			return ev
-		}
-		switch ev.Event {
-		case "output":
-			ev.Response = plain
-		case "error":
-			ev.ErrorMessage = plain
-		}
-		return ev
-	}
-	inner := strings.TrimSpace(s)
-	if inner == "" {
-		return ev
-	}
-	if inner == "[DONE]" {
-		if ev.Event == "" {
-			ev.Event = "done"
-		}
-		if ev.Event == "done" {
-			ev.FinishReason = "stop"
-		}
-		return ev
-	}
-	var innerRaw map[string]any
-	if err := json.Unmarshal([]byte(inner), &innerRaw); err == nil {
-		applySOLOData(ev, innerRaw)
-		return ev
-	}
-	switch ev.Event {
-	case "output":
-		ev.Response = s
-	case "error":
-		ev.ErrorMessage = s
-	case "done":
-		ev.FinishReason = s
-		if ev.FinishReason == "" {
-			ev.FinishReason = "stop"
-		}
-	}
-	return ev
-}
-
-func applySOLOData(ev *SOLOEvent, raw map[string]any) {
 	switch ev.Event {
 	case "output":
 		if v, ok := raw["response"].(string); ok {
@@ -178,4 +106,5 @@ func applySOLOData(ev *SOLOEvent, raw map[string]any) {
 			ev.ErrorMessage, _ = raw["msg"].(string)
 		}
 	}
+	return ev, nil
 }

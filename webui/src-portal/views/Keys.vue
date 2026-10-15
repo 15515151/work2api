@@ -154,7 +154,7 @@ async function saveModels(k: KeyInfo, selected: string[], policy: "follow" | "fi
             <span class="h-2 w-2 rounded-full" :class="k.enabled ? 'bg-live' : 'bg-faint'" />
             <span class="font-medium">{{ k.name }}</span>
             <code class="mono text-micro text-faint">{{ k.key_prefix }}</code>
-            <span class="mono ml-auto text-micro text-muted">{{ fmtTokens(k.tokens_known === false ? null : k.tokens) }} tokens · {{ k.requests }} 次</span>
+            <span class="mono ml-auto text-micro text-muted" :title="k.tokens_known === false ? '已记录的 Tokens 合计；部分请求未上报用量' : ''">{{ fmtTokens(k.tokens) }} tokens · {{ k.requests }} 次</span>
           </div>
           <div class="mt-2 flex flex-wrap items-center gap-3 text-micro text-faint">
             <span>创建于 {{ fmtTime(k.created_at) }}</span>

@@ -515,10 +515,35 @@ func routeOpaqueContinuation(payload map[string]any) bool {
 }
 
 func cloneRoutePayload(body map[string]any) map[string]any {
-	raw, _ := json.Marshal(body)
-	var out map[string]any
-	_ = json.Unmarshal(raw, &out)
+	if body == nil {
+		return nil
+	}
+	out := make(map[string]any, len(body))
+	for key, value := range body {
+		out[key] = cloneRouteValue(value)
+	}
 	return out
+}
+
+// Route inputs have already been decoded as JSON. Copy mutable containers so
+// adapters cannot change another attempt's history; immutable strings can share
+// their backing storage without re-encoding the entire conversation.
+func cloneRouteValue(value any) any {
+	switch value := value.(type) {
+	case map[string]any:
+		return cloneRoutePayload(value)
+	case []any:
+		if value == nil {
+			return []any(nil)
+		}
+		out := make([]any, len(value))
+		for i, item := range value {
+			out[i] = cloneRouteValue(item)
+		}
+		return out
+	default:
+		return value
+	}
 }
 
 func (s *Server) dispatchModelRoute(w http.ResponseWriter, r *http.Request, proto provider.Protocol, payload map[string]any, p *Principal) bool {

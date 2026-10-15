@@ -2,11 +2,13 @@
 import { computed } from 'vue'
 const props = defineProps<{ selected: string[]; results: string[]; selectable?: string[]; disabled?: boolean }>()
 const emit = defineEmits<{ 'update:selected': [value: string[]] }>()
-const eligible = computed(() => [...new Set(props.results)].filter(m => !props.selectable || props.selectable.includes(m)))
-const selectedResults = computed(() => props.selected.filter(m => props.results.includes(m)))
-const allSelected = computed(() => eligible.value.length > 0 && eligible.value.every(m => props.selected.includes(m)))
+const resultSet = computed(() => new Set(props.results))
+const selectedSet = computed(() => new Set(props.selected))
+const eligible = computed(() => { const selectable = props.selectable ? new Set(props.selectable) : null; return [...resultSet.value].filter(m => !selectable || selectable.has(m)) })
+const selectedResults = computed(() => props.selected.filter(m => resultSet.value.has(m)))
+const allSelected = computed(() => eligible.value.length > 0 && eligible.value.every(m => selectedSet.value.has(m)))
 function selectResults() { if (!props.disabled) emit('update:selected', [...new Set([...props.selected, ...eligible.value])]) }
-function removeResults() { if (!props.disabled) emit('update:selected', props.selected.filter(m => !props.results.includes(m))) }
+function removeResults() { if (!props.disabled) emit('update:selected', props.selected.filter(m => !resultSet.value.has(m))) }
 function clearAll() { if (!props.disabled) emit('update:selected', []) }
 </script>
 <template>

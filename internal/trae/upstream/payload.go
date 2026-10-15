@@ -10,12 +10,19 @@ func PrepareBody(src []byte, variant string) []byte {
 	return PrepareBodyResolved(src, variant, "")
 }
 func PrepareBodyResolved(src []byte, variant, resolvedModel string) []byte {
+	body, _ := PrepareBodyResolvedWithLimits(src, variant, resolvedModel)
+	return body
+}
+
+// Capture effective limits from the same object that produces the wire body;
+// callers must not prepare and decode the entire conversation again for logs.
+func PrepareBodyResolvedWithLimits(src []byte, variant, resolvedModel string) ([]byte, map[string]int) {
 	if len(src) == 0 {
-		return src
+		return src, nil
 	}
 	var obj map[string]any
 	if err := json.Unmarshal(src, &obj); err != nil {
-		return src
+		return src, nil
 	}
 	obj["stream"] = true
 	obj["function"] = FunctionFor(variant)
@@ -28,6 +35,9 @@ func PrepareBodyResolved(src []byte, variant, resolvedModel string) []byte {
 			}
 			if message["role"] == "developer" {
 				message["role"] = "system"
+			}
+			if message["role"] == "assistant" && message["content"] == nil {
+				message["content"] = ""
 			}
 			if calls, ok := message["tool_calls"].([]any); ok {
 				for _, item := range calls {
@@ -90,9 +100,13 @@ func PrepareBodyResolved(src []byte, variant, resolvedModel string) []byte {
 	}
 	b, err := json.Marshal(out)
 	if err != nil {
-		return src
+		return src, nil
 	}
-	return b
+	var limits map[string]int
+	if n, ok := out["max_tokens"].(float64); ok && n > 0 && n <= 1<<30 && n == float64(int(n)) {
+		limits = map[string]int{"max_tokens": int(n)}
+	}
+	return b, limits
 }
 func SanitizeModelName(model, variant string) string { return strings.TrimSpace(model) }
 

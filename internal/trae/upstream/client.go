@@ -295,6 +295,11 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte, resolvedModel string) (rc
 }
 func (c *Client) ChatStreamWithHeaders(a *auth.Auth, body []byte, resolvedModel string) (rc io.ReadCloser, status int, respBody []byte, headers http.Header, err error) {
 	prepared := PrepareBodyResolved(body, a.Variant, resolvedModel)
+	return c.ChatPreparedStreamWithHeaders(a, prepared)
+}
+
+// prepared is request-local and already normalized for this identity/model.
+func (c *Client) ChatPreparedStreamWithHeaders(a *auth.Auth, prepared []byte) (rc io.ReadCloser, status int, respBody []byte, headers http.Header, err error) {
 	req, err := http.NewRequest(http.MethodPost, c.agentBase()+EpChat, bytes.NewReader(prepared))
 	if err != nil {
 		return nil, 0, nil, nil, err
