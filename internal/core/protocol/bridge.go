@@ -115,7 +115,11 @@ func ConvertRequest(from, to Protocol, input map[string]any) (map[string]any, er
 	if from == to {
 		return jsonutil.CloneMap(input), nil
 	}
-	request, err := decodeBridgeRequest(from, input)
+	filtered, err := FunctionToolSubset(input, from)
+	if err != nil {
+		return nil, err
+	}
+	request, err := decodeBridgeRequest(from, filtered)
 	if err != nil {
 		return nil, err
 	}

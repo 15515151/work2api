@@ -1067,3 +1067,84 @@ func encodeAnthropicRequest(request bridgeRequest) map[string]any {
 	}
 	return output
 }
+
+// FunctionToolSubset drops unavailable optional tools only. Tools which need
+// reversible lowering must be prepared by PrepareClientTools first.
+func FunctionToolSubset(input map[string]any, from Protocol) (map[string]any, error) {
+	if from != Chat && from != Responses {
+		return input, nil
+	}
+	rawTools, exists := input["tools"]
+	tools, ok := rawTools.([]any)
+	if exists && rawTools != nil && !ok {
+		return nil, fmt.Errorf("tools must be an array")
+	}
+	var kept []any
+	dropped := false
+	count := 0
+	for i, raw := range tools {
+		tool, ok := raw.(map[string]any)
+		kind := jsonutil.StringAt(tool, "type")
+		if !ok || kind == "" {
+			return nil, fmt.Errorf("tools[%d] must specify a type", i)
+		}
+		if kind == "namespace" || kind == "custom" {
+			return nil, fmt.Errorf("tools[%d] requires client tool preparation", i)
+		}
+		if kind != "function" {
+			if !dropped {
+				kept = append([]any{}, tools[:i]...)
+				dropped = true
+			}
+			continue
+		}
+		count++
+		if dropped {
+			kept = append(kept, raw)
+		}
+	}
+	switch choice := input["tool_choice"].(type) {
+	case string:
+		if choice == "required" && count == 0 {
+			return nil, fmt.Errorf("tool_choice requires an available tool")
+		}
+	case map[string]any:
+		kind := jsonutil.StringAt(choice, "type")
+		if kind == "function" {
+			name := jsonutil.StringAt(choice, "name")
+			if from == Chat {
+				name = jsonutil.StringAt(choice, "function", "name")
+			}
+			found := false
+			for _, raw := range tools {
+				tool, _ := raw.(map[string]any)
+				candidate := jsonutil.StringAt(tool, "name")
+				if from == Chat {
+					candidate = jsonutil.StringAt(tool, "function", "name")
+				}
+				if tool["type"] == "function" && name != "" && name == candidate {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return nil, fmt.Errorf("tool_choice selects an unavailable function")
+			}
+		} else if kind != "auto" && kind != "none" && kind != "" {
+			return nil, fmt.Errorf("tool_choice selects an unsupported tool type: %s", kind)
+		}
+	}
+	if !dropped {
+		return input, nil
+	}
+	out := make(map[string]any, len(input))
+	for k, v := range input {
+		out[k] = v
+	}
+	if len(kept) == 0 {
+		delete(out, "tools")
+	} else {
+		out["tools"] = kept
+	}
+	return out, nil
+}

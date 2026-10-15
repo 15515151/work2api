@@ -750,6 +750,127 @@ func TestNativeStreamCompletion(t *testing.T) {
 	}
 }
 
+// Codex aborts the turn with "failed to parse ResponseCompleted: missing field
+// `cached_tokens`" when the Responses usage object carries an empty
+// input_tokens_details, which is what an upstream without cache reporting
+// produced. An upstream may omit cache or reasoning counters, so the detail
+// objects must be omitted rather than sent empty.
+func TestResponsesUsageOmitsUnreportedDetails(t *testing.T) {
+	input := "event: output\ndata: {\"response\":\"answer\"}\n\nevent: token_usage\ndata: {\"prompt_tokens\":12,\"completion_tokens\":7,\"total_tokens\":19}\n\nevent: done\ndata: {\"finish_reason\":\"stop\"}\n\n"
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%v", stream), func(t *testing.T) {
+			r := fixtureRuntime(t, func(w http.ResponseWriter, req *http.Request) {
+				io.WriteString(w, input)
+			})
+			identity := &auth.Auth{UID: "fixture-user", Variant: "cn", AccessToken: "fixture"}
+			r.accounts[accountID("fixture-user")] = &accountState{Auth: identity, Enabled: true, Identities: map[string]*auth.Auth{"cn": identity}, Catalogs: map[string][]upstream.ModelInfo{"cn": {{ID: "m", Name: "Model"}}}}
+			w := httptest.NewRecorder()
+			report, err := r.Serve(context.Background(), provider.ServeRequest{
+				Writer:   w,
+				Protocol: provider.ProtocolResponses,
+				Payload:  map[string]any{"model": "trae/m", "stream": stream, "input": []any{map[string]any{"role": "user", "content": "hi"}}},
+			})
+			if err != nil || report.Status != "ok" {
+				t.Fatalf("status=%s err=%v", report.Status, err)
+			}
+			for _, usage := range responsesUsages(t, w.Body.Bytes(), stream) {
+				if _, present := usage["input_tokens_details"]; present {
+					t.Fatalf("empty input_tokens_details breaks Codex: %v", usage)
+				}
+				if _, present := usage["output_tokens_details"]; present {
+					t.Fatalf("unreported reasoning detail emitted: %v", usage)
+				}
+				if usage["input_tokens"] != float64(12) || usage["output_tokens"] != float64(7) || usage["total_tokens"] != float64(19) {
+					t.Fatalf("token totals changed: %v", usage)
+				}
+			}
+		})
+	}
+}
+
+// responsesUsages collects every usage object carried by a Responses reply,
+// streaming or not. Only the terminal events carry usage, so earlier stream
+// events are skipped.
+func responsesUsages(t *testing.T, body []byte, stream bool) []map[string]any {
+	t.Helper()
+	var usages []map[string]any
+	collect := func(document map[string]any) {
+		usage, ok := document["usage"].(map[string]any)
+		if !ok {
+			return
+		}
+		usages = append(usages, usage)
+	}
+	if !stream {
+		var document map[string]any
+		if err := json.Unmarshal(body, &document); err != nil {
+			t.Fatal(err)
+		}
+		collect(document)
+		if len(usages) == 0 {
+			t.Fatalf("missing usage in %s", body)
+		}
+		return usages
+	}
+	for _, frame := range strings.Split(string(body), "\n\n") {
+		data := ""
+		for _, line := range strings.Split(frame, "\n") {
+			if strings.HasPrefix(line, "data: ") {
+				data = strings.TrimPrefix(line, "data: ")
+			}
+		}
+		if data == "" || data == "[DONE]" {
+			continue
+		}
+		var event map[string]any
+		if err := json.Unmarshal([]byte(data), &event); err != nil {
+			t.Fatal(err)
+		}
+		if response, ok := event["response"].(map[string]any); ok {
+			collect(response)
+		}
+	}
+	if len(usages) == 0 {
+		t.Fatalf("no usage-bearing events in %s", body)
+	}
+	return usages
+}
+
+// The upstream interleaves progress_notice heartbeats whose data payload is a
+// bare JSON string instead of an object. Parsing used to fail hard on those
+// frames, which aborted an otherwise healthy turn with a 502. The heartbeat
+// must be skipped while the answer that follows it still reaches the client.
+func TestNativeProgressNoticeHeartbeatIsSkipped(t *testing.T) {
+	input := "event: progress_notice\ndata: \"Processing_1791806915\"\n\nevent: output\ndata: {\"response\":\"answer\"}\n\nevent: token_usage\ndata: {\"prompt_tokens\":9,\"completion_tokens\":2,\"total_tokens\":11}\n\nevent: done\ndata: {\"finish_reason\":\"stop\"}\n\n"
+	events := newEvents(strings.NewReader(input))
+	first, err := events.next()
+	if err != nil {
+		t.Fatalf("heartbeat aborted the stream: %v", err)
+	}
+	if first.Event != "progress_notice" || first.Response != "" {
+		t.Fatalf("heartbeat parsed as output: %+v", first)
+	}
+	var stream bytes.Buffer
+	if err = normalizeStream(&stream, events, first, "trae/test", nil); err != nil {
+		t.Fatal(err)
+	}
+	reply, usage, known, err := protocol.CollapseStreamWithUsage(&stream, protocol.Chat, "trae/test")
+	if err != nil || !known || usage.Input != 9 || usage.Output != 2 {
+		t.Fatalf("usage=%+v known=%v err=%v", usage, known, err)
+	}
+	if !bytes.Contains(reply, []byte("answer")) {
+		t.Fatalf("answer lost after heartbeat: %s", reply)
+	}
+}
+
+// Corrupt JSON is still a hard failure; only well-formed non-object frames are
+// skipped.
+func TestNativeMalformedFrameStillFails(t *testing.T) {
+	events := newEvents(strings.NewReader("event: progress_notice\ndata: {not-json}\n\n"))
+	if _, err := events.next(); err == nil {
+		t.Fatal("malformed frame accepted")
+	}
+}
 func TestPreparedTraeLimitsMatchWireAndBoundMultilineEvents(t *testing.T) {
 	input := []byte(`{"model":"m","max_tokens":77,"messages":[{"role":"user","content":"hello"}]}`)
 	wire, limits := upstream.PrepareBodyResolvedWithLimits(input, "solo", "m")
@@ -822,5 +943,22 @@ func TestFirstEventDiagnosticsKeepCategoriesWithoutRawContent(t *testing.T) {
 		if got := firstEventFailure(tc.err); got != tc.want {
 			t.Fatal(got, tc.want)
 		}
+	}
+}
+
+func TestTraeNullAssistantNormalizationStaysAtBoundary(t *testing.T) {
+	input := []byte(`{"model":"m","messages":[{"role":"assistant","content":null,"tool_calls":[{"id":"a","type":"function","function":{"name":"echo","arguments":"{}"}}]}]}`)
+	wire := upstream.PrepareBodyResolved(input, "solo", "m")
+	var body map[string]any
+	if err := json.Unmarshal(wire, &body); err != nil {
+		t.Fatal(err)
+	}
+	message := body["messages"].([]any)[0].(map[string]any)
+	blocks, ok := message["content"].([]any)
+	if !ok || len(blocks) != 1 || blocks[0].(map[string]any)["text"] != "" {
+		t.Fatal("null assistant not normalized", message)
+	}
+	if !bytes.Contains(wire, []byte(`"function_call"`)) || !bytes.Contains(input, []byte(`"content":null`)) {
+		t.Fatal("tool history/input changed", string(wire))
 	}
 }

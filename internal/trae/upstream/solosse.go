@@ -61,7 +61,16 @@ func (e *SOLOStreamError) Kind() ErrKind {
 
 func ParseSOLOLine(eventName, dataLine string) (*SOLOEvent, error) {
 	ev := &SOLOEvent{Event: strings.TrimSpace(eventName)}
-	if dataLine == "" {
+	if strings.TrimSpace(dataLine) == "" {
+		return ev, nil
+	}
+	// A known control heartbeat may carry a JSON string. Do not extend this
+	// exemption to output/error/done or accept malformed JSON as model text.
+	if ev.Event == "progress_notice" {
+		var heartbeat any
+		if err := json.Unmarshal([]byte(dataLine), &heartbeat); err != nil {
+			return nil, err
+		}
 		return ev, nil
 	}
 	var raw map[string]any

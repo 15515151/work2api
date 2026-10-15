@@ -36,6 +36,9 @@ func PrepareBodyResolvedWithLimits(src []byte, variant, resolvedModel string) ([
 			if message["role"] == "developer" {
 				message["role"] = "system"
 			}
+			if message["role"] == "assistant" && message["content"] == nil {
+				message["content"] = ""
+			}
 			if calls, ok := message["tool_calls"].([]any); ok {
 				for _, item := range calls {
 					if call, ok := item.(map[string]any); ok {
