@@ -32,6 +32,35 @@ func TestSessionAffinityIsolatedByUserAndModel(t *testing.T) {
 	}
 }
 
+func TestResponsesSessionFallbackPreservesOriginalIdentity(t *testing.T) {
+	first := map[string]any{"role": "user", "content": "first request"}
+	want := extractSessionKey(map[string]any{"messages": []any{first}})
+	for _, input := range []any{
+		"first request",
+		[]any{first},
+		[]any{map[string]any{"type": "function_call_output", "role": "user", "content": "tool result"}, map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "first request"}}}, map[string]any{"role": "assistant", "content": "answer"}, map[string]any{"role": "user", "content": "next turn"}},
+	} {
+		body := map[string]any{"input": input}
+		if got := extractSessionKey(body); got != want {
+			t.Fatalf("Responses fallback mismatch: %s != %s", got, want)
+		}
+		p := &Principal{UserID: 1, AppID: 7}
+		r := withRequestSessionIdentity(httptest.NewRequest("POST", "/v1/responses", nil), body)
+		if requestSessionKey(r, p, "model", nil) != scopedSessionKey(p, "model", want) {
+			t.Fatal("original identity lost after conversion")
+		}
+		body["metadata"] = map[string]any{"session_id": "explicit"}
+		if got := extractSessionKey(body); got != "sid:explicit" {
+			t.Fatal("fallback overrode explicit identity", got)
+		}
+	}
+	for _, input := range []any{" ", []any{map[string]any{"type": "function_call_output", "output": "not a conversation"}}, []any{map[string]any{"role": "assistant", "content": "answer"}}, []any{map[string]any{"role": "user", "content": []any{map[string]any{"type": "input_image", "text": "not user text"}}}}} {
+		if got := extractSessionKey(map[string]any{"input": input}); got != "" {
+			t.Fatal("invented a session from non-user text", got)
+		}
+	}
+}
+
 func TestRequestSessionIdentitySurvivesChangedMessagesAndConversion(t *testing.T) {
 	principal := &Principal{UserID: 1, AppID: 7}
 	body := map[string]any{"messages": []any{map[string]any{"role": "user", "content": "first"}}, "metadata": map[string]any{"conversation_id": "body-session"}}
