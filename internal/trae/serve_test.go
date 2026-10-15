@@ -931,6 +931,21 @@ func TestNativeToolHistoryAndOutput(t *testing.T) {
 	}
 }
 
+func TestFirstEventDiagnosticsKeepCategoriesWithoutRawContent(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want string
+	}{
+		{errTraeEmptyReply, "empty_reply"}, {io.ErrUnexpectedEOF, "unexpected_eof"}, {context.Canceled, "cancelled"},
+		{context.DeadlineExceeded, "timeout"}, {&json.SyntaxError{}, "invalid_json"}, {&json.UnmarshalTypeError{}, "invalid_event_shape"},
+		{errors.New("private upstream request body"), "stream_read_error"},
+	} {
+		if got := firstEventFailure(tc.err); got != tc.want {
+			t.Fatal(got, tc.want)
+		}
+	}
+}
+
 func TestTraeNullAssistantNormalizationStaysAtBoundary(t *testing.T) {
 	input := []byte(`{"model":"m","messages":[{"role":"assistant","content":null,"tool_calls":[{"id":"a","type":"function","function":{"name":"echo","arguments":"{}"}}]}]}`)
 	wire := upstream.PrepareBodyResolved(input, "solo", "m")

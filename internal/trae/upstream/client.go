@@ -83,20 +83,12 @@ func bizError(code int32, prefix, upstreamMsg string) *Error {
 	return &Error{Kind: kind, Msg: msg, BizCode: code}
 }
 
-var sessionDeadMarkers = []string{"login", "token 失效", "token invalid", "session", "unauthorized", "401"}
+// Require explicit input/context size language, not token-rate or queue limits.
 var inputTooLargeMarkers = []string{
-	"too long",
-	"too many tokens",
-	"context length",
-	"maximum context",
-	"context window",
-	"request entity too large",
-	"input too large",
-	"输入过长",
-	"内容过长",
-	"上下文过长",
-	"上下文长度",
-	"超出模型上限",
+	"context length", "maximum context", "context window", "request entity too large",
+	"input too large", "input too long", "prompt too long", "message too long",
+	"messages too long", "history too long", "request payload too large", "request body too large",
+	"输入过长", "内容过长", "上下文过长", "上下文长度", "超出模型上限",
 }
 
 func MsgIndicatesInputTooLarge(s string) bool {
@@ -114,28 +106,24 @@ func Classify(status int, body string) ErrKind {
 	if status == http.StatusRequestEntityTooLarge {
 		return ErrInputTooLarge
 	}
+	// Explicit transport status wins over incidental words in an error message.
+	if status == http.StatusUnauthorized {
+		return ErrSessionDead
+	}
+	if status == http.StatusTooManyRequests {
+		return ErrSoftRate
+	}
 	if code == 1005 || (strings.Contains(body, "1005") && strings.Contains(lower, "plan")) {
 		return ErrPlanLimit
 	}
 	if code == 4008 || status == http.StatusPaymentRequired {
 		return ErrPlanLimit
 	}
-	if status >= 400 && status < 500 && MsgIndicatesInputTooLarge(body) {
-		return ErrInputTooLarge
-	}
-	if status == http.StatusUnauthorized {
-		for _, m := range sessionDeadMarkers {
-			if strings.Contains(lower, strings.ToLower(m)) {
-				return ErrSessionDead
-			}
-		}
-		return ErrSessionDead
-	}
-	if status == http.StatusTooManyRequests {
-		return ErrSoftRate
-	}
 	if status == http.StatusNotFound {
 		return ErrNotFound
+	}
+	if status >= 400 && MsgIndicatesInputTooLarge(body) {
+		return ErrInputTooLarge
 	}
 	if status >= 500 {
 		return ErrServer

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"strings"
 	"time"
 
@@ -65,6 +66,40 @@ func (r *eventReader) next() (*upstream.SOLOEvent, error) {
 }
 func eventError(e *upstream.SOLOEvent) error {
 	return &upstream.SOLOStreamError{Code: e.ErrorCode, Msg: e.ErrorMessage}
+}
+
+var errTraeEmptyReply = errors.New("Trae 上游返回空回复")
+
+// Record a bounded category, not raw upstream messages or response fragments.
+func firstEventFailure(err error) string {
+	if errors.Is(err, errTraeEmptyReply) {
+		return "empty_reply"
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return "unexpected_eof"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "cancelled"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
+	}
+	if errors.Is(err, streamwatch.ErrSSEEventTooLarge) || errors.Is(err, bufio.ErrTooLong) {
+		return "event_too_large"
+	}
+	var syntax *json.SyntaxError
+	if errors.As(err, &syntax) {
+		return "invalid_json"
+	}
+	var shape *json.UnmarshalTypeError
+	if errors.As(err, &shape) {
+		return "invalid_event_shape"
+	}
+	var timeout interface{ Timeout() bool }
+	if errors.As(err, &timeout) && timeout.Timeout() {
+		return "timeout"
+	}
+	return "stream_read_error"
 }
 
 func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report provider.UsageReport, result error) {
@@ -215,6 +250,7 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 				}
 			}
 			if stream == nil {
+				log.Printf("trae rejection stage=http model=%q status=%d kind=%s code=%d", model, status, kind, upstream.BusinessCode(errorBody))
 				lastRejection = rejectionError(kind, status, upstream.BusinessCode(errorBody))
 				lastRetryDelay = 0
 				if kind == upstream.ErrSoftRate {
@@ -248,7 +284,7 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 				initialUsage = first.Usage
 			}
 			if first.Event == "done" {
-				err = errors.New("Trae 上游返回空回复")
+				err = errTraeEmptyReply
 				break
 			}
 			if first.Response != "" || first.Reasoning != "" || len(first.ToolCalls) > 0 && string(first.ToolCalls) != "null" && string(first.ToolCalls) != "[]" || first.Event == "extra_info" && text(first.Usage["reasoning_content"]) != "" {
@@ -260,6 +296,7 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 			var rejection *upstream.SOLOStreamError
 			if errors.As(err, &rejection) {
 				kind := rejection.Kind()
+				log.Printf("trae rejection stage=first_event model=%q kind=%s code=%d", model, kind, rejection.Code)
 				lastRejection = rejectionError(kind, 0, rejection.Code)
 				lastRetryDelay = 0
 				if kind == upstream.ErrSoftRate {
@@ -271,6 +308,12 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 				}
 				return returnRejection()
 			}
+			if ctx.Err() != nil {
+				return report, ctx.Err()
+			}
+			// Class alone is enough to correlate a parser/transport failure; raw
+			// upstream errors may include request content or credential material.
+			log.Printf("trae rejection stage=first_event model=%q reason=%s error_type=%T", model, firstEventFailure(err), err)
 			return report, err
 		}
 		// Cancellation closes both sides and the HTTP body; no detached reader
