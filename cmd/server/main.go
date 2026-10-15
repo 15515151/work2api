@@ -122,11 +122,11 @@ func main() {
 	executable, _ := os.Executable()
 	executable, _ = filepath.EvalSymlinks(executable)
 	deployment := updateDeployment(executable, currentBuild())
-	updater := selfupdate.New(filepath.Join(cfg.DataDir, ".updates"), executable, currentBuild(), deployment, launchUpdateHelper, func() selfupdate.Plan {
+	updater := selfupdate.New(filepath.Join(cfg.DataDir, ".updates"), executable, currentBuild(), deployment, func(path string) error { return launchUpdateHelper(path, cfg.AdminToken) }, func() selfupdate.Plan {
 		cwd, _ := os.Getwd()
 		_, actualPort, _ := net.SplitHostPort(addr)
 		portNumber, _ := strconv.Atoi(actualPort)
-		canonicalArgs := []string{"-host", cfg.Host, "-port", actualPort, "-strict-port", "-data-dir", cfg.DataDir, "-db", cfg.DBPath, "-admin-token", cfg.AdminToken, "-log-level", cfg.LogLevel}
+		canonicalArgs := []string{"-host", cfg.Host, "-port", actualPort, "-strict-port", "-data-dir", cfg.DataDir, "-db", cfg.DBPath, "-log-level", cfg.LogLevel}
 		return selfupdate.Plan{BindHost: cfg.Host, BindPort: portNumber, DataDir: cfg.DataDir, DBPath: cfg.DBPath, CWD: cwd, Args: canonicalArgs, Identity: identity}
 	})
 	srv.SetUpdater(updater)

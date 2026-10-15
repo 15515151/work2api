@@ -742,6 +742,9 @@ func (m *Manager) Prepare(ctx context.Context, token string, backup func(context
 	if err != nil {
 		return err
 	}
+	if err = ValidateBackup(plan.Backup, plan.BackupHash, plan.Target, plan.DataDir, plan.DBPath); err != nil {
+		return fmt.Errorf("更新前备份不可恢复: %w", err)
+	}
 	plan.Phase = "backup_ready"
 	if err = WriteJSON(filepath.Join(plan.Root, "plan.json"), plan); err != nil {
 		return err

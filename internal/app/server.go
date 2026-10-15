@@ -232,7 +232,7 @@ func (s *Server) requestGuard(next http.Handler) http.Handler {
 				defer controller.SetReadDeadline(time.Time{})
 				return bodies.read(http.MaxBytesReader(w, r.Body, limit), r.ContentLength)
 			}()
-			defer bodies.release(reserved)
+			defer func() { bodies.release(reserved) }()
 			if err != nil {
 				var overload *apiError
 				if errors.As(err, &overload) {
@@ -257,7 +257,10 @@ func (s *Server) requestGuard(next http.Handler) http.Handler {
 				writeJSON(w, 400, errBody(400, "JSON 结构过于复杂或嵌套过深", "invalid_request_error").Body)
 				return
 			}
-			r.Body = io.NopCloser(bytes.NewReader(body))
+			buffered := &bufferedRequestBody{reader: bytes.NewReader(body), budget: bodies, reserved: reserved}
+			reserved = 0 // ownership transfers to the shared body
+			r.Body = buffered
+			defer buffered.Close()
 		}
 		if heavy && isRefresh(r) {
 			s.serveRefresh(w, r, next)
@@ -595,6 +598,9 @@ func writeAPIErr(w http.ResponseWriter, e *apiError) {
 }
 
 func readJSON(r *http.Request) (map[string]any, error) {
+	if buffered, ok := r.Body.(*bufferedRequestBody); ok {
+		defer buffered.Close()
+	}
 	var body map[string]any
 	dec := json.NewDecoder(r.Body)
 	if err := dec.Decode(&body); err != nil {

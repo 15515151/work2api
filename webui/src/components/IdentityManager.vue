@@ -88,7 +88,7 @@ async function toggleAudit() { showAudit.value = !showAudit.value; if (showAudit
 <template>
   <section class="glass rounded-xl p-5 space-y-4">
     <div class="flex flex-wrap items-center justify-between gap-3"><h2 class="font-semibold">用户管理</h2><div class="flex gap-2"><WButton size="sm" :disabled="busy || !identity || !['admin', 'owner'].includes(identity.role)" @click="showCreate = !showCreate">创建账号</WButton><WButton size="sm" :disabled="busy || !identity || !['admin', 'owner'].includes(identity.role)" @click="toggleAudit">身份操作记录</WButton></div></div>
-    <p v-if="identity" class="text-micro text-faint">当前：{{ identity.recovery ? '恢复入口' : `${identity.username} · ${roleLabel(identity.role)}` }}。管理人员通过私有入口登录；角色不会自动授予门户 Key 调用资格。</p>
+    <p v-if="identity" class="text-micro text-faint">当前：{{ identity.recovery ? '恢复入口' : `${identity.username} · ${roleLabel(identity.role)}` }}。管理角色与模型调用权限分别配置。</p>
     <p v-if="!ownerExists && identity?.role" class="text-small text-warn">尚未指定超级管理员。请使用恢复 Token 登录，从已完成改密的有效管理员中明确选择。</p>
     <p v-if="error && !verification" role="alert" class="text-small text-fault">{{ error }} <button @click="loadIdentity" class="text-brand">重新加载身份</button></p>
     <form v-if="showCreate" class="rounded-lg border border-line p-3 space-y-3" @submit.prevent="create">
@@ -98,7 +98,7 @@ async function toggleAudit() { showAudit.value = !showAudit.value; if (showAudit
     <div class="flex flex-wrap gap-2"><select v-model="filter" aria-label="用户身份筛选" class="rounded-lg border border-line bg-bg p-2"><option value="user">普通用户</option><option value="staff">管理人员</option></select><WInput v-model="search" placeholder="搜索用户名" /></div>
     <p v-if="!users.length" class="text-small text-faint">暂无匹配账号。</p>
     <article v-for="u in users" :key="u.id" class="rounded-lg border border-line p-3 space-y-3">
-      <div class="flex flex-wrap items-center gap-2"><span>{{ u.username }}</span><span class="text-micro text-faint">#{{ u.id }} · {{ roleLabel(u.role) }} · {{ u.status === 'active' ? '有效' : '已停用' }}{{ u.must_change_password ? ' · 待首次改密' : '' }}</span>
+      <div class="flex flex-wrap items-center gap-2"><span>{{ u.username }}</span><span class="text-micro text-faint" :title="'账号 ID：' + u.id">{{ roleLabel(u.role) }} · {{ u.status === 'active' ? '有效' : '已停用' }}{{ u.must_change_password ? ' · 待首次改密' : '' }}</span>
         <WButton v-if="canManage(u)" size="sm" :disabled="busy" @click="ask(`${u.status === 'active' ? '停用' : '启用'}「${u.username}」`, () => api.portalWrite(`users/${u.id}/status`, { status: u.status === 'active' ? 'disabled' : 'active' }))">{{ u.status === 'active' ? '停用' : '启用' }}</WButton>
         <WButton v-if="isOwner && canManage(u)" size="sm" :disabled="busy" @click="ask(`将「${u.username}」${u.role === 'user' ? '升级为管理员' : '降级为普通用户'}`, () => api.portalWrite(`users/${u.id}/role`, { role: u.role === 'user' ? 'admin' : 'user' }))">{{ u.role === 'user' ? '授予管理员' : '撤销管理员' }}</WButton>
         <WButton v-if="isOwner && u.role === 'admin' && u.status === 'active' && !u.must_change_password && (ownerExists || identity?.recovery)" size="sm" :disabled="busy" @click="transfer(u)">{{ ownerExists ? '交接超级管理员' : '指定超级管理员' }}</WButton>

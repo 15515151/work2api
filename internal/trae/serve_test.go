@@ -27,6 +27,7 @@ import (
 	"work2api/internal/core/protocol"
 	"work2api/internal/core/provider"
 	"work2api/internal/store"
+	"work2api/internal/streamwatch"
 	"work2api/internal/trae/auth"
 	"work2api/internal/trae/upstream"
 )
@@ -749,6 +750,23 @@ func TestNativeStreamCompletion(t *testing.T) {
 	}
 }
 
+func TestPreparedTraeLimitsMatchWireAndBoundMultilineEvents(t *testing.T) {
+	input := []byte(`{"model":"m","max_tokens":77,"messages":[{"role":"user","content":"hello"}]}`)
+	wire, limits := upstream.PrepareBodyResolvedWithLimits(input, "solo", "m")
+	var body map[string]any
+	if json.Unmarshal(wire, &body) != nil || limits["max_tokens"] != 77 || body["max_tokens"] != float64(77) {
+		t.Fatal("limits differ from wire", limits)
+	}
+	if string(input) != `{"model":"m","max_tokens":77,"messages":[{"role":"user","content":"hello"}]}` {
+		t.Fatal("caller body mutated")
+	}
+	line := "data: " + strings.Repeat("x", 1024) + "\n"
+	events := newEvents(strings.NewReader(strings.Repeat(line, streamwatch.DefaultMaxEventBytes/len(line)+1)))
+	if _, err := events.next(); !errors.Is(err, streamwatch.ErrSSEEventTooLarge) {
+		t.Fatal("multiline event unbounded", err)
+	}
+}
+
 func TestNativeStreamRequiresTerminalEvent(t *testing.T) {
 	events := newEvents(strings.NewReader("event: output\ndata: {\"response\":\"partial\"}\n\n"))
 	first, err := events.next()
@@ -788,6 +806,21 @@ func TestNativeToolHistoryAndOutput(t *testing.T) {
 		converted, err := protocol.ConvertResponse(protocol.Chat, target, reply)
 		if err != nil || !bytes.Contains(converted, []byte("call-a")) || !bytes.Contains(converted, []byte("lookup")) {
 			t.Fatalf("tool conversion failed: %s (%v)", converted, err)
+		}
+	}
+}
+
+func TestFirstEventDiagnosticsKeepCategoriesWithoutRawContent(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want string
+	}{
+		{errTraeEmptyReply, "empty_reply"}, {io.ErrUnexpectedEOF, "unexpected_eof"}, {context.Canceled, "cancelled"},
+		{context.DeadlineExceeded, "timeout"}, {&json.SyntaxError{}, "invalid_json"}, {&json.UnmarshalTypeError{}, "invalid_event_shape"},
+		{errors.New("private upstream request body"), "stream_read_error"},
+	} {
+		if got := firstEventFailure(tc.err); got != tc.want {
+			t.Fatal(got, tc.want)
 		}
 	}
 }

@@ -27,6 +27,174 @@ import (
 	"work2api/internal/workbuddy/upstream"
 )
 
+func TestRoutePayloadClonePreservesHistoryAndAttemptIsolation(t *testing.T) {
+	var input map[string]any
+	if err := json.Unmarshal([]byte(`{"model":"merged","messages":[{"content":[{"type":"text","text":"history"}]}],"tools":[{"function":{"parameters":{"enum":["a","b"]}}}],"n":1,"empty":null}`), &input); err != nil {
+		t.Fatal(err)
+	}
+	first, second := cloneRoutePayload(input), cloneRoutePayload(input)
+	if !reflect.DeepEqual(first, input) {
+		t.Fatal("clone changed decoded JSON values")
+	}
+	first["model"] = "member"
+	first["messages"].([]any)[0].(map[string]any)["content"].([]any)[0].(map[string]any)["text"] = "changed"
+	first["tools"].([]any)[0].(map[string]any)["function"].(map[string]any)["parameters"].(map[string]any)["enum"].([]any)[0] = "changed"
+	if !reflect.DeepEqual(second, input) {
+		t.Fatal("attempt mutation leaked into original or sibling attempt")
+	}
+}
+
+func BenchmarkRoutePayloadClone(b *testing.B) {
+	history := make([]any, 100)
+	for i := range history {
+		history[i] = map[string]any{"role": "user", "content": strings.Repeat("x", 10<<10)}
+	}
+	input := map[string]any{"model": "merged", "messages": history}
+	b.Run("json_roundtrip", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			raw, _ := json.Marshal(input)
+			var output map[string]any
+			_ = json.Unmarshal(raw, &output)
+			if len(output) != 2 {
+				b.Fatal("invalid clone")
+			}
+		}
+	})
+	b.Run("container_copy", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if len(cloneRoutePayload(input)) != 2 {
+				b.Fatal("invalid clone")
+			}
+		}
+	})
+}
+
+func TestBufferedRequestBodyReleasesAfterParsingAcrossClones(t *testing.T) {
+	for _, input := range []string{`{"value":"ok"}`, `{"value":"ok"} {}`, `{"value":`} {
+		budget := &bodyBudget{}
+		data, reserved, err := budget.read(strings.NewReader(input), int64(len(input)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		body := &bufferedRequestBody{reader: bytes.NewReader(data), budget: budget, reserved: reserved}
+		r := httptest.NewRequest("POST", "/v1/messages", nil)
+		r.Body = body
+		clone := r.WithContext(context.Background())
+		_, err = readJSON(clone)
+		if (err == nil) != (input == `{"value":"ok"}`) {
+			t.Fatalf("parse %q: %v", input, err)
+		}
+		if budget.usage() != 0 || body.reader != nil {
+			t.Fatal("raw body retained after parsing")
+		}
+		if n, err := r.Body.Read(make([]byte, 1)); n != 0 || err != io.EOF {
+			t.Fatalf("original clone still readable: %d %v", n, err)
+		}
+		_ = body.Close()
+		_ = clone.Body.Close()
+		if budget.usage() != 0 {
+			t.Fatal("reservation released twice")
+		}
+	}
+}
+
+var benchmarkPayloadRequest *http.Request
+
+func TestRequestGuardBodyCleanupBeforeAndAfterHandler(t *testing.T) {
+	for _, mode := range []string{"parse", "skip", "panic"} {
+		t.Run(mode, func(t *testing.T) {
+			s := NewServer(&Orchestrator{cfg: &config.Config{}})
+			var retained io.ReadCloser
+			h := s.requestGuard(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				retained = r.Body
+				if s.bodies.usage() == 0 {
+					t.Fatal("body not charged before parsing")
+				}
+				if mode == "parse" {
+					if _, err := readJSON(r.WithContext(context.Background())); err != nil {
+						t.Fatal(err)
+					}
+					if s.bodies.usage() != 0 {
+						t.Fatal("raw body charged until handler completion")
+					}
+				}
+				if mode == "panic" {
+					panic("handler failure")
+				}
+			}))
+			func() {
+				defer func() {
+					if p := recover(); p != nil && mode != "panic" {
+						panic(p)
+					}
+				}()
+				h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("POST", "/test", strings.NewReader(`{"value":"ok"}`)))
+			}()
+			if s.bodies.usage() != 0 {
+				t.Fatal("guard fallback leaked reservation")
+			}
+			if retained == nil {
+				t.Fatal("handler not reached")
+			}
+			if n, err := retained.Read(make([]byte, 1)); n != 0 || err != io.EOF {
+				t.Fatal("guard retained raw buffer")
+			}
+		})
+	}
+}
+
+func TestWorkBuddyPayloadReaderRetainsRedirectReplay(t *testing.T) {
+	payload := map[string]any{"model": "m", "messages": []any{map[string]any{"role": "user", "content": "test"}}}
+	want, _ := json.Marshal(payload)
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		data, err := io.ReadAll(r.Body)
+		if err != nil || !bytes.Equal(data, want) || r.ContentLength != int64(len(want)) || r.Method != "POST" {
+			t.Errorf("payload metadata/replay changed: %v length=%d body=%q", err, r.ContentLength, data)
+		}
+		if r.URL.Path == "/start" {
+			http.Redirect(w, r, "/done", http.StatusTemporaryRedirect)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+	}))
+	defer server.Close()
+	ctx, timing := streamwatch.WithTiming(context.Background())
+	if err := upstream.Shared().StreamUpstream(ctx, nil, payload, server.URL+"/start", func(string) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if requests != 2 {
+		t.Fatalf("redirect was not replayed: %d", requests)
+	}
+	if timing.Snapshot().GenerationEvents != 1 {
+		t.Fatal("WorkBuddy terminal frame double-counted generation")
+	}
+}
+
+func BenchmarkRequestPayloadReader(b *testing.B) {
+	payload := []byte(`{"content":"` + strings.Repeat("x", 1<<20) + `"}`)
+	for _, legacy := range []bool{true, false} {
+		b.Run(fmt.Sprintf("string_copy=%t", legacy), func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				var reader io.Reader = bytes.NewReader(payload)
+				if legacy {
+					reader = strings.NewReader(string(payload))
+				}
+				request, err := http.NewRequest("POST", "http://localhost/test", reader)
+				if err != nil {
+					b.Fatal(err)
+				}
+				benchmarkPayloadRequest = request
+			}
+		})
+	}
+}
+
 func TestBudgetPredictionSeparatesDomainsAndFreeModels(t *testing.T) {
 	balance := func(n float64) *float64 { return &n }
 	data := map[string]provider.AdminData{

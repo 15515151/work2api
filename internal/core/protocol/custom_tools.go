@@ -55,18 +55,23 @@ func PrepareCustomTools(body map[string]any) (map[string]any, map[string]bool, e
 	out := copyCustomMap(body)
 	for _, key := range []string{"tools", "input"} {
 		if items, ok := body[key].([]any); ok {
-			cloned := make([]any, len(items))
+			var cloned []any
 			for i, raw := range items {
-				if item, ok := raw.(map[string]any); ok {
+				item, ok := raw.(map[string]any)
+				kind := jsonutil.StringAt(item, "type")
+				if ok && (key == "tools" && kind == "custom" || key == "input" && (kind == "custom_tool_call" || kind == "custom_tool_call_output")) {
+					if cloned == nil {
+						cloned = append([]any(nil), items...)
+					}
 					cloned[i] = copyCustomMap(item)
-				} else {
-					cloned[i] = raw
 				}
 			}
-			out[key] = cloned
+			if cloned != nil {
+				out[key] = cloned
+			}
 		}
 	}
-	if choice, ok := body["tool_choice"].(map[string]any); ok {
+	if choice, ok := body["tool_choice"].(map[string]any); ok && jsonutil.StringAt(choice, "type") == "custom" {
 		out["tool_choice"] = copyCustomMap(choice)
 	}
 	for _, raw := range jsonutil.SliceAt(out, "tools") {

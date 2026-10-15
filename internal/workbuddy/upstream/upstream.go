@@ -9,6 +9,7 @@ package upstream
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -143,7 +144,7 @@ func (c *Client) StreamUpstream(ctx context.Context, headers map[string]string, 
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(string(payload)))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
 	if err != nil {
 		return err
 	}
@@ -254,6 +255,9 @@ func streamSSE(resp *http.Response, yield LineFunc) error {
 		}
 		if err := state.observe(chunk); err != nil {
 			return err
+		}
+		if streamwatch.ChatGeneration(chunk) {
+			streamwatch.Generation(resp.Request.Context())
 		}
 		// Keep ordinary single-line payloads; only multiline SSE needs folding.
 		line := "data: " + data

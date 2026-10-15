@@ -21,6 +21,7 @@ import (
 	"time"
 	"work2api/internal/config"
 	"work2api/internal/core/provider"
+	"work2api/internal/selfupdate"
 	"work2api/internal/statebackup"
 )
 
@@ -371,6 +372,9 @@ func (o *Orchestrator) runBackup(ctx context.Context) (err error) {
 	raw, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
 		return err
+	}
+	if len(raw) > selfupdate.MaxBackupManifestBytes {
+		return errors.New("完整备份清单超过允许大小")
 	}
 	if err = os.WriteFile(filepath.Join(staging, "manifest.json"), raw, 0600); err != nil {
 		return err

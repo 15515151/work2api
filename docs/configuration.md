@@ -24,8 +24,8 @@
 | — | `ADMIN_CONCURRENCY` / `HEAVY_ADMIN_CONCURRENCY` | `8` / `2` | 轻管理 / 重管理独立限额；同类刷新共享执行结果 |
 | — | `QUERY_CONCURRENCY` / `BODY_READ_CONCURRENCY` | `4` / `4` | 模型列表及 Token 统计 / 请求体读取限额 |
 | — | `REQUEST_BODY_BUDGET` | `0` | 不附加全局原始缓冲额度；正数可主动启用字节预算 |
-| — | `MAX_JSON_ITEMS` / `MAX_JSON_DEPTH` | `0` / `0` | 默认不附加结构符号/深度门槛；正数主动启用额外保护，JSON合法性仍验证 |
-| — | `MAX_RESPONSE_BYTES` | `134217728` | 非流式响应读取/聚合上限128MiB；SSE不累计封顶，单行解析40MiB |
+| — | `MAX_JSON_ITEMS` / `MAX_JSON_DEPTH` | `1000000` / `512` | 结构符号/嵌套保护，不计算字符串内部标点；0显式关闭，独立于模型执行并发 |
+| — | `MAX_RESPONSE_BYTES` | `134217728` | 非流式响应读取/聚合上限128MiB；SSE总输出不累计封顶，单行与单事件40MiB保护（含多行data） |
 | — | `DESENSITIZE` | 已停用 | 旧配置忽略；完整保留技能、工具和项目指令，不再摘要替换或插入零宽字符 |
 | — | `CHANNEL_IDENTITY_COMPAT` | `true` | WorkBuddy 国内/国际账号遇到结构化 400/403 + 11128 且尚未输出时，优先兼容已验证的 Claude Code/SDK、Codex CLI 身份或 ZCode 分支模板；保留技能、工具、权限和任务内容。明确首条 system 校验走既有协议规范化；关闭后同时关闭归因精简 |
 | — | `CHANNEL_METADATA_COMPAT` | `true` | 匹配已验证的 CC billing 归因行时，可进一步精简归因。两级同账号兼容重试合计最多 2 次，连同授权范围内换号共最多 5 次；已启用的兼容随当前请求换号保留。成功方式仅在当前会话、账号及系统/工具模板一致时复用；重启失效 |

@@ -38,6 +38,12 @@ func IsModelMismatchCode(code int64) bool {
 	return ok
 }
 func (e *SOLOStreamError) Kind() ErrKind {
+	if e.Code == 429 {
+		return ErrSoftRate
+	}
+	if e.Code == 401 {
+		return ErrSessionDead
+	}
 	if _, ok := soloPlanLimitCodes[e.Code]; ok {
 		return ErrPlanLimit
 	}
@@ -47,17 +53,12 @@ func (e *SOLOStreamError) Kind() ErrKind {
 	if _, ok := soloModelMismatchCodes[e.Code]; ok {
 		return ErrModelUnavailable
 	}
-	if e.Code == 429 {
-		return ErrSoftRate
-	}
-	if e.Code == 401 {
-		return ErrSessionDead
-	}
 	if e.Code >= 500 && e.Code <= 599 {
 		return ErrServer
 	}
 	return ErrClient
 }
+
 func ParseSOLOLine(eventName, dataLine string) (*SOLOEvent, error) {
 	ev := &SOLOEvent{Event: strings.TrimSpace(eventName)}
 	if dataLine == "" {

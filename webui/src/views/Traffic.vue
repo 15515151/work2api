@@ -4,7 +4,8 @@ import { useRoute, useRouter } from 'vue-router'
 import { api } from '@/api/client'
 import type { UsageSummary, UsagePoint, UsageRecord } from '@/types'
 import { toast } from '@/lib/toast'
-import { int, abbr, credits as fmtCredits, dt, pct } from '@/lib/format'
+import { int, abbr, dt, pct } from '@/lib/format'
+import { tokensKnown } from '@/lib/usage-log'
 import WPage from '@/components/ui/WPage.vue'
 import WCard from '@/components/ui/WCard.vue'
 import WTabs from '@/components/ui/WTabs.vue'
@@ -62,7 +63,7 @@ const accountBars = computed(() =>
   (summary.value?.by_account || []).map((a) => ({
     label: (a.label || a.account_uid.slice(0, 8)) + (a.removed ? ' (已删除)' : ''),
     value: a.count,
-    sub: fmtCredits(a.credits) + ' 额度',
+    sub: abbr(a.tokens) + ' tok',
   })),
 )
 
@@ -176,19 +177,19 @@ async function exportCSV() {
       if (all.length >= (res.total || 0) || !res.records?.length) break
       p++
     }
-    const head = ['时间','请求标识','调用模型','实际模型','协议','Key','账号','输入Tokens','输出Tokens','缓存读取Tokens','最终命中消耗','消耗渠道','总耗时ms','排队ms','账号等待ms','首响应ms','上游尝试次数','客户端HTTP状态','结果','结束原因']
+    const head = ['时间','请求标识','调用模型','实际模型','协议','Key','账号','输入Tokens','输出Tokens','缓存读取Tokens','最终命中消耗','消耗渠道','总耗时ms','排队ms','账号等待ms','首响应ms','首生成ms','生成阶段耗时ms','上游尝试次数','客户端HTTP状态','结果','结束原因']
     const cell=(v: unknown) => {
       let text=String(v ?? '')
       if(typeof v==='string' && /^[=+@\-\t\r]/.test(text))text="'"+text
       return '"'+text.replace(/"/g,'""')+'"'
     }
     const lines = all.map(r=>{
-      const p=r.diagnostics?.performance, known=r.tokens_known===true || r.tokens_known===1
+      const p=r.diagnostics?.performance, known=tokensKnown(r)
       const physical=r.diagnostics?.physical_model || r.model
       const channel=physical.includes('/')?physical.split('/')[0]:'workbuddy'
       return [dt(r.ts,'YYYY-MM-DD HH:mm:ss'),p?.request_id,r.diagnostics?.requested_model || r.model,physical,r.protocol,r.app_name,r.account_uid,
         known?r.input_tokens:null,known?r.output_tokens:null,r.cached_tokens,r.credit_known?r.credits:null,channel,p?.total_ms ?? r.latency_ms,
-        p?.queue_ms,p?.account_wait_ms,p?.first_byte_ms,p?.attempts,p?.http_status,r.status,r.diagnostics?.finish_reason].map(cell).join(',')
+        p?.queue_ms,p?.account_wait_ms,p?.first_byte_ms,p?.first_generation_ms,p?.generation_ms,p?.attempts,p?.http_status,r.status,r.diagnostics?.finish_reason].map(cell).join(',')
     })
     const blob = new Blob(['﻿' + [head.join(','), ...lines].join('\n')], { type: 'text/csv;charset=utf-8' })
     const url = URL.createObjectURL(blob)
@@ -234,7 +235,7 @@ onMounted(() => loadTab(tab.value))
         <!-- 缓存命中：有可统计样本才展示（qoder 等不上报的上游自动隐藏） -->
         <WCard v-if="cacheStats" title="提示词缓存" class="mb-4">
           <template #actions>
-            <span class="text-micro text-faint">基于 {{ int(cacheStats.rows) }} 条已知样本（仅统计缓存数据有效的成功请求）</span>
+            <span class="text-micro text-faint">{{ int(cacheStats.rows) }} 次有效调用</span>
           </template>
           <div class="flex flex-wrap items-center gap-6">
             <div class="min-w-24">
@@ -294,7 +295,7 @@ onMounted(() => loadTab(tab.value))
         <RequestLogTable v-else :rows="records" :account-label="acctLabel" admin @detail="openDetail" />
       </WCard>
 
-      <p class="mt-3 text-micro text-faint">按网关请求归并重试；Tokens 为最终命中报告值，各次消耗在详情中展示。历史无请求标识记录逐条保留。</p>
+
       <!-- 分页 -->
       <div v-if="total > pageSize" class="mt-4 flex items-center justify-between text-small text-muted">
         <span>共 <span class="mono text-ink">{{ int(total) }}</span> 条</span>

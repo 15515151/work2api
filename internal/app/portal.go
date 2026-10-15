@@ -1270,12 +1270,15 @@ func (s *Server) portalUsage(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, map[string]any{
 		"today": map[string]any{
-			"requests":             reqs,
-			"input_tokens":         input,
-			"output_tokens":        output,
-			"daily_limit_requests": s.o.cfg.PortalDailyRequests,
-			"daily_limit_input":    s.o.cfg.PortalDailyInputTokens,
-			"daily_limit_output":   s.o.cfg.PortalDailyOutputTokens,
+			"requests":               reqs,
+			"input_tokens":           input,
+			"output_tokens":          output,
+			"recorded_input_tokens":  inTok,
+			"recorded_output_tokens": outTok,
+			"tokens_known":           known,
+			"daily_limit_requests":   s.o.cfg.PortalDailyRequests,
+			"daily_limit_input":      s.o.cfg.PortalDailyInputTokens,
+			"daily_limit_output":     s.o.cfg.PortalDailyOutputTokens,
 		},
 		"keys": apps,
 	})

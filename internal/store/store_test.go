@@ -8,6 +8,59 @@ import (
 	"time"
 )
 
+func TestAppCostsKeepChannelsAndOwnersSeparate(t *testing.T) {
+	db, err := New(filepath.Join(t.TempDir(), "costs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	user, err := db.CreateUser("cost-user", "fixture", "user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	app, err := db.CreateApp("mixed", "mixed-hash", "", "", "", "", user)
+	if err != nil {
+		t.Fatal(err)
+	}
+	known, unknown := true, false
+	paid, zero, foreign := 2.0, 0.0, 99.0
+	for _, item := range []UsageParams{
+		{Model: "legacy-workbuddy", AppID: app, UserID: user, Credits: &paid, TokensKnown: &known, InputTokens: 10, OutputTokens: 5},
+		{Model: "legacy-workbuddy", AppID: app, UserID: user, TokensKnown: &known},
+		{Model: "unified/model", Diagnostics: &UsageDiagnostics{PhysicalModel: "trae/model"}, AppID: app, UserID: user, Credits: &zero, TokensKnown: &known, InputTokens: 10, OutputTokens: 5},
+		{Model: "qoder/model", AppID: app, UserID: user, TokensKnown: &unknown, InputTokens: 10, OutputTokens: 5},
+		{Model: "unified/missing-physical", AppID: app, UserID: user, Credits: &paid, TokensKnown: &known},
+		{Model: "trae/model", AppID: app, UserID: 0, Credits: &foreign, TokensKnown: &known, InputTokens: 100},
+	} {
+		if err := db.LogUsage(item); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, list := range []func() ([]App, error){db.ListApps, func() ([]App, error) { return db.UserApps(user) }} {
+		apps, err := list()
+		if err != nil || len(apps) != 1 {
+			t.Fatal(apps, err)
+		}
+		a := apps[0]
+		if a.Requests != 5 || a.Tokens != 45 || a.TokensKnown || a.CreditsKnown || len(a.ChannelCosts) != 4 {
+			t.Fatal(a)
+		}
+		costs := map[string]*float64{}
+		for _, c := range a.ChannelCosts {
+			costs[c.Provider] = c.Credits
+			if c.Provider == "workbuddy" && !c.Partial {
+				t.Fatal("partial reported costs were marked complete")
+			}
+			if c.Provider == "trae" && c.Partial {
+				t.Fatal("reported zero was marked incomplete")
+			}
+		}
+		if costs["workbuddy"] == nil || *costs["workbuddy"] != 2 || costs["trae"] == nil || *costs["trae"] != 0 || costs["qoder"] != nil || costs["unknown"] == nil || *costs["unknown"] != 2 {
+			t.Fatal(costs)
+		}
+	}
+}
+
 func TestBudgetSamplesExcludeUnknownTokensErrorsAndOldHistory(t *testing.T) {
 	db, err := New(filepath.Join(t.TempDir(), "budget.db"))
 	if err != nil {

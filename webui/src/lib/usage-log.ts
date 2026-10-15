@@ -38,10 +38,28 @@ export function costUnit(r: Partial<UsageRecord>) {
   return channelName(r) === 'OpenCode' ? '上游消耗（单位未确认）' : channelName(r) + ' 积分'
 }
 
-// Whole-request average, matching sub2api's usage output-rate semantics.
-// Includes reasoning, connection/queue time and retries; not decode-only throughput.
+// Observed generation window, including reasoning/text/tool argument deltas.
+// Historical rows and single-frame replies have no reliable generation interval.
 export function outputRate(r: Partial<UsageRecord>): string {
+ return formatOutputRate(r,r.diagnostics?.performance?.generation_ms)
+}
+
+export function hasGenerationWindow(r: Partial<UsageRecord>): boolean {
+ const duration=r.diagnostics?.performance?.generation_ms
+ return typeof duration==='number' && Number.isFinite(duration) && duration>0
+}
+
+// Keep existing observable metrics visible without relabelling them as new
+// generation metrics. This also covers upstream single-document replies.
+export function displayedOutputRate(r: Partial<UsageRecord>): string {
+ return hasGenerationWindow(r)?outputRate(r):averageOutputRate(r)
+}
+// Whole-request average, kept in details for comparison with older records.
+export function averageOutputRate(r: Partial<UsageRecord>): string {
  const duration=r.diagnostics?.performance?.total_ms ?? r.latency_ms
+ return formatOutputRate(r,duration)
+}
+function formatOutputRate(r: Partial<UsageRecord>,duration?:number):string {
  if(!tokensKnown(r) || (r.status!=='ok' && r.status!=='incomplete') || observed(r.output_tokens)==null || (r.output_tokens ?? 0)<=0 || duration==null || !Number.isFinite(duration) || duration<=0)return '—'
  const rate=(r.output_tokens ?? 0)*1000/duration
  return Number.isFinite(rate)?rate.toFixed(1)+' tok/s':'—'

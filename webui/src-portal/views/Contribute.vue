@@ -165,7 +165,7 @@ async function share(c: ContributionInfo) {
       </div>
       <p class="mt-1 text-micro text-faint">
         贡献可选。添加个人账号后可调用本人支持的模型；贡献账号进入统一池，其他用户可按默认或管理员授权范围调用，并可能消耗账号额度。
-        你可以随时撤回贡献，账号会保留为仅本人使用。服务器会保存授权凭据；共享记录和凭据也会保留，用于本人调用及重新授权。
+        你可以随时撤回贡献，账号会保留为仅本人使用。服务器会保存授权凭据；凭据保留用于本人调用及重新授权。
       </p>
       <label class="mt-4 flex cursor-pointer items-start gap-2 text-small text-muted">
         <input v-model="accepted" type="checkbox" class="mt-0.5" />

@@ -22,6 +22,7 @@ type eventReader struct {
 	scanner *bufio.Scanner
 	event   string
 	data    []string
+	budget  streamwatch.SSEEventBudget
 }
 
 func newEvents(reader io.Reader) *eventReader {
@@ -32,6 +33,10 @@ func newEvents(reader io.Reader) *eventReader {
 func (r *eventReader) next() (*upstream.SOLOEvent, error) {
 	for r.scanner.Scan() {
 		line := r.scanner.Text()
+		if err := r.budget.AddLine(line); err != nil {
+			r.data = nil
+			return nil, err
+		}
 		if line == "" {
 			if len(r.data) > 0 {
 				name, data := r.event, strings.Join(r.data, "\n")
@@ -61,6 +66,40 @@ func (r *eventReader) next() (*upstream.SOLOEvent, error) {
 }
 func eventError(e *upstream.SOLOEvent) error {
 	return &upstream.SOLOStreamError{Code: e.ErrorCode, Msg: e.ErrorMessage}
+}
+
+var errTraeEmptyReply = errors.New("Trae 上游返回空回复")
+
+// Record a bounded category, not raw upstream messages or response fragments.
+func firstEventFailure(err error) string {
+	if errors.Is(err, errTraeEmptyReply) {
+		return "empty_reply"
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return "unexpected_eof"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "cancelled"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
+	}
+	if errors.Is(err, streamwatch.ErrSSEEventTooLarge) || errors.Is(err, bufio.ErrTooLong) {
+		return "event_too_large"
+	}
+	var syntax *json.SyntaxError
+	if errors.As(err, &syntax) {
+		return "invalid_json"
+	}
+	var shape *json.UnmarshalTypeError
+	if errors.As(err, &shape) {
+		return "invalid_event_shape"
+	}
+	var timeout interface{ Timeout() bool }
+	if errors.As(err, &timeout) && timeout.Timeout() {
+		return "timeout"
+	}
+	return "stream_read_error"
 }
 
 func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report provider.UsageReport, result error) {
@@ -179,14 +218,9 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 			return report, err
 		}
 		streamwatch.StartAttempt(ctx)
-		// Inspect the prepared wire body, not inferred client defaults.
-		var sent map[string]any
-		if json.Unmarshal(upstream.PrepareBodyResolved(encoded, identity.Variant, identityModel), &sent) == nil {
-			if n, ok := sent["max_tokens"].(float64); ok && n > 0 && n <= 1<<30 && n == float64(int(n)) {
-				report.EffectiveLimits = map[string]int{"max_tokens": int(n)}
-			}
-		}
-		stream, status, errorBody, headers, sendErr := r.client(ctx).ChatStreamWithHeaders(identity, encoded, identityModel)
+		prepared, limits := upstream.PrepareBodyResolvedWithLimits(encoded, identity.Variant, identityModel)
+		report.EffectiveLimits = limits
+		stream, status, errorBody, headers, sendErr := r.client(ctx).ChatPreparedStreamWithHeaders(identity, prepared)
 		streamwatch.AttemptHeaders(ctx, status, headers)
 		streamwatch.AttemptResult(ctx, status)
 		if sendErr != nil {
@@ -202,7 +236,7 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 					}
 					attempt++ // the same-identity retry shares the total dispatch budget
 					streamwatch.StartAttempt(ctx)
-					stream, status, errorBody, headers, sendErr = r.client(ctx).ChatStreamWithHeaders(identity, encoded, identityModel)
+					stream, status, errorBody, headers, sendErr = r.client(ctx).ChatPreparedStreamWithHeaders(identity, prepared)
 					streamwatch.AttemptHeaders(ctx, status, headers)
 					streamwatch.AttemptResult(ctx, status)
 					if sendErr != nil {
@@ -212,11 +246,7 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 				}
 			}
 			if stream == nil {
-				snip := string(errorBody)
-				if len(snip) > 500 {
-					snip = snip[:500]
-				}
-				log.Printf("trae reject model=%s status=%d kind=%s code=%d body=%q", model, status, kind, upstream.BusinessCode(errorBody), snip)
+				log.Printf("trae rejection stage=http model=%q status=%d kind=%s code=%d", model, status, kind, upstream.BusinessCode(errorBody))
 				lastRejection = rejectionError(kind, status, upstream.BusinessCode(errorBody))
 				lastRetryDelay = 0
 				if kind == upstream.ErrSoftRate {
@@ -250,7 +280,7 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 				initialUsage = first.Usage
 			}
 			if first.Event == "done" {
-				err = errors.New("Trae 上游返回空回复")
+				err = errTraeEmptyReply
 				break
 			}
 			if first.Response != "" || first.Reasoning != "" || len(first.ToolCalls) > 0 && string(first.ToolCalls) != "null" && string(first.ToolCalls) != "[]" || first.Event == "extra_info" && text(first.Usage["reasoning_content"]) != "" {
@@ -262,7 +292,7 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 			var rejection *upstream.SOLOStreamError
 			if errors.As(err, &rejection) {
 				kind := rejection.Kind()
-				log.Printf("trae stream-error model=%s kind=%s code=%d msg=%q", model, kind, rejection.Code, rejection.Msg)
+				log.Printf("trae rejection stage=first_event model=%q kind=%s code=%d", model, kind, rejection.Code)
 				lastRejection = rejectionError(kind, 0, rejection.Code)
 				lastRetryDelay = 0
 				if kind == upstream.ErrSoftRate {
@@ -274,13 +304,13 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 				}
 				return returnRejection()
 			}
-			log.Printf("trae first-event model=%s err=%v", model, err)
-			lastRejection = rejectionError(upstream.ErrServer, 502, 0)
-			r.cool(ref.LocalID, upstream.ErrServer)
-			if attempt < 2 {
-				continue
+			if ctx.Err() != nil {
+				return report, ctx.Err()
 			}
-			return returnRejection()
+			// Class alone is enough to correlate a parser/transport failure; raw
+			// upstream errors may include request content or credential material.
+			log.Printf("trae rejection stage=first_event model=%q reason=%s error_type=%T", model, firstEventFailure(err), err)
+			return report, err
 		}
 		// Cancellation closes both sides and the HTTP body; no detached reader
 		// survives the downstream consumer or service shutdown.
@@ -301,7 +331,7 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 			usage, known, err = protocol.TranscodeStream(ctx, req.Writer, pipeReader, protocol.Chat, protocol.Protocol(req.Protocol), "trae/"+model)
 		} else {
 			var reply []byte
-			reply, usage, known, err = protocol.CollapseStreamWithUsage(pipeReader, protocol.Chat, "trae/"+model)
+			reply, usage, known, err = protocol.CollapseStreamWithUsageContext(ctx, pipeReader, protocol.Chat, "trae/"+model)
 			if err == nil {
 				reply, err = protocol.ConvertResponse(protocol.Chat, protocol.Protocol(req.Protocol), reply)
 			}

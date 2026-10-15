@@ -5,7 +5,7 @@ import WTable, { type Column } from './ui/WTable.vue'
 import WButton from './ui/WButton.vue'
 import WEmpty from './ui/WEmpty.vue'
 import { dt, int, latency } from '../lib/format'
-import { tokensKnown, reasoningTokens, observed, channelName, resultLabel, resultClass, costUnit, outputRate } from '../lib/usage-log'
+import { tokensKnown, reasoningTokens, observed, channelName, resultLabel, resultClass, costUnit, hasGenerationWindow, displayedOutputRate } from '../lib/usage-log'
 const props=defineProps<{ rows: UsageRecord[]; accountLabel?: (uid: string, model: string) => string; admin?: boolean }>()
 defineEmits<{ detail: [id: number] }>()
 const choices: Column[]=[{key:'effort',label:'思考强度',nowrap:true},{key:'cost',label:'实际消耗',nowrap:true,align:'right' as const}].filter(c=>props.admin || c.key!=='cost')
@@ -64,7 +64,7 @@ const columns=computed<Column[]>(()=>[
      <span v-if="(reasoningTokens(row) ?? 0)>0">思考 {{int(reasoningTokens(row))}}</span><span v-if="(observed(row.cached_tokens) ?? 0)>0" title="缓存读取 Tokens">缓存读 {{int(row.cached_tokens)}}</span><span v-if="(observed(row.diagnostics?.token_details?.cache_creation_tokens) ?? 0)>0" title="缓存写入 Tokens">缓存写 {{int(row.diagnostics.token_details.cache_creation_tokens)}}</span>
     </div>
    </template>
-   <template #cell-timing="{row}"><div class="inline-grid grid-cols-[auto_auto] gap-x-3 gap-y-0.5 text-micro tabular-nums"><span class="text-faint">首响应</span><span class="text-ink">{{latency(row.diagnostics?.performance?.first_byte_ms)}}</span><span class="text-faint">总耗时</span><span class="font-medium text-ink">{{latency(row.diagnostics?.performance?.total_ms ?? row.latency_ms)}}</span><span class="text-faint" title="输出总 Tokens ÷ 整次请求耗时，含思考、等待和重试">平均速度</span><span class="text-ink">{{outputRate(row)}}</span></div></template>
+   <template #cell-timing="{row}"><div class="inline-grid grid-cols-[auto_auto] gap-x-3 gap-y-0.5 text-micro tabular-nums"><span class="text-faint" :title="row.diagnostics?.performance?.first_generation_ms != null ? '首次有效思考、正文或工具参数增量，不计开始事件和心跳' : '首次下游写入，可能是协议事件，不等于首个生成增量'">{{row.diagnostics?.performance?.first_generation_ms != null ? '首生成' : '首响应'}}</span><span class="text-ink">{{latency(row.diagnostics?.performance?.first_generation_ms ?? row.diagnostics?.performance?.first_byte_ms)}}</span><span class="text-faint">总耗时</span><span class="font-medium text-ink">{{latency(row.diagnostics?.performance?.total_ms ?? row.latency_ms)}}</span><span class="text-faint" :title="hasGenerationWindow(row) ? '输出总 Tokens ÷ 有效生成增量时间，含思考与工具参数；受缓冲和网络影响' : '输出总 Tokens ÷ 整次请求耗时，含思考、等待与重试'">{{hasGenerationWindow(row) ? '生成速度' : '平均速度'}}</span><span class="text-ink">{{displayedOutputRate(row)}}</span></div></template>
    <template #cell-effort="{row}"><span class="text-micro text-muted">{{row.reasoning_effort || '未记录'}}</span></template>
    <template #cell-cost="{row}"><div class="tabular-nums text-ink">{{row.credits ?? '—'}}</div><div class="text-micro text-faint">{{costUnit(row)}}</div></template>
    <template #cell-actions="{row}"><WButton size="sm" variant="subtle" @click="$emit('detail',row.id)">详情</WButton></template>

@@ -499,10 +499,30 @@ func TestPortalUsageOmitsBodiesAndMarksMissingUsage(t *testing.T) {
 	if row["tokens_known"] != int64(0) || row["app_id"] != int64(42) {
 		t.Fatal(row)
 	}
+	known := true
+	if err := s.o.db.LogUsage(store.UsageParams{UserID: u.ID, AppID: 42, Model: "test", InputTokens: 13, OutputTokens: 7, TokensKnown: &known, Status: "ok"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.o.db.LogUsage(store.UsageParams{UserID: 0, Model: "test", InputTokens: 1000, OutputTokens: 1000, TokensKnown: &known, Status: "ok"}); err != nil {
+		t.Fatal(err)
+	}
 	w := httptest.NewRecorder()
 	s.portalUsage(w, portalRequest(u, "/portal/api/usage", ""))
 	if w.Code != 200 || !containsJSONNullTokens(w.Body.String()) {
 		t.Fatal(w.Code, w.Body.String())
+	}
+	var result struct {
+		Today struct {
+			Input  int64 `json:"recorded_input_tokens"`
+			Output int64 `json:"recorded_output_tokens"`
+			Known  bool  `json:"tokens_known"`
+		}
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Today.Input != 13 || result.Today.Output != 7 || result.Today.Known {
+		t.Fatal("partial daily totals hidden or foreign usage included", w.Body.String())
 	}
 }
 
@@ -584,6 +604,29 @@ func TestStalePasswordChangeCannotOverwriteReset(t *testing.T) {
 }
 
 type backupSourceProbe struct{ path string }
+
+func TestQoderContributionTaskValidityUsesBalancedLock(t *testing.T) {
+	s := &Server{portalTasks: map[string]*portalContributionTask{}}
+	task := &portalContributionTask{expires: time.Now().Add(time.Minute)}
+	if s.portalTaskLive(task) {
+		t.Fatal("removed task is live")
+	}
+	s.portalTasks["reservation"] = task
+	if !s.portalTaskLive(task) {
+		t.Fatal("valid task rejected")
+	}
+	delete(s.portalTasks, "reservation")
+	s.portalTasks["login-id"] = task
+	if !s.portalTaskLive(task) {
+		t.Fatal("task remapping lost identity")
+	}
+	task.expires = time.Now().Add(-time.Minute)
+	if s.portalTaskLive(task) {
+		t.Fatal("expired task is live")
+	}
+	s.portalMu.Lock()
+	s.portalMu.Unlock()
+}
 
 func (*backupSourceProbe) Name() string                                   { return "fixture-source" }
 func (*backupSourceProbe) Prefix() string                                 { return "fixture-source/" }

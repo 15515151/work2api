@@ -5,7 +5,9 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
+	"work2api/internal/core/provider"
 	"work2api/internal/tokenusage"
 	"work2api/internal/workbuddy/upstream"
 )
@@ -19,6 +21,11 @@ type AnthropicStreamConverter struct {
 
 	nonstream    bool
 	emittedStart bool
+	logPolicy    *provider.LogCapturePolicy
+	textLog      *provider.LogCapture
+	thinkingLog  *provider.LogCapture
+	toolLogBytes int
+	toolLogFull  bool
 
 	textContent   strings.Builder
 	textBlockOpen bool
@@ -198,7 +205,11 @@ func (c *AnthropicStreamConverter) processChunk(chunk map[string]any) string {
 			// thinking 与 text 交替时按 Anthropic 语义切换 block：开 thinking 前先
 			// 关掉打开中的 text block，正文出现时先关 thinking 再开新 text。
 			if reasoning, ok := delta["reasoning_content"].(string); ok && reasoning != "" {
-				c.thinkingContent.WriteString(reasoning)
+				if c.thinkingLog != nil && !c.nonstream {
+					c.thinkingLog.WriteString(reasoning)
+				} else {
+					c.thinkingContent.WriteString(reasoning)
+				}
 				if !c.thinkingBlockOpen {
 					if c.textBlockOpen {
 						events.WriteString(c.evt("content_block_stop", map[string]any{"index": c.textBlockIdx}))
@@ -224,7 +235,11 @@ func (c *AnthropicStreamConverter) processChunk(chunk map[string]any) string {
 				content += refusal
 			}
 			if content != "" {
-				c.textContent.WriteString(content)
+				if c.textLog != nil && !c.nonstream {
+					c.textLog.WriteString(content)
+				} else {
+					c.textContent.WriteString(content)
+				}
 				if !c.textBlockOpen {
 					if c.thinkingBlockOpen {
 						events.WriteString(c.evt("content_block_stop", map[string]any{"index": c.thinkingBlockIdx}))
@@ -278,7 +293,11 @@ func (c *AnthropicStreamConverter) processChunk(chunk map[string]any) string {
 				}
 				if fn != nil {
 					if args, ok := fn["arguments"].(string); ok && args != "" {
-						slot.args.WriteString(args)
+						if c.logPolicy != nil && !c.nonstream {
+							c.appendToolLog(slot, args)
+						} else {
+							slot.args.WriteString(args)
+						}
 						events.WriteString(c.evt("content_block_delta", map[string]any{
 							"index": slot.blockIdx,
 							"delta": map[string]any{"type": "input_json_delta", "partial_json": args},
@@ -311,6 +330,32 @@ func (c *AnthropicStreamConverter) processChunk(chunk map[string]any) string {
 }
 
 func (c *AnthropicStreamConverter) SetNonstream() { c.nonstream = true }
+
+func (c *AnthropicStreamConverter) appendToolLog(slot *toolUseSlot, args string) {
+	p := *c.logPolicy
+	if !p.Enabled || c.toolLogFull {
+		return
+	}
+	if p.Limit > 0 && len(args) > p.Limit-c.toolLogBytes {
+		cut := p.Limit - c.toolLogBytes
+		for cut > 0 && !utf8.RuneStart(args[cut]) {
+			cut--
+		}
+		args = args[:cut]
+		c.toolLogFull = true
+	}
+	c.toolLogBytes += len(args)
+	slot.args.WriteString(args)
+}
+
+// SetStreamingLogPolicy bounds only diagnostic copies. Wire deltas and the
+// upstream stream validator still receive the complete tool arguments.
+// Configure before feeding chunks; non-stream replies always retain content.
+func (c *AnthropicStreamConverter) SetStreamingLogPolicy(p provider.LogCapturePolicy) {
+	c.logPolicy = &p
+	c.textLog = provider.NewLogCaptureWithPolicy(p)
+	c.thinkingLog = provider.NewLogCaptureWithPolicy(p)
+}
 
 func (c *AnthropicStreamConverter) evt(eventType string, data map[string]any) string {
 	if c.nonstream {
@@ -380,10 +425,20 @@ func (c *AnthropicStreamConverter) ToolsSummaryLimited(limit int) string {
 }
 
 // TextContent returns the accumulated assistant text (for usage logging).
-func (c *AnthropicStreamConverter) TextContent() string { return c.textContent.String() }
+func (c *AnthropicStreamConverter) TextContent() string {
+	if c.textLog != nil && !c.nonstream {
+		return c.textLog.String()
+	}
+	return c.textContent.String()
+}
 
 // Reasoning returns the accumulated thinking text (for usage logging).
-func (c *AnthropicStreamConverter) Reasoning() string { return c.thinkingContent.String() }
+func (c *AnthropicStreamConverter) Reasoning() string {
+	if c.thinkingLog != nil && !c.nonstream {
+		return c.thinkingLog.String()
+	}
+	return c.thinkingContent.String()
+}
 
 // Usage returns the merged usage map (may be nil).
 func (c *AnthropicStreamConverter) Usage() map[string]any { return c.usage }

@@ -104,7 +104,7 @@ func sameExistingPath(a, b string) bool {
 	second, err := os.Stat(b)
 	return err == nil && os.SameFile(first, second)
 }
-func launchUpdateHelper(path string) error {
+func launchUpdateHelper(path string, effectiveToken ...string) error {
 	var plan selfupdate.Plan
 	if err := selfupdate.ReadJSON(path, &plan); err != nil {
 		return err
@@ -120,6 +120,9 @@ func launchUpdateHelper(path string) error {
 		cmd = exec.Command("systemd-run", "--quiet", "--collect", "--unit=work2api-updater-"+strings.TrimPrefix(plan.ID, "transaction-"), "--property=Type=exec", helper, "-apply-update", path)
 	} else {
 		cmd = exec.Command(helper, "-apply-update", path)
+		if len(effectiveToken) > 0 {
+			cmd.Env = updateTokenEnv(os.Environ(), effectiveToken[0])
+		}
 		detachUpdate(cmd)
 	}
 	cmd.Dir = plan.CWD
@@ -338,9 +341,10 @@ func startUpdated(plan selfupdate.Plan) error {
 		defer cancel()
 		return exec.CommandContext(ctx, "systemctl", "restart", plan.Unit).Run()
 	}
-	args := append([]string(nil), plan.Args...)
+	args, env := privateUpdateArgs(plan.Args, os.Environ())
 	args = append(args, "-data-dir", plan.DataDir, "-db", plan.DBPath, "-strict-port")
 	cmd := exec.Command(plan.Target, args...)
+	cmd.Env = env
 	cmd.Dir = plan.CWD
 	detachUpdate(cmd)
 	logFile, err := os.OpenFile(filepath.Join(plan.Root, "service-start.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
@@ -355,6 +359,36 @@ func startUpdated(plan selfupdate.Plan) error {
 	}
 	go cmd.Wait()
 	return nil
+}
+
+func updateTokenEnv(env []string, token string) []string {
+	out := make([]string, 0, len(env)+1)
+	for _, value := range env {
+		key, _, _ := strings.Cut(value, "=")
+		if !strings.EqualFold(key, "ADMIN_TOKEN") {
+			out = append(out, value)
+		}
+	}
+	return append(out, "ADMIN_TOKEN="+token)
+}
+
+// Older transactions may contain a command-line token. Preserve its effective
+// override (including empty values), but never expose it in replacement argv.
+func privateUpdateArgs(args, env []string) ([]string, []string) {
+	out := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		key, token, equals := strings.Cut(args[i], "=")
+		if key != "-admin-token" && key != "--admin-token" {
+			out = append(out, args[i])
+			continue
+		}
+		if !equals && i+1 < len(args) {
+			i++
+			token = args[i]
+		}
+		env = updateTokenEnv(env, token)
+	}
+	return out, env
 }
 
 var errAcceptanceUncertain = errors.New("更新开放结果未确认")
