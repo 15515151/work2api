@@ -1,43 +1,42 @@
-# 开发与构建
+# 开发、验证与发布
 
 [返回项目首页](../README.md)
 
-## 从源码构建
+## 源码运行
 
-### 1. 环境要求
-
-- **Go ≥ 1.26**（Windows 默认安装在 `C:\Program Files\Go\bin`，若未加入 PATH 需自行指定）
-- 仅当**要改前端**时才需要 **Node ≥ 22**（前端产物已 `embed` 进仓库，纯后端构建无需 Node）
-
-### 2. 编译后端（前端已内置）
+需要 Go ≥ 1.26。前端已内嵌，纯后端构建不需要 Node。
 
 ```bash
-# 前端 dist 已 embed 进 internal/app/webui/，直接编译即可
-CGO_ENABLED=0 go build -o work2api.exe ./cmd/server
-./work2api.exe                     # 默认监听 127.0.0.1:8787
-./work2api.exe -port 8799          # 自定义端口
+go build -o work2api ./cmd/server
+./work2api
 ```
 
-Windows 上也可用脚本一键构建并运行：
-
-双击 `scripts/run.cmd` 即可启动并打开管理面板；兼容 Windows PowerShell 5.1，报错时窗口会保留错误信息。终端中也可使用以下命令：
+Windows 使用 `go build -o work2api.exe ./cmd/server`，也可双击 `scripts/run.cmd`，或运行：
 
 ```powershell
-pwsh -File scripts/run.ps1          # 构建 work2api.exe 并运行
-pwsh -File scripts/run.ps1 -NoRun   # 只构建
+pwsh -File scripts/run.ps1
+pwsh -File scripts/run.ps1 -NoRun
 ```
 
-### 3.（可选）重建前端
+## 修改前端
 
-只有修改 `webui/` 源码后才需要：
+需要 Node ≥ 22，在项目根目录执行：
 
 ```bash
-cd webui
-npm ci
-npm run build:embed                 # 类型检查、构建并同步内嵌产物
-npm run check:embed                 # 校验内嵌资源与 dist 一致
-# 回到项目根目录，重新构建后端
+npm --prefix webui ci
+npm --prefix webui run build:embed
+npm --prefix webui run check:embed
 ```
-## 验证
 
-在项目根目录运行 `go test ./...` 与 `go vet ./...`。修改前端后先运行 `npm --prefix webui run build:embed`，再运行 `npm --prefix webui run check:embed`。同步工具会清理已失去引用的旧构建产物；不要手工保留多批哈希资源。
+`build:embed` 包含类型检查、构建、同步内嵌资源与清理旧哈希文件。修改前端后应同时提交源码和 `internal/app/webui`，再重建 Go 程序。源码统一使用 LF，避免跨平台构建哈希不同。样式规范见 [WebUI 设计约定](../webui/DESIGN.md)。
+
+## 验证与产物
+
+```bash
+go test ./...
+go vet ./...
+```
+
+每次分支推送通过检查后，Actions 生成六平台临时包，保留 14 天。
+
+正式版仅手动运行 `Release binaries and GHCR image` 并填写 `vX.Y.Z` 发布，普通 push 或推送 tag 不发布 Release。标题固定为版本号，发行说明自动列出上一版本以来的非合并提交标题，并附对比链接。
