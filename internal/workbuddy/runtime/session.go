@@ -144,7 +144,46 @@ func ExtractSessionKey(body map[string]any) string {
 			return "fb:" + hex.EncodeToString(sum[:])[:16]
 		}
 	}
+	// Responses carries history in input rather than messages. Match the same
+	// weak first-user fingerprint, never a tool result or a per-turn item ID.
+	if input, ok := body["input"].(string); ok {
+		return weakSessionText(input)
+	}
+	items, _ := body["input"].([]any)
+	for _, raw := range items {
+		item, ok := raw.(map[string]any)
+		if !ok || item["role"] != "user" {
+			continue
+		}
+		if kind, _ := item["type"].(string); kind != "" && kind != "message" {
+			continue
+		}
+		text, _ := item["content"].(string)
+		if blocks, ok := item["content"].([]any); ok {
+			var parts []string
+			for _, raw := range blocks {
+				block, _ := raw.(map[string]any)
+				if block["type"] == "input_text" || block["type"] == "text" {
+					if value, _ := block["text"].(string); value != "" {
+						parts = append(parts, value)
+					}
+				}
+			}
+			text = strings.Join(parts, " ")
+		}
+		if key := weakSessionText(text); key != "" {
+			return key
+		}
+	}
 	return ""
+}
+
+func weakSessionText(text string) string {
+	if strings.TrimSpace(text) == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(text))
+	return "fb:" + hex.EncodeToString(sum[:])[:16]
 }
 
 type SessionEntry struct {
