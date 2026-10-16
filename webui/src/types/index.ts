@@ -227,6 +227,7 @@ export interface UsageDiagnostics {
   requested_output_limits?: Record<string, number>
   effective_output_limits?: Record<string, number>
   compatibility?: 'original' | 'identity' | 'client_metadata'
+  images_removed?: number
   error_kind?: string
   upstream_started: boolean
 }

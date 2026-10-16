@@ -300,6 +300,116 @@ type channelRetryUpstream struct {
 	afterCall func(int)
 }
 
+func TestWorkBuddyImageRecovery(t *testing.T) {
+	for _, tc := range []struct {
+		name                              string
+		history, current, partial, always bool
+		code                              int
+		calls                             int
+	}{
+		{"history only", true, false, false, false, 11135, 2},
+		{"history and current images", true, true, false, false, 11135, 2},
+		{"current only", false, true, false, false, 11135, 2},
+		{"no images", false, false, false, false, 11135, 1},
+		{"already output", true, false, true, false, 11135, 1},
+		{"retry bounded", true, true, false, true, 11135, 2},
+		{"other error", true, false, false, false, 11101, 1},
+		{"adjacent user parts", true, true, false, false, 11135, 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			o, acc := newDNSFailoverOrch(t, &failingUpstream{})
+			client := &channelRetryUpstream{body: fmt.Sprintf(`{"code":%d}`, tc.code), partial: tc.partial, always: tc.always}
+			o.wb.UpstreamClient = client
+			image := func(url string) any {
+				return map[string]any{"type": "image_url", "image_url": map[string]any{"url": url}}
+			}
+			old := []any{map[string]any{"type": "text", "text": "old"}}
+			if tc.history {
+				old = append(old, image("https://example.test/expired.png"), image("data:image/png;base64,AA=="))
+			}
+			current := []any{map[string]any{"type": "text", "text": "continue"}}
+			if tc.current {
+				current = append(current, image("https://example.test/current.png"))
+			}
+			body := map[string]any{"messages": []any{
+				map[string]any{"role": "user", "content": old},
+				map[string]any{"role": "assistant", "content": "previous answer", "tool_calls": []any{map[string]any{"id": "call1", "function": map[string]any{"name": "run", "arguments": `{"image_url":"business data"}`}}}},
+				map[string]any{"role": "tool", "tool_call_id": "call1", "content": "result"},
+				map[string]any{"role": "user", "content": current},
+			}}
+			if tc.name == "adjacent user parts" {
+				messages := body["messages"].([]any)
+				body["messages"] = []any{messages[0], messages[3]}
+			}
+			original, _ := json.Marshal(body)
+			d := &wbruntime.RequestDiagnostics{}
+			ctx := context.WithValue(context.Background(), wbruntime.RequestDiagnosticsKey{}, d)
+			_, err := o.openUpstream(ctx, acc, body, "test-model", "", func(string) error { return nil }, nil)
+			if client.calls != tc.calls {
+				t.Fatalf("calls=%d want=%d err=%v", client.calls, tc.calls, err)
+			}
+			wantSuccess := tc.calls == 2 && !tc.always
+			if (err == nil) != wantSuccess {
+				t.Fatalf("unexpected recovery result: %v", err)
+			}
+			after, _ := json.Marshal(body)
+			if string(after) != string(original) {
+				t.Fatal("original request changed")
+			}
+			if tc.calls == 2 {
+				if client.urls[0] != client.urls[1] {
+					t.Fatal("image recovery changed upstream account region")
+				}
+				messages := client.bodies[1]["messages"].([]any)
+				wantRemoved := 0
+				if tc.history {
+					wantRemoved += 2
+				}
+				if tc.current {
+					wantRemoved++
+				}
+				if d.ImagesRemoved != wantRemoved {
+					t.Fatalf("removed=%d want=%d", d.ImagesRemoved, wantRemoved)
+				}
+				for i, item := range messages {
+					message := item.(map[string]any)
+					originalMessage := body["messages"].([]any)[i].(map[string]any)
+					if parts, ok := message["content"].([]any); ok {
+						for _, part := range parts {
+							if part.(map[string]any)["type"] == "image_url" {
+								t.Fatal("image survived recovery")
+							}
+						}
+						before := originalMessage["content"].([]any)
+						oldText, _ := json.Marshal(before[0])
+						newText, _ := json.Marshal(parts[0])
+						if len(parts) != len(before) || string(oldText) != string(newText) {
+							t.Fatal("text or block order changed")
+						}
+					} else {
+						before, _ := json.Marshal(originalMessage)
+						after, _ := json.Marshal(message)
+						if string(before) != string(after) {
+							t.Fatalf("non-image message %d changed", i)
+						}
+					}
+				}
+			}
+			if !o.wb.Pool.Get(acc.UID).Enabled || o.wb.Pool.Get(acc.UID).CooldownUntil > nowSec() {
+				t.Fatal("image failure penalized account")
+			}
+			if wantSuccess {
+				client.calls, client.bodies = 0, nil
+				_, _ = o.openUpstream(ctx, acc, body, "test-model", "", func(string) error { return nil }, nil)
+				first, _ := json.Marshal(client.bodies[0])
+				if string(first) != string(original) {
+					t.Fatal("image fallback leaked into next request")
+				}
+			}
+		})
+	}
+}
+
 func (f *channelRetryUpstream) StreamUpstream(_ context.Context, _ map[string]string, request map[string]any, target string, yield upstream.LineFunc) error {
 	f.calls++
 	f.bodies = append(f.bodies, request)

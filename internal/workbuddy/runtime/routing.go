@@ -308,6 +308,7 @@ func (o *Runtime) OpenUpstreamScoped(ctx context.Context, acc *pool.Account, bod
 	compatUID := ""
 	compatLevel := 0
 	requestCompatLevel := 0
+	imageRetried := false
 	var candidates [3]struct {
 		body           map[string]any
 		matched, ready bool
@@ -482,7 +483,7 @@ func (o *Runtime) OpenUpstreamScoped(ctx context.Context, acc *pool.Account, bod
 			return acc, err
 		}
 		if started {
-			if denied {
+			if denied || (upstreamErr && ClassifyUpstream(ue.StatusCode, ue.Raw, ue.Header) == ErrImageInvalid) {
 				return acc, err
 			}
 			// 流已开始又中断：软冷却（可能是上游中途掉线），不重试已开始的流。
@@ -498,6 +499,24 @@ func (o *Runtime) OpenUpstreamScoped(ctx context.Context, acc *pool.Account, bod
 				o.Pool.OnFailure(acc.UID, CooldownSoft)
 			}
 			return acc, err
+		}
+		// Recover only explicit 11135 errors before any output. Never penalize an
+		// account or cache this request-local, lossy fallback.
+		if !imageRetried && ue.StatusCode == 400 && CodeMarker(strings.ToLower(string(ue.Raw)), "11135") && attempt+1 < maxFailoverAttempts {
+			if reduced, count := withoutRequestImages(body); count > 0 {
+				body = reduced
+				for i := range candidates {
+					candidates[i].ready = false
+				}
+				imageRetried = true
+				compatUID, compatLevel = acc.UID, level
+				delete(tried, acc.UID)
+				if d := Diagnostic(ctx); d != nil {
+					d.ImagesRemoved = count
+				}
+				log.Printf("图片降级: model=%s removed=%d attempt=%d", model, count, attempt+1)
+				continue
+			}
 		}
 		if denied {
 			requestCompatLevel = max(requestCompatLevel, level)
