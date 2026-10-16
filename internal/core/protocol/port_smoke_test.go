@@ -22,6 +22,62 @@ type terminalOnlyReader struct {
 	reads int
 }
 
+func TestToolResultImagesSurviveProtocolConversion(t *testing.T) {
+	image := map[string]any{"type": "image", "source": map[string]any{"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}}
+	body := map[string]any{"model": "test", "messages": []any{
+		map[string]any{"role": "user", "content": "take two screenshots"},
+		map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "tool_use", "id": "a", "name": "shot", "input": map[string]any{}}, map[string]any{"type": "tool_use", "id": "b", "name": "shot", "input": map[string]any{}}}},
+		map[string]any{"role": "user", "content": []any{map[string]any{"type": "tool_result", "tool_use_id": "b", "content": []any{map[string]any{"type": "text", "text": "second shot"}, image}}, map[string]any{"type": "tool_result", "tool_use_id": "a", "content": "first shot"}}},
+	}}
+	original, _ := json.Marshal(body)
+	chat, err := PrepareRequest(Anthropic, Chat, body, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	messages := jsonutil.SliceAt(chat, "messages")
+	if len(messages) != 5 {
+		t.Fatalf("unexpected messages: %v", messages)
+	}
+	for i, id := range []string{"a", "b"} {
+		m := messages[i+2].(map[string]any)
+		if m["role"] != "tool" || m["tool_call_id"] != id {
+			t.Fatal("tool result pairing broken")
+		}
+	}
+	attachment := messages[4].(map[string]any)
+	parts := jsonutil.SliceAt(attachment, "content")
+	if attachment["role"] != "user" || len(parts) != 2 || jsonutil.StringAt(parts[1].(map[string]any), "image_url", "url") != "data:image/png;base64,iVBORw0KGgo=" {
+		t.Fatal("tool image lost", attachment)
+	}
+	responses, err := PrepareRequest(Anthropic, Responses, body, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, raw := range jsonutil.SliceAt(responses, "input") {
+		item := raw.(map[string]any)
+		if item["type"] == "function_call_output" && item["call_id"] == "b" {
+			parts := jsonutil.SliceAt(item, "output")
+			found = len(parts) == 2 && parts[1].(map[string]any)["type"] == "input_image"
+		}
+	}
+	if !found {
+		t.Fatal("Responses tool image became text")
+	}
+	back, err := PrepareRequest(Responses, Anthropic, responses, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, _ := json.Marshal(back)
+	if !bytes.Contains(encoded, []byte(`"type":"image"`)) {
+		t.Fatal("image lost on reverse conversion")
+	}
+	after, _ := json.Marshal(body)
+	if !bytes.Equal(original, after) {
+		t.Fatal("input mutated")
+	}
+}
+
 func TestResponsesUsageObservesNativeTerminalWithoutDecodingContent(t *testing.T) {
 	for _, tc := range []struct{ status, kind, reason, want string }{
 		{"completed", "custom_tool_call", "", "tool_calls"},

@@ -12,9 +12,9 @@ import (
 // E2 回归：会话亲和信号按上游优先级取请求头，回落 body 信号。
 func TestDeriveRequestIDsHeaderSignals(t *testing.T) {
 	// x-session-id 头优先于 body 信号（客户端显式分离会话）
-	h := http.Header{"X-Session-Id": []string{"ses_0123456789abABCDEFGHIJKLMN"}}
+	h := http.Header{"X-Session-Id": []string{"ses_012345678ffeABCDEFGHIJKLMN"}}
 	ids := deriveRequestIDs(map[string]any{"conversation_id": "other"}, h)
-	if ids.Session != "ses_0123456789abABCDEFGHIJKLMN" {
+	if ids.Session != "ses_012345678ffeABCDEFGHIJKLMN" {
 		t.Fatalf("header 信号应优先, got %q", ids.Session)
 	}
 	// 上游头优先级：x-opencode-session > x-session-affinity > X-Session-Id > x-session-id > conversation-id
@@ -35,7 +35,7 @@ func TestDeriveRequestIDsHeaderSignals(t *testing.T) {
 }
 
 func TestCanonicalSessionIDPassesValidIDUnchanged(t *testing.T) {
-	valid := "ses_0123456789ab" + "ABCDEFGHIJKLMN" // ses_ + 12 hex + 14 base62
+	valid := "ses_012345678ffe" + "ABCDEFGHIJKLMN" // ses_ + 12 hex + 14 base62
 	if !canonicalSessionPattern.MatchString(valid) {
 		t.Fatalf("test fixture is not a canonical session id: %q", valid)
 	}
@@ -71,7 +71,7 @@ func TestNodePoolCursorForIsDeterministicPerSession(t *testing.T) {
 		t.Fatalf("newNodePool: %v", err)
 	}
 
-	const session = "ses_0123456789abABCDEFGHIJKLMN"
+	const session = "ses_012345678ffeABCDEFGHIJKLMN"
 	first := pool.CursorFor(session)
 	second := pool.CursorFor(session)
 	if first.next != second.next {

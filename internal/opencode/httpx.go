@@ -2,15 +2,13 @@ package opencode
 
 import (
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
-	"runtime"
 )
 
 // userAgent identifies as the OpenCode CLI so Zen accepts the request.
 func userAgent() string {
-	return fmt.Sprintf("opencode/1.18.31 (%s %s; %s)", runtime.GOOS, runtime.GOARCH, runtime.Version())
+	return "opencode/latest/2.0.29/cli"
 }
 
 // drainAndClose discards and closes a response body so its connection can be

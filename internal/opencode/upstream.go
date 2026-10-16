@@ -3,12 +3,15 @@ package opencode
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"time"
 	"work2api/internal/streamwatch"
 
 	"work2api/internal/core/protocol"
@@ -192,7 +195,7 @@ func (rt *Runtime) doAnonymousUpstream(ctx context.Context, route Route, bodies 
 			drainAndClose(lastResponse.Body)
 			lastResponse = nil
 		}
-		req, err := newUpstreamRequest(ctx, rt.cfg.Upstream.Zen, route.Protocol, body, ids, anonymousZenKey)
+		req, err := newUpstreamRequest(ctx, rt.anonymousBase(), route.Protocol, body, ids, anonymousZenKey)
 		if err != nil {
 			return nil, err, attempts
 		}
@@ -203,7 +206,8 @@ func (rt *Runtime) doAnonymousUpstream(ctx context.Context, route Route, bodies 
 		if ids.AccountUID != nil {
 			*ids.AccountUID = "opencode:anonymous"
 		}
-		resp, err := doInferenceAttempt(node.proxy.client, req, route.Protocol)
+		resp, err := doInferenceAttempt(node.proxy.client, req, route.Protocol, time.Duration(rt.cfg.Performance.AttemptTimeoutSeconds)*time.Second)
+		err = classifyProxyRoute(node.proxy, err)
 		attemptStatus := 0
 		if resp != nil {
 			attemptStatus = resp.StatusCode
@@ -228,7 +232,11 @@ func (rt *Runtime) doAnonymousUpstream(ctx context.Context, route Route, bodies 
 		return lastResponse, nil, attempts
 	}
 	if lastErr == nil {
-		lastErr = errors.New("no healthy anonymous proxies available")
+		if !rt.transports.hasHealthy() {
+			lastErr = errProxyUnavailable
+		} else {
+			lastErr = errors.New("no healthy anonymous proxies available")
+		}
 	}
 	return nil, lastErr, attempts
 }
@@ -237,7 +245,7 @@ const anonymousZenKey = "public"
 
 // anonymousCoreTools are the tool names the free tier expects on an
 // agent-shaped request. Requests without them are rejected with 403.
-var anonymousCoreTools = []string{"bash", "edit", "glob", "grep", "read"}
+var anonymousCoreTools = []string{"shell", "read"}
 
 // prepareAnonymousBody normalizes a body for the free tier: streaming enabled,
 // include_usage for Chat, and the core agent tools present. System One decision
@@ -340,8 +348,11 @@ func anonymousToolset(proto protocol.Protocol, names []string) []any {
 }
 
 func anonymousTool(proto protocol.Protocol, name string) map[string]any {
-	description := "Agent tool " + name
-	parameters := map[string]any{"type": "object", "properties": map[string]any{}}
+	definition, known := officialTools[name]
+	if !known {
+		return nil
+	}
+	description, parameters := definition.Description, definition.Parameters
 	switch proto {
 	case protocol.Chat:
 		return map[string]any{
@@ -442,7 +453,8 @@ func (rt *Runtime) doKeyUpstream(ctx context.Context, route Route, bodies map[Ti
 		if ids.AccountUID != nil {
 			*ids.AccountUID = uid
 		}
-		resp, err := doInferenceAttempt(proxy.client, req, route.Protocol)
+		resp, err := doInferenceAttempt(proxy.client, req, route.Protocol, time.Duration(rt.cfg.Performance.AttemptTimeoutSeconds)*time.Second)
+		err = classifyProxyRoute(proxy, err)
 		attemptStatus := 0
 		if resp != nil {
 			attemptStatus = resp.StatusCode
@@ -514,11 +526,11 @@ func newUpstreamRequest(ctx context.Context, baseURL string, proto protocol.Prot
 	req.Header.Set("Accept", "application/json, text/event-stream")
 	req.Header.Set("User-Agent", userAgent())
 	req.Header.Set("x-opencode-client", "cli")
-	req.Header.Set("x-opencode-session", ids.Session)
+	req.Header.Set("x-opencode-session-id", ids.Session)
 	req.Header.Set("x-session-affinity", ids.Session)
 	req.Header.Set("X-Session-Id", ids.Session)
-	req.Header.Set("x-opencode-request", ids.Request)
-	req.Header.Set("x-opencode-project", ids.Project)
+	sum := sha256.Sum256([]byte(ids.Project))
+	req.Header.Set("x-opencode-project", hex.EncodeToString(sum[:20]))
 	if ids.ParentSession != "" {
 		req.Header.Set("x-parent-session-id", ids.ParentSession)
 	}
@@ -534,4 +546,14 @@ func newUpstreamRequest(ctx context.Context, baseURL string, proto protocol.Prot
 
 func isNonRetryableClientResponse(resp *http.Response, err error) bool {
 	return err == nil && resp != nil && resp.StatusCode >= 400 && resp.StatusCode < 500 && resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusTooManyRequests
+}
+
+func (rt *Runtime) anonymousBase() string {
+	if rt.cfg.Upstream.Anonymous != "" {
+		return rt.cfg.Upstream.Anonymous
+	}
+	if strings.TrimRight(rt.cfg.Upstream.Zen, "/") == "https://opencode.ai/zen" {
+		return "https://opencode.ai/inference"
+	}
+	return rt.cfg.Upstream.Zen
 }

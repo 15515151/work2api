@@ -18,6 +18,10 @@ const (
 // syncProxyResult updates proxy health from real traffic. Only timeouts and
 // connection refusals mark a proxy unavailable.
 func (rt *Runtime) syncProxyResult(ctx context.Context, proxy *proxyTransport, status int, err error) bool {
+	var attempt *attemptError
+	if errors.As(err, &attempt) && attempt.phase == "first_event" {
+		return false
+	}
 	if proxy == nil || isLocalDNSFailure(err) {
 		return false
 	}
@@ -72,6 +76,13 @@ func (rt *Runtime) rebindUnavailableProxy(proxy *proxyTransport, wasHealthy bool
 }
 
 func (rt *Runtime) restoreProxy(proxy *proxyTransport) (zenMoved, goMoved int) {
+	if rt.anonymous != nil {
+		for _, node := range rt.anonymous.nodes {
+			if node.proxy == proxy {
+				rt.anonymous.MarkSuccess(node)
+			}
+		}
+	}
 	if proxy == nil {
 		return 0, 0
 	}
@@ -235,7 +246,7 @@ func (rt *Runtime) refreshZen(ctx context.Context) []string {
 	if !rt.cfg.Anonymous {
 		return nil
 	}
-	return rt.refreshAnonymousTier(ctx, rt.cfg.Upstream.Zen)
+	return rt.refreshAnonymousTier(ctx, rt.anonymousBase())
 }
 
 func (rt *Runtime) refreshAnonymousTier(ctx context.Context, base string) []string {
@@ -251,6 +262,9 @@ func (rt *Runtime) refreshAnonymousTier(ctx context.Context, base string) []stri
 		}
 		refreshCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		models, status, err := FetchModels(refreshCtx, node.proxy.client, base, anonymousZenKey)
+		if status == http.StatusNotFound && base != rt.cfg.Upstream.Zen {
+			models, status, err = FetchModels(refreshCtx, node.proxy.client, rt.cfg.Upstream.Zen, anonymousZenKey)
+		}
 		if ctx.Err() != nil || errors.Is(err, context.Canceled) {
 			cancel()
 			return nil

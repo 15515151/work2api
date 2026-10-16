@@ -121,6 +121,10 @@ func isLocalDNSFailure(err error) bool {
 }
 
 func (p *anonymousPool) MarkFailure(node *anonymousNode, resp *http.Response, err error) {
+	var attempt *attemptError
+	if errors.As(err, &attempt) && attempt.phase == "first_event" {
+		return
+	}
 	if node == nil {
 		return
 	}
@@ -134,7 +138,7 @@ func (p *anonymousPool) MarkFailure(node *anonymousNode, resp *http.Response, er
 	delay := p.cooldown * time.Duration(1<<min(failures-1, 3))
 	if resp != nil {
 		if retryAfter := parseRetryAfter(resp.Header.Get("Retry-After")); retryAfter > delay {
-			delay = retryAfter
+			delay = min(retryAfter, p.cooldown*8)
 		}
 	}
 	node.cooldownUntil.Store(time.Now().Add(delay).UnixNano())
@@ -461,6 +465,10 @@ func (p *nodePool) MarkSuccess(node *upstreamNode) {
 }
 
 func (p *nodePool) MarkFailure(node *upstreamNode, resp *http.Response, err error) {
+	var attempt *attemptError
+	if errors.As(err, &attempt) && attempt.phase == "first_event" {
+		return
+	}
 	if err != nil && isLocalDNSFailure(err) {
 		return
 	}

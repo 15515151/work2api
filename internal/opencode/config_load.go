@@ -66,8 +66,16 @@ func Normalize(path string, cfg Config) (Config, error) {
 		return Config{}, errors.New("prefer must be \"zen\" or \"go\"")
 	}
 	cfg.Upstream.Zen = strings.TrimSpace(cfg.Upstream.Zen)
+	cfg.Upstream.Anonymous = strings.TrimSpace(cfg.Upstream.Anonymous)
+	if cfg.Upstream.Anonymous == "" {
+		if strings.TrimRight(cfg.Upstream.Zen, "/") == "https://opencode.ai/zen" {
+			cfg.Upstream.Anonymous = "https://opencode.ai/inference"
+		} else {
+			cfg.Upstream.Anonymous = cfg.Upstream.Zen
+		}
+	}
 	cfg.Upstream.Go = strings.TrimSpace(cfg.Upstream.Go)
-	for name, raw := range map[string]string{"upstream.zen": cfg.Upstream.Zen, "upstream.go": cfg.Upstream.Go} {
+	for name, raw := range map[string]string{"upstream.anonymous": cfg.Upstream.Anonymous, "upstream.zen": cfg.Upstream.Zen, "upstream.go": cfg.Upstream.Go} {
 		u, err := url.Parse(strings.TrimSpace(raw))
 		if err != nil || u.Host == "" || (strings.ToLower(u.Scheme) != "http" && strings.ToLower(u.Scheme) != "https") {
 			return Config{}, fmt.Errorf("%s must be an http or https URL", name)

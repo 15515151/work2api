@@ -12,14 +12,31 @@ import (
 
 // Metadata carries per-model capability fields surfaced through the catalog.
 type Metadata struct {
-	ContextWindow    int      `json:"context_window,omitempty"`
-	MaxInput         int      `json:"max_input,omitempty"`
-	MaxOutput        int      `json:"max_output,omitempty"`
-	Reasoning        bool     `json:"reasoning,omitempty"`
-	ToolCall         bool     `json:"tool_call,omitempty"`
-	StructuredOutput bool     `json:"structured_output,omitempty"`
-	InputModalities  []string `json:"input_modalities,omitempty"`
-	OutputModalities []string `json:"output_modalities,omitempty"`
+	ContextWindow    int               `json:"context_window,omitempty"`
+	MaxInput         int               `json:"max_input,omitempty"`
+	MaxOutput        int               `json:"max_output,omitempty"`
+	Reasoning        bool              `json:"reasoning,omitempty"`
+	ToolCall         bool              `json:"tool_call,omitempty"`
+	StructuredOutput bool              `json:"structured_output,omitempty"`
+	InputModalities  []string          `json:"input_modalities,omitempty"`
+	OutputModalities []string          `json:"output_modalities,omitempty"`
+	ReasoningOptions []ReasoningOption `json:"reasoning_options,omitempty"`
+	Cost             *ModelCost        `json:"cost,omitempty"`
+}
+
+// These are published reference prices, not measured subscription charges.
+type ModelCost struct {
+	Input      *float64 `json:"input,omitempty"`
+	Output     *float64 `json:"output,omitempty"`
+	CacheRead  *float64 `json:"cache_read,omitempty"`
+	CacheWrite *float64 `json:"cache_write,omitempty"`
+}
+
+type ReasoningOption struct {
+	Type   string   `json:"type"`
+	Values []string `json:"values,omitempty"`
+	Min    *int     `json:"min,omitempty"`
+	Max    *int     `json:"max,omitempty"`
 }
 
 // Route describes how a model reaches an upstream, per tier.
@@ -352,7 +369,7 @@ func (c *Catalog) Supported(model string) bool {
 // the request (anonymous routes always resolve to TierZen).
 func (c *Catalog) MetadataForTier(model string, tier Tier) Metadata {
 	c.mu.RLock()
-	md, pricing := c.modelMeta[tier][model], c.pricing
+	md, pricing := cloneMetadata(c.modelMeta[tier][model]), c.pricing
 	c.mu.RUnlock()
 	if pricing != nil {
 		if price, ok := pricing.Price(model); ok {
@@ -365,6 +382,9 @@ func (c *Catalog) MetadataForTier(model string, tier Tier) Metadata {
 			}
 			if md.MaxOutput == 0 {
 				md.MaxOutput = limits.MaxOutput
+			}
+			if md.Cost == nil && price.SourceTier == tier {
+				md.Cost = publishedCost(map[string]any{"input": price.Input, "output": price.Output, "cache_read": price.CacheRead, "cache_write": price.CacheWrite})
 			}
 		}
 	}
@@ -425,7 +445,7 @@ func cloneModelMeta(source map[Tier]map[string]Metadata) map[Tier]map[string]Met
 	result := map[Tier]map[string]Metadata{TierZen: {}, TierGo: {}}
 	for _, tier := range []Tier{TierZen, TierGo} {
 		for id, md := range source[tier] {
-			result[tier][id] = md
+			result[tier][id] = cloneMetadata(md)
 		}
 	}
 	return result

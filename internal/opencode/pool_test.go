@@ -1,12 +1,20 @@
 package opencode
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	"image/color"
+	"image/png"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,6 +24,510 @@ import (
 	"work2api/internal/core/protocol"
 	"work2api/internal/core/provider"
 )
+
+func TestUpstreamCompatibilityAndToolAliases(t *testing.T) {
+	for _, proto := range []protocol.Protocol{protocol.Chat, protocol.Responses, protocol.Anthropic} {
+		t.Run(string(proto), func(t *testing.T) {
+			tool := map[string]any{"name": "read", "description": "client reader", "parameters": map[string]any{"type": "object", "properties": map[string]any{"value": map[string]any{"type": "string"}}, "required": []any{"value"}}}
+			var definition any = tool
+			if proto == protocol.Chat {
+				definition = map[string]any{"type": "function", "function": tool}
+			} else if proto == protocol.Anthropic {
+				tool["input_schema"] = tool["parameters"]
+				delete(tool, "parameters")
+			} else {
+				tool["type"] = "function"
+			}
+			body := map[string]any{"tools": []any{definition}, "messages": []any{map[string]any{"role": "assistant", "tool_calls": []any{map[string]any{"function": map[string]any{"name": "read", "arguments": `{"name":"read"}`}}}}}}
+			original, _ := json.Marshal(body)
+			lowered, names := aliasClientTools(body, proto)
+			if len(names) != 1 {
+				t.Fatal("client tool not aliased")
+			}
+			alias := ""
+			for k := range names {
+				alias = k
+			}
+			typed := lowered["tools"].([]any)[0].(map[string]any)
+			if proto == protocol.Chat {
+				typed = typed["function"].(map[string]any)
+			}
+			if typed["name"] != alias || typed["description"] != "client reader" {
+				t.Fatal("client definition replaced")
+			}
+			before, _ := json.Marshal(body)
+			if !bytes.Equal(original, before) {
+				t.Fatal("request mutated")
+			}
+			var response map[string]any
+			switch proto {
+			case protocol.Chat:
+				response = map[string]any{"choices": []any{map[string]any{"delta": map[string]any{"tool_calls": []any{map[string]any{"function": map[string]any{"name": alias, "arguments": `{"name":"read"}`}}}}}}}
+			case protocol.Responses:
+				response = map[string]any{"type": "response.output_item.added", "item": map[string]any{"type": "function_call", "name": alias, "arguments": "{}"}}
+			case protocol.Anthropic:
+				response = map[string]any{"type": "content_block_start", "content_block": map[string]any{"type": "tool_use", "name": alias, "id": "call1", "input": map[string]any{}}}
+			}
+			encoded, _ := json.Marshal(response)
+			w := httptest.NewRecorder()
+			w.Header().Set("Content-Type", "text/event-stream")
+			writer := &toolAliasWriter{ResponseWriter: w, names: names}
+			frame := append(append([]byte("event: test\ndata: "), encoded...), []byte("\n\n")...)
+			for _, b := range frame {
+				if _, err := writer.Write([]byte{b}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := writer.Finish(); err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(w.Body.String(), alias) || !strings.Contains(w.Body.String(), `"name":"read"`) {
+				t.Fatal("response alias leaked", w.Body.String())
+			}
+		})
+	}
+}
+
+func TestAttemptDeadlineDoesNotCutEstablishedStream(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\n")
+		w.(http.Flusher).Flush()
+		time.Sleep(100 * time.Millisecond)
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"last\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+	}))
+	defer srv.Close()
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, srv.URL, strings.NewReader("{}"))
+	resp, err := doInferenceAttempt(srv.Client(), req, protocol.Chat, 60*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil || !bytes.Contains(body, []byte("last")) {
+		t.Fatal("committed stream cut", err)
+	}
+	client := &http.Client{Transport: catalogTestTransport(func(r *http.Request) (*http.Response, error) { <-r.Context().Done(); return nil, r.Context().Err() })}
+	start := time.Now()
+	_, err = doInferenceAttempt(client, req, protocol.Chat, 20*time.Millisecond)
+	if !errors.Is(err, context.DeadlineExceeded) || time.Since(start) > time.Second {
+		t.Fatal("dial/write not bounded", err)
+	}
+}
+
+func TestAnonymousCooldownAndProxyRecovery(t *testing.T) {
+	proxy := &proxyTransport{}
+	proxy.healthy.Store(true)
+	p := newAnonymousPool(true, &transportPool{items: []*proxyTransport{proxy}}, time.Second)
+	p.MarkFailure(p.nodes[0], &http.Response{StatusCode: 429, Header: http.Header{"Retry-After": []string{"7200"}}}, nil)
+	if time.Until(time.Unix(0, p.nodes[0].cooldownUntil.Load())) > 8*time.Second {
+		t.Fatal("anonymous cooldown pinned for hours")
+	}
+	rt := &Runtime{anonymous: p, zenNodes: &nodePool{}, goNodes: &nodePool{}, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	rt.restoreProxy(proxy)
+	cursor := p.CursorFor("test")
+	if cursor.Next() == nil {
+		t.Fatal("recovered anonymous lane still locked")
+	}
+}
+
+func TestAnonymousEndpointAndIdentity(t *testing.T) {
+	for _, tc := range []struct{ zen, anonymous, want string }{
+		{"https://opencode.ai/zen", "", "https://opencode.ai/inference"},
+		{"https://gateway.example/zen", "", "https://gateway.example/zen"},
+		{"https://gateway.example/zen", "https://gateway.example/anonymous", "https://gateway.example/anonymous"},
+	} {
+		cfg := defaultConfig()
+		cfg.Anonymous = true
+		cfg.Upstream.Zen, cfg.Upstream.Anonymous = tc.zen, tc.anonymous
+		cfg, err := Normalize("", cfg)
+		if err != nil || cfg.Upstream.Anonymous != tc.want {
+			t.Fatalf("anonymous endpoint: %q %v", cfg.Upstream.Anonymous, err)
+		}
+	}
+	ids := RequestIDs{Session: CanonicalSessionID("conversation"), Project: "scoped-project"}
+	req, err := newUpstreamRequest(context.Background(), "https://gateway.example", protocol.Chat, []byte("{}"), ids, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Header.Get("x-opencode-session-id") != ids.Session || len(req.Header.Get("x-opencode-project")) != 40 || req.Header.Get("x-opencode-request") != "" {
+		t.Fatal("unexpected upstream identity headers")
+	}
+}
+
+func TestLiveMetadataShape(t *testing.T) {
+	if os.Getenv("WORK2API_LIVE_QUOTES") != "1" {
+		t.Skip("explicit live verification only")
+	}
+	cfg, err := LoadConfig(filepath.Join("..", "..", "data", "opencode", "opencode.json"))
+	if err != nil {
+		t.Fatal("local transport config unavailable")
+	}
+	pool, err := newTransportPool(cfg.RuntimeProxies(), cfg.Performance, 25*time.Second)
+	if err != nil {
+		t.Fatal("transport unavailable")
+	}
+	defer func() {
+		for _, p := range pool.items {
+			p.client.CloseIdleConnections()
+		}
+	}()
+	for _, endpoint := range []string{CapabilitiesURL, modelsDevDefaultURL} {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		req, _ := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
+		req.Header.Set("User-Agent", userAgent())
+		resp, err := pool.items[0].client.Do(req)
+		if err != nil {
+			cancel()
+			t.Fatal("metadata transport failed")
+		}
+		var providers map[string]map[string]any
+		err = json.NewDecoder(io.LimitReader(resp.Body, 64<<20)).Decode(&providers)
+		resp.Body.Close()
+		cancel()
+		if resp.StatusCode != 200 || err != nil {
+			t.Fatalf("metadata HTTP %d", resp.StatusCode)
+		}
+		for _, id := range []string{"opencode", "opencode-go"} {
+			models, _ := providers[id]["models"].(map[string]any)
+			count := 0
+			for _, raw := range models {
+				m, _ := raw.(map[string]any)
+				encoded, _ := json.Marshal(m)
+				var model capabilityModel
+				if err := json.Unmarshal(encoded, &model); err != nil {
+					t.Fatal("live metadata schema incompatible", err)
+				}
+				md := model.metadata()
+				extra := map[string]any{}
+				(&Runtime{cfg: defaultConfig()}).addDiscoveryMetadata(extra, model.ID, md, Tier(id))
+				expected := map[string]bool{}
+				for _, option := range model.ReasoningOptions {
+					if option.Type == "effort" && model.Reasoning {
+						for _, value := range option.Values {
+							if value != "" {
+								expected[value] = true
+							}
+						}
+					}
+				}
+				actual, _ := extra["reasoning_efforts"].([]string)
+				if len(actual) != len(expected) {
+					t.Fatal("live reasoning options lost or invented", model.ID)
+				}
+				for _, value := range actual {
+					if !expected[value] {
+						t.Fatal("unexpected live effort", model.ID, value)
+					}
+				}
+				if m["reasoning"] != true {
+					continue
+				}
+				keys := []string{}
+				for k := range m {
+					keys = append(keys, k)
+				}
+				if count < 2 {
+					t.Logf("source=%s provider=%s reasoning_model=%v keys=%v reasoning_options=%v cost=%v", endpoint, id, m["id"], keys, m["reasoning_options"], m["cost"])
+				}
+				count++
+			}
+			t.Logf("validated source=%s provider=%s models=%d reasoning_models=%d", endpoint, id, len(models), count)
+		}
+	}
+}
+
+func TestResponsesMinimumBudgetKeepsInvalidAndLargeValues(t *testing.T) {
+	rt := &Runtime{cfg: defaultConfig()}
+	for _, n := range []float64{0, 1, 2.5, 15, 16, 1024} {
+		input := map[string]any{"model": "test", "input": "hi", "max_output_tokens": n}
+		bodies, err := rt.prepareRouteBodies(protocol.Responses, Route{Tier: TierZen, Protocol: protocol.Responses}, input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var actual map[string]any
+		if err := json.Unmarshal(bodies[TierZen], &actual); err != nil {
+			t.Fatal(err)
+		}
+		want := n
+		if n == 1 || n == 15 {
+			want = 16
+		}
+		if actual["max_output_tokens"] != want || input["max_output_tokens"] != n {
+			t.Fatalf("budget %v: got %v, want %v; input %v", n, actual["max_output_tokens"], want, input["max_output_tokens"])
+		}
+	}
+}
+
+func TestFragmentedToolNamePreservesArguments(t *testing.T) {
+	w := httptest.NewRecorder()
+	w.Header().Set("Content-Type", "text/event-stream")
+	writer := &toolAliasWriter{ResponseWriter: w, names: map[string]string{"w2a_example": "read"}}
+	for _, name := range []string{"w2a_", "example"} {
+		frame := fmt.Sprintf("data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":%q,\"arguments\":\"w2a_example\"}}]}}]}\n\n", name)
+		if _, err := writer.Write([]byte(frame)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.Finish(); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(w.Body.String(), `"name":"read"`) || strings.Count(w.Body.String(), `"arguments":"w2a_example"`) != 2 {
+		t.Fatal("fragmented name or opaque arguments corrupted", w.Body.String())
+	}
+}
+
+func TestCompatibilityToolScopePreservesInputAndRejectsPlaceholders(t *testing.T) {
+	for _, proto := range []protocol.Protocol{protocol.Chat, protocol.Anthropic, protocol.Responses} {
+		input := map[string]any{"messages": []any{map[string]any{"role": "user", "content": "read original text"}}, "system": "original system", "instructions": "original instructions", "tool_choice": "auto"}
+		before, _ := json.Marshal(input)
+		out := describeClientTools(input, proto, map[string]string{"alias_read": "read"}, true)
+		after, _ := json.Marshal(input)
+		if !bytes.Equal(before, after) || out["tool_choice"] != "auto" {
+			t.Fatal("client input or automatic choice modified")
+		}
+		var response map[string]any
+		switch proto {
+		case protocol.Chat:
+			response = map[string]any{"choices": []any{map[string]any{"message": map[string]any{"tool_calls": []any{map[string]any{"function": map[string]any{"name": "read", "arguments": "{}"}}}}}}}
+		case protocol.Anthropic:
+			response = map[string]any{"type": "content_block_start", "content_block": map[string]any{"type": "tool_use", "name": "read"}}
+		case protocol.Responses:
+			response = map[string]any{"type": "response.output_item.added", "item": map[string]any{"type": "function_call", "name": "read"}}
+		}
+		raw, _ := json.Marshal(response)
+		w := httptest.NewRecorder()
+		writer := &toolAliasWriter{ResponseWriter: w, names: map[string]string{"alias_read": "read"}, blocked: map[string]bool{"read": true}}
+		if _, err := writer.Write(raw); err == nil || w.Body.Len() != 0 || writer.Finish() == nil {
+			t.Fatal("non-executable tool reached client", proto)
+		}
+	}
+	w := httptest.NewRecorder()
+	w.Header().Set("Content-Type", "text/event-stream")
+	writer := &toolAliasWriter{ResponseWriter: w, blocked: map[string]bool{"read": true}}
+	for i, fragment := range []string{"re", "ad"} {
+		frame := fmt.Sprintf("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"name\":%q}}]}}]}\n\n", fragment)
+		_, err := writer.Write([]byte(frame))
+		if (i == 0 && err != nil) || (i == 1 && err == nil) {
+			t.Fatal("fragmented placeholder escaped guard", err)
+		}
+	}
+	if strings.Contains(w.Body.String(), `"name":"re"`) {
+		t.Fatal("partial placeholder name leaked")
+	}
+}
+
+// Run explicitly after user approval; never reads keys into test output and
+// never dispatches through paid lanes. No server restart is required.
+func TestLiveOpenCodeCompatibility(t *testing.T) {
+	if os.Getenv("WORK2API_LIVE_OPENCODE") != "1" {
+		t.Skip("explicit live invocation only")
+	}
+	cfg, err := LoadConfig(filepath.Join("..", "..", "data", "opencode", "opencode.json"))
+	if err != nil {
+		t.Fatal("local OpenCode config unavailable")
+	}
+	cfg.ZenKeys, cfg.GoKeys = nil, nil
+	cfg.Anonymous = true
+	cfg.Retry.MaxAttempts = 1
+	transports, err := newTransportPool(cfg.RuntimeProxies(), cfg.Performance, 45*time.Second)
+	if err != nil {
+		t.Fatal("proxy transport unavailable")
+	}
+	defer func() {
+		for _, proxy := range transports.items {
+			proxy.client.CloseIdleConnections()
+		}
+	}()
+	rt := &Runtime{cfg: cfg, logger: slog.New(slog.NewTextHandler(io.Discard, nil)), transports: transports, zenNodes: &nodePool{}, goNodes: &nodePool{}, anonymous: newAnonymousPool(true, transports, time.Second), catalog: NewCatalog(TierZen, nil), ready: true}
+	model := "deepseek-v4.1-flash-free"
+	rt.catalog.ReplaceWithCapabilities([]string{model}, nil, map[Tier]map[string]protocol.Protocol{TierZen: {model: protocol.Chat}}, nil, nil)
+	if os.Getenv("WORK2API_LIVE_AUTO_TOOLS") == "1" {
+		ctx, cancel := context.WithTimeout(context.Background(), 70*time.Second)
+		defer cancel()
+		payload := map[string]any{"model": "opencode/" + model, "max_tokens": 2048, "reasoning_effort": "low", "tool_choice": "auto",
+			"messages": []any{map[string]any{"role": "user", "content": "Use the read tool to read /tmp/work2api-probe.txt. Call the tool, do not answer with instructions."}},
+			"tools":    []any{map[string]any{"type": "function", "function": map[string]any{"name": "read", "description": "Read a local text file.", "parameters": map[string]any{"type": "object", "properties": map[string]any{"file_path": map[string]any{"type": "string"}}, "required": []any{"file_path"}}}}}}
+		for _, external := range []protocol.Protocol{protocol.Chat, protocol.Anthropic, protocol.Responses} {
+			converted, err := protocol.PrepareRequest(protocol.Chat, external, payload, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			w := httptest.NewRecorder()
+			report, err := rt.Serve(ctx, provider.ServeRequest{Protocol: provider.Protocol(external), Payload: converted, Writer: w})
+			if err != nil || w.Code != 200 || report.Status != "ok" {
+				t.Fatalf("automatic tool call failed HTTP=%d outcome=%s", w.Code, report.Status)
+			}
+			var response map[string]any
+			encoded, convertErr := protocol.ConvertResponse(external, protocol.Chat, w.Body.Bytes())
+			if convertErr != nil {
+				t.Fatal(convertErr)
+			}
+			if json.Unmarshal(encoded, &response) != nil {
+				t.Fatal("invalid response")
+			}
+			choices, _ := response["choices"].([]any)
+			if len(choices) != 1 {
+				t.Fatal("expected one choice")
+			}
+			choice, _ := choices[0].(map[string]any)
+			message, _ := choice["message"].(map[string]any)
+			calls, _ := message["tool_calls"].([]any)
+			if len(calls) != 1 {
+				t.Fatal("expected client read call")
+			}
+			call, _ := calls[0].(map[string]any)
+			fn, _ := call["function"].(map[string]any)
+			var args map[string]any
+			if json.Unmarshal([]byte(fmt.Sprint(fn["arguments"])), &args) != nil || fn["name"] != "read" || args["file_path"] != "/tmp/work2api-probe.txt" {
+				t.Fatalf("automatic selection broke client tool contract: function=%v", fn)
+			}
+			t.Logf("automatic read selection preserved original name and file_path schema protocol=%s; no tool executed", external)
+		}
+		return
+	}
+	for _, proto := range []provider.Protocol{provider.ProtocolChat, provider.ProtocolAnthropic, provider.ProtocolResponses} {
+		if os.Getenv("WORK2API_LIVE_IMAGES_ONLY") == "1" {
+			continue
+		}
+		payload := map[string]any{"model": "opencode/" + model, "stream": false, "max_tokens": 128, "reasoning_effort": "low", "messages": []any{map[string]any{"role": "user", "content": "Reply with just OK."}}}
+		if proto == provider.ProtocolResponses {
+			delete(payload, "messages")
+			payload["input"] = "Reply with just OK."
+			payload["max_output_tokens"] = 128
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 70*time.Second)
+		w := httptest.NewRecorder()
+		started := time.Now()
+		report, err := rt.Serve(ctx, provider.ServeRequest{Protocol: proto, Payload: payload, Writer: w})
+		cancel()
+		t.Logf("protocol=%s status=%d duration=%s outcome=%s", proto, w.Code, time.Since(started).Round(time.Millisecond), report.Status)
+		if err != nil || w.Code != 200 {
+			t.Fatalf("upstream verification failed: HTTP %d, %s", w.Code, w.Body.String())
+		}
+	}
+	for _, external := range []protocol.Protocol{protocol.Chat, protocol.Anthropic, protocol.Responses} {
+		if os.Getenv("WORK2API_LIVE_IMAGES_ONLY") == "1" {
+			continue
+		}
+		chat := map[string]any{"model": "opencode/" + model, "stream": false, "max_tokens": 2048, "reasoning_effort": "low",
+			"messages":    []any{map[string]any{"role": "user", "content": "Call read with value hello. Do not answer without the tool."}},
+			"tools":       []any{map[string]any{"type": "function", "function": map[string]any{"name": "read", "description": "Echo the value provided; no file access.", "parameters": map[string]any{"type": "object", "properties": map[string]any{"value": map[string]any{"type": "string"}}, "required": []any{"value"}}}}},
+			"tool_choice": map[string]any{"type": "function", "function": map[string]any{"name": "read"}}}
+		payload, err := protocol.PrepareRequest(protocol.Chat, external, chat, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		proto := provider.ProtocolChat
+		if external == protocol.Anthropic {
+			proto = provider.ProtocolAnthropic
+		}
+		if external == protocol.Responses {
+			proto = provider.ProtocolResponses
+		}
+		invoke := func(p map[string]any) *httptest.ResponseRecorder {
+			ctx, cancel := context.WithTimeout(context.Background(), 70*time.Second)
+			defer cancel()
+			w := httptest.NewRecorder()
+			start := time.Now()
+			report, err := rt.Serve(ctx, provider.ServeRequest{Protocol: proto, Payload: p, Writer: w})
+			t.Logf("tool protocol=%s status=%d duration=%s outcome=%s finish=%s", external, w.Code, time.Since(start).Round(time.Millisecond), report.Status, report.FinishReason)
+			if err != nil || w.Code != 200 || report.Status != "ok" {
+				t.Fatalf("tool verification failed HTTP %d: %s", w.Code, w.Body.String())
+			}
+			return w
+		}
+		first := invoke(payload)
+		decoded, err := protocol.ConvertResponse(external, protocol.Chat, first.Body.Bytes())
+		if err != nil {
+			t.Fatal(err)
+		}
+		var result map[string]any
+		if json.Unmarshal(decoded, &result) != nil {
+			t.Fatal("invalid response")
+		}
+		choices := result["choices"].([]any)
+		message := choices[0].(map[string]any)["message"].(map[string]any)
+		calls, _ := message["tool_calls"].([]any)
+		if len(calls) != 1 {
+			t.Fatal("forced client tool not called", string(decoded))
+		}
+		call := calls[0].(map[string]any)
+		fn := call["function"].(map[string]any)
+		if fn["name"] != "read" {
+			t.Fatal("client name not restored")
+		}
+		var arguments map[string]any
+		if json.Unmarshal([]byte(fn["arguments"].(string)), &arguments) != nil || arguments["value"] != "hello" {
+			t.Fatal("client schema not respected", fn)
+		}
+		chat["model"] = "opencode/" + model
+		chat["messages"] = append(chat["messages"].([]any), message, map[string]any{"role": "tool", "tool_call_id": call["id"], "content": "The result is 42."}, map[string]any{"role": "user", "content": "Now reply with only the result number. Do not call any tools."})
+		chat["tool_choice"] = "none"
+		follow, err := protocol.PrepareRequest(protocol.Chat, external, chat, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		invoke(follow)
+		// Verify aliases do not leak through real SSE events, including native
+		// Responses events used by the outer namespace/custom restoration layer.
+		payload["model"] = "opencode/" + model
+		payload["stream"] = true
+		streamed := invoke(payload)
+		_, aliases := aliasClientTools(payload, external)
+		for _, line := range strings.Split(streamed.Body.String(), "\n") {
+			if !strings.HasPrefix(line, "data:") {
+				continue
+			}
+			var event map[string]any
+			if json.Unmarshal([]byte(strings.TrimSpace(strings.TrimPrefix(line, "data:"))), &event) == nil && restoreToolNames(event, aliases) {
+				t.Fatal("structured tool name alias leaked")
+			}
+		}
+		if !strings.Contains(streamed.Body.String(), `"name":"read"`) {
+			t.Fatal("client tool name missing")
+		}
+	}
+	// A tiny generated PNG avoids using any user attachment in upstream tests.
+	img := image.NewRGBA(image.Rect(0, 0, 32, 32))
+	for y := 0; y < 32; y++ {
+		for x := 0; x < 32; x++ {
+			img.Set(x, y, color.RGBA{R: 255, A: 255})
+		}
+	}
+	var pngBytes bytes.Buffer
+	if err := png.Encode(&pngBytes, img); err != nil {
+		t.Fatal(err)
+	}
+	picture := map[string]any{"type": "image", "source": map[string]any{"type": "base64", "media_type": "image/png", "data": base64.StdEncoding.EncodeToString(pngBytes.Bytes())}}
+	for _, external := range []protocol.Protocol{protocol.Anthropic, protocol.Responses} {
+		input := map[string]any{"model": "opencode/" + model, "max_tokens": 256, "stream": false, "messages": []any{
+			map[string]any{"role": "user", "content": "Use the screenshot tool and identify the dominant color. Answer with one English color word."},
+			map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "tool_use", "id": "shot1", "name": "screenshot", "input": map[string]any{}}}},
+			map[string]any{"role": "user", "content": []any{map[string]any{"type": "tool_result", "tool_use_id": "shot1", "content": []any{picture}}}},
+		}, "tools": []any{map[string]any{"name": "screenshot", "description": "Return an image", "input_schema": map[string]any{"type": "object", "properties": map[string]any{}}}}}
+		if external == protocol.Responses {
+			var err error
+			input, err = protocol.PrepareRequest(protocol.Anthropic, protocol.Responses, input, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		proto := provider.ProtocolAnthropic
+		if external == protocol.Responses {
+			proto = provider.ProtocolResponses
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 70*time.Second)
+		w := httptest.NewRecorder()
+		start := time.Now()
+		report, err := rt.Serve(ctx, provider.ServeRequest{Protocol: proto, Payload: input, Writer: w})
+		cancel()
+		t.Logf("tool-image protocol=%s HTTP=%d duration=%s outcome=%s", external, w.Code, time.Since(start).Round(time.Millisecond), report.Status)
+		if err != nil || w.Code != 200 || !strings.Contains(strings.ToLower(w.Body.String()), "red") {
+			t.Fatalf("tool image not recognized: %s", w.Body.String())
+		}
+	}
+}
 
 type catalogTestTransport func(*http.Request) (*http.Response, error)
 
@@ -137,6 +649,58 @@ func TestMergedMetadataRetainsTierLimitsAndNativeAuthority(t *testing.T) {
 	price.Limits[TierGo] = ModelLimits{}
 	if c.MetadataForTier("same", TierGo).MaxOutput != 40 {
 		t.Fatal("metadata map aliases store")
+	}
+}
+
+func TestDiscoveryUsesPublishedEffortsAndTierPrices(t *testing.T) {
+	var raw capabilityModel
+	if err := json.Unmarshal([]byte(`{"reasoning":true,"reasoning_options":[{"type":"toggle"},{"type":"effort","values":["low","high","high"]},{"type":"budget_tokens","min":1024}],"cost":{"input":0,"output":2,"cache_read":0,"cache_write":-1}}`), &raw); err != nil {
+		t.Fatal(err)
+	}
+	md := raw.metadata()
+	c := NewCatalog(TierZen, nil)
+	c.ReplaceWithCapabilities(nil, nil, nil, nil, map[Tier]map[string]Metadata{TierZen: {"m": md}})
+	md.ReasoningOptions[1].Values[0] = "corrupted"
+	*md.Cost.Output = 999
+	got := c.MetadataForTier("m", TierZen)
+	if got.ReasoningOptions[1].Values[0] != "low" || *got.Cost.Output != 2 {
+		t.Fatal("catalog retained caller references")
+	}
+	*got.Cost.Output = 7
+	if *c.MetadataForTier("m", TierZen).Cost.Output != 2 {
+		t.Fatal("returned metadata aliases cache")
+	}
+	rt := &Runtime{cfg: defaultConfig()}
+	extra := map[string]any{}
+	rt.addDiscoveryMetadata(extra, "m", c.MetadataForTier("m", TierZen), TierZen)
+	if strings.Join(extra["reasoning_efforts"].([]string), ",") != "low,high" {
+		t.Fatal("invented reasoning levels", extra)
+	}
+	cost := extra["cost"].(map[string]float64)
+	if len(cost) != 4 || cost["input"] != 0 || cost["output"] != 2 || cost["cacheRead"] != 0 {
+		t.Fatal("missing/zero/invalid reference prices confused", cost)
+	}
+	for _, options := range [][]ReasoningOption{nil, {{Type: "toggle"}}, {{Type: "budget_tokens"}}} {
+		extra = map[string]any{}
+		rt.addDiscoveryMetadata(extra, "m", Metadata{Reasoning: true, ReasoningOptions: options}, TierGo)
+		if extra["reasoning_efforts"] != nil || extra["compat"] != nil {
+			t.Fatal("non-effort controls became effort choices")
+		}
+	}
+	rt.cfg.Reasoning.Effort = "high"
+	extra = map[string]any{}
+	rt.addDiscoveryMetadata(extra, "m", c.MetadataForTier("m", TierZen), TierZen)
+	if strings.Join(extra["reasoning_efforts"].([]string), ",") != "high" || extra["default_reasoning_effort"] != "high" {
+		t.Fatal("forced effort advertised ineffective choices", extra)
+	}
+	rt.cfg.Reasoning.Effort = "max"
+	extra = map[string]any{}
+	rt.addDiscoveryMetadata(extra, "m", c.MetadataForTier("m", TierZen), TierZen)
+	if extra["reasoning_efforts"] != nil {
+		t.Fatal("unverified override became model capability")
+	}
+	if got := c.MetadataForTier("m", TierGo); got.Cost != nil || len(got.ReasoningOptions) > 0 {
+		t.Fatal("Zen capabilities leaked to Go")
 	}
 }
 

@@ -47,8 +47,9 @@ type ReasoningConfig struct {
 }
 
 type UpstreamConfig struct {
-	Zen string `json:"zen"`
-	Go  string `json:"go"`
+	Anonymous string `json:"anonymous,omitempty"`
+	Zen       string `json:"zen"`
+	Go        string `json:"go"`
 }
 
 type RetryConfig struct {
@@ -86,7 +87,7 @@ type PerformanceConfig struct {
 	AttemptTimeoutSeconds  int `json:"attempt_timeout_seconds"`
 }
 
-// AttemptTimeout bounds a single upstream attempt's header wait; see upstream.
+// AttemptTimeout bounds an uncommitted attempt; established streams keep their request budget.
 func (cfg PerformanceConfig) AttemptTimeout(requestTimeout time.Duration) time.Duration {
 	if cfg.AttemptTimeoutSeconds > 0 {
 		attempt := time.Duration(cfg.AttemptTimeoutSeconds) * time.Second

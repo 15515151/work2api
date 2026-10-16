@@ -42,6 +42,8 @@ type capabilityModel struct {
 	ToolCall         bool                       `json:"tool_call"`
 	StructuredOutput bool                       `json:"structured_output"`
 	Modalities       *capabilityModelModalities `json:"modalities"`
+	ReasoningOptions []ReasoningOption          `json:"reasoning_options"`
+	Cost             map[string]any             `json:"cost"`
 }
 
 type capabilityModelModalities struct {
@@ -64,6 +66,8 @@ func (m *capabilityModel) metadata() Metadata {
 		Reasoning:        m.Reasoning,
 		ToolCall:         m.ToolCall,
 		StructuredOutput: m.StructuredOutput,
+		ReasoningOptions: m.ReasoningOptions,
+		Cost:             publishedCost(m.Cost),
 	}
 	if m.Modalities != nil {
 		md.InputModalities = m.Modalities.Input
@@ -74,7 +78,7 @@ func (m *capabilityModel) metadata() Metadata {
 		md.MaxInput = m.Limit.Input
 		md.MaxOutput = m.Limit.Output
 	}
-	return md
+	return cloneMetadata(md)
 }
 
 // FetchCapabilities reads OpenCode's machine-readable provider catalog, which

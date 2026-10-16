@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strings"
 	"time"
@@ -73,6 +74,29 @@ func (rt *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (result
 		return rt.serveSystemOne(ctx, w, external, payload, route, ids)
 	}
 
+	payload, toolNames := aliasClientTools(payload, external)
+	compatibilityTools := route.Anonymous || rt.catalog.IsFreeModel(model)
+	payload = describeClientTools(payload, external, toolNames, compatibilityTools)
+	if len(toolNames) > 0 || compatibilityTools {
+		blocked := map[string]bool{}
+		for _, original := range toolNames {
+			blocked[original] = true
+		}
+		if compatibilityTools {
+			for _, name := range anonymousCoreTools {
+				blocked[name] = true
+			}
+		}
+		writer := &toolAliasWriter{ResponseWriter: w, names: toolNames, blocked: blocked}
+		w = writer
+		defer func() {
+			if err := writer.Finish(); err != nil {
+				result.Status = "error"
+				result.Error = err.Error()
+				serveErr = err
+			}
+		}()
+	}
 	bodies, bodyLimits, err := rt.prepareRouteBodiesWithLimits(external, route, payload)
 	if err != nil {
 		protocol.WriteError(w, external, http.StatusBadRequest, err.Error(), "invalid_request_error", "")
@@ -84,6 +108,15 @@ func (rt *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (result
 	resp, upstreamRoute, err := rt.doUpstream(requestCtx, route, bodies, ids)
 	if err != nil {
 		rt.logger.Warn("all upstream attempts failed", "component", "opencode.upstream", "request_id", ids.Request, "model", model, "error", err)
+
+		if protocol.ClientCanceled(ctx, err) {
+			w.WriteHeader(499)
+			return provider.UsageReport{Status: "incomplete", Error: "client canceled"}, nil
+		}
+		if errors.Is(err, errProxyUnavailable) {
+			protocol.WriteError(w, external, http.StatusServiceUnavailable, "configured proxy route unavailable", "proxy_error", ids.Request)
+			return provider.UsageReport{Status: "error", Error: "proxy route unavailable"}, nil
+		}
 		if errors.Is(err, context.DeadlineExceeded) {
 			protocol.WriteError(w, external, http.StatusGatewayTimeout, "upstream request timed out", "upstream_timeout", ids.Request)
 			return provider.UsageReport{Status: "error", Error: "upstream timeout"}, nil
@@ -184,6 +217,15 @@ func (rt *Runtime) serveSystemOne(ctx context.Context, w http.ResponseWriter, ex
 	defer cancel()
 	resp, upstreamRoute, err := rt.doUpstream(requestCtx, route, bodies, ids)
 	if err != nil {
+
+		if protocol.ClientCanceled(ctx, err) {
+			w.WriteHeader(499)
+			return provider.UsageReport{Status: "incomplete", Error: "client canceled"}, nil
+		}
+		if errors.Is(err, errProxyUnavailable) {
+			protocol.WriteError(w, protocol.SystemOne, http.StatusServiceUnavailable, "configured proxy route unavailable", "proxy_error", ids.Request)
+			return provider.UsageReport{Status: "error", Error: "proxy route unavailable"}, nil
+		}
 		if errors.Is(err, context.DeadlineExceeded) {
 			protocol.WriteError(w, protocol.SystemOne, http.StatusGatewayTimeout, "upstream request timed out", "upstream_timeout", ids.Request)
 			return provider.UsageReport{Status: "error", Error: "upstream timeout"}, nil
@@ -265,6 +307,22 @@ func (rt *Runtime) prepareRouteBodiesWithLimits(from protocol.Protocol, route Ro
 				continue
 			}
 			return nil, nil, fmt.Errorf("prepare %s upstream request: %w", tier, err)
+		}
+		// Only this endpoint requires a minimum Responses budget; never change
+		// public protocol conversion or larger caller-provided limits.
+		if proto == protocol.Responses {
+			var n float64
+			switch v := upstreamPayload["max_output_tokens"].(type) {
+			case int:
+				n = float64(v)
+			case float64:
+				n = v
+			case json.Number:
+				n, _ = v.Float64()
+			}
+			if n > 0 && n < 16 && math.Trunc(n) == n {
+				upstreamPayload["max_output_tokens"] = 16
+			}
 		}
 		if effort := rt.cfg.ForcedEffort(jsonutil.StringAt(upstreamPayload, "model")); effort != "" {
 			protocol.ForcedEffort(proto, upstreamPayload, effort)

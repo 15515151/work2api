@@ -240,6 +240,7 @@ func (rt *Runtime) Models(ctx context.Context) []provider.CatalogModel {
 				extra["cache_write_cost"] = *price.CacheWrite
 			}
 		}
+		rt.addDiscoveryMetadata(extra, route.ID, md, route.Tier)
 		out = append(out, provider.CatalogModel{
 			ID:         runtimePrefix + route.ID,
 			Name:       route.ID,

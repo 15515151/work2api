@@ -25,6 +25,8 @@ Windows 可探测本机已登录凭据；无法解密时改用扫码授权。国
 
 在「编辑配置」中设置 Zen / Go Key 和匿名入口，保存后生效。也可使用 `OPENCODE_CONFIG` 指定配置路径。
 
+官方匿名入口自动使用 `/inference`；自定义端点保持原地址，也可通过 `upstream.anonymous` 单独指定。可选的 `performance.attempt_timeout_seconds` 只限制连接至首次有效流事件的等待，默认不额外限制，流开始后沿用整次请求超时。
+
 不提供账号 OAuth、签到或余额查询。匿名入口是系统资源，用户只能贡献个人 Key。模型页价格为参考价，Go 订阅以实际账单为准。
 
 ## Trae

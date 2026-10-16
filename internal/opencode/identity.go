@@ -39,7 +39,7 @@ func deriveRequestIDs(body map[string]any, headers ...Header) RequestIDs {
 	}
 	signal := ""
 	if h != nil {
-		signal = firstNonEmpty(provider.BoundedSessionID(h.Get("x-opencode-session")), provider.BoundedSessionID(h.Get("x-session-affinity")), provider.HeaderSessionID(h))
+		signal = firstNonEmpty(provider.BoundedSessionID(h.Get("x-opencode-session-id")), provider.BoundedSessionID(h.Get("x-opencode-session")), provider.BoundedSessionID(h.Get("x-session-affinity")), provider.HeaderSessionID(h))
 	}
 	if signal == "" {
 		signal = jsonutil.FirstString(
@@ -134,11 +134,11 @@ const base62Alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrst
 // official OpenCode session id (preserving prompt-cache affinity). Any other
 // downstream identity is deterministically hashed into the canonical shape.
 func CanonicalSessionID(signal string) string {
-	if canonicalSessionPattern.MatchString(signal) {
+	if canonicalSessionPattern.MatchString(signal) && descendingTimePartPattern.MatchString(signal[4:16]) {
 		return signal
 	}
 	sum := sha256.Sum256([]byte("ses\x00" + signal))
-	timePart := hex.EncodeToString(sum[:6])
+	timePart := descendingTimePart(sum[:6])
 	randomPart := base62Fixed(new(big.Int).SetBytes(sum[6:16]), 14)
 	return "ses_" + timePart + randomPart
 }
@@ -161,4 +161,14 @@ func RandomID(prefix string, size int) string {
 		panic(fmt.Sprintf("crypto/rand failed: %v", err))
 	}
 	return prefix + "_" + hex.EncodeToString(buf)
+}
+
+var descendingTimePartPattern = regexp.MustCompile(`^[0-9a-f]{9}f[c-f][0-9a-f]$`)
+
+// Identifier.descending wire layout, derived deterministically from the scoped
+// conversation hash. Stable across turns without sharing identities across keys.
+func descendingTimePart(hash []byte) string {
+	current := (uint64(hash[0])<<28|uint64(hash[1])<<20|uint64(hash[2])<<12|uint64(hash[3])<<4|uint64(hash[4])>>4)<<12 | 1
+	inverted := ^current & 0xFFFFFFFFFFFF
+	return hex.EncodeToString([]byte{byte(inverted >> 40), byte(inverted >> 32), byte(inverted >> 24), byte(inverted >> 16), byte(inverted >> 8), byte(inverted)})
 }
