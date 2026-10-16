@@ -228,6 +228,8 @@ export interface UsageDiagnostics {
   effective_output_limits?: Record<string, number>
   compatibility?: 'original' | 'identity' | 'client_metadata'
   images_removed?: number
+  images_repaired?: number
+  image_recovery?: 'partial' | 'all'
   error_kind?: string
   upstream_started: boolean
 }

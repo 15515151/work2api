@@ -410,6 +410,82 @@ func TestWorkBuddyImageRecovery(t *testing.T) {
 	}
 }
 
+func TestWorkBuddySelectiveImageRecovery(t *testing.T) {
+	const valid = "data:image/png;base64,iVBORw0KGgo="
+	const remote = "https://example.test/normal.png"
+	for _, tc := range []struct {
+		name, raw                   string
+		urls                        []string
+		want                        []string // empty means an omitted image
+		deny, calls, fixed, removed int
+		mode                        string
+	}{
+		{"bad base64 only", `{"code":11135}`, []string{valid, "data:image/png;base64,!!", remote}, []string{valid, "", remote}, 1, 2, 0, 1, "partial"},
+		{"missing padding", `{"code":11135}`, []string{valid, "data:image/png;base64,iVBORw0KGgo", remote}, []string{valid, valid, remote}, 1, 2, 1, 0, "partial"},
+		{"base64 whitespace", `{"code":11135}`, []string{"data:image/png;base64,iVBO Rw0K\nGgo=", remote}, []string{valid, remote}, 1, 2, 1, 0, "partial"},
+		{"actual MIME", `{"code":11135}`, []string{"data:image/jpeg;base64,iVBORw0KGgo=", remote}, []string{valid, remote}, 1, 2, 1, 0, "partial"},
+		{"empty data", `{"code":11135}`, []string{valid, "data:image/png;base64,", remote}, []string{valid, "", remote}, 1, 2, 0, 1, "partial"},
+		{"explicit position", `{"code":11135,"extError":{"param":"messages[0].content[2].image_url.url"}}`, []string{valid, remote}, []string{valid, ""}, 1, 2, 0, 1, "partial"},
+		{"out of range position", `{"code":11135,"param":"messages[99].content[2]"}`, []string{valid, remote}, []string{"", ""}, 1, 2, 0, 2, "all"},
+		{"text position ignored", `{"code":11135,"param":"messages[0].content[0]"}`, []string{valid, remote}, []string{"", ""}, 1, 2, 0, 2, "all"},
+		{"conflicting positions", `{"code":11135,"param":"messages[0].content[1]","extError":{"param":"messages[0].content[2]"}}`, []string{valid, remote}, []string{"", ""}, 1, 2, 0, 2, "all"},
+		{"repair then full fallback", `{"code":11135}`, []string{"data:image/png;base64,iVBORw0KGgo", remote}, []string{valid, remote}, 2, 3, 1, 2, "all"},
+		{"misleading message ignored", `{"code":11101,"msg":"quoted: \"code\":11135"}`, []string{valid, remote}, nil, 1, 1, 0, 0, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			o, acc := newDNSFailoverOrch(t, &failingUpstream{})
+			client := &channelRetryUpstream{body: tc.raw, denyCalls: tc.deny}
+			o.wb.UpstreamClient = client
+			parts := []any{map[string]any{"type": "text", "text": "inspect"}}
+			for _, url := range tc.urls {
+				parts = append(parts, map[string]any{"type": "image_url", "image_url": map[string]any{"url": url, "detail": "high"}})
+			}
+			body := map[string]any{"messages": []any{map[string]any{"role": "user", "content": parts}}}
+			original, _ := json.Marshal(body)
+			d := &wbruntime.RequestDiagnostics{}
+			ctx := context.WithValue(context.Background(), wbruntime.RequestDiagnosticsKey{}, d)
+			_, err := o.openUpstream(ctx, acc, body, "test-model", "", func(string) error { return nil }, nil)
+			if client.calls != tc.calls || (err == nil) != (tc.calls > tc.deny) {
+				t.Fatalf("calls=%d want=%d err=%v", client.calls, tc.calls, err)
+			}
+			if d.ImagesRepaired != tc.fixed || d.ImagesRemoved != tc.removed || d.ImageRecovery != tc.mode {
+				t.Fatalf("unexpected diagnostics: %+v", d)
+			}
+			after, _ := json.Marshal(body)
+			if string(original) != string(after) {
+				t.Fatal("original request mutated")
+			}
+			if tc.want != nil {
+				second := client.bodies[1]["messages"].([]any)[0].(map[string]any)["content"].([]any)
+				if second[0].(map[string]any)["text"] != "inspect" {
+					t.Fatal("text changed")
+				}
+				for i, want := range tc.want {
+					part := second[i+1].(map[string]any)
+					if want == "" {
+						if part["type"] != "text" {
+							t.Fatal("invalid image survived")
+						}
+						continue
+					}
+					image, ok := part["image_url"].(map[string]any)
+					if !ok || image["url"] != want || image["detail"] != "high" {
+						t.Fatalf("image %d changed incorrectly: %v", i, part)
+					}
+				}
+			}
+			if tc.calls == 3 {
+				last := client.bodies[2]["messages"].([]any)[0].(map[string]any)["content"].([]any)
+				for _, v := range last {
+					if v.(map[string]any)["type"] != "text" {
+						t.Fatal("full fallback retained image")
+					}
+				}
+			}
+		})
+	}
+}
+
 func (f *channelRetryUpstream) StreamUpstream(_ context.Context, _ map[string]string, request map[string]any, target string, yield upstream.LineFunc) error {
 	f.calls++
 	f.bodies = append(f.bodies, request)

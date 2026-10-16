@@ -308,7 +308,7 @@ func (o *Runtime) OpenUpstreamScoped(ctx context.Context, acc *pool.Account, bod
 	compatUID := ""
 	compatLevel := 0
 	requestCompatLevel := 0
-	imageRetried := false
+	imageRecoveryStage := 0
 	var candidates [3]struct {
 		body           map[string]any
 		matched, ready bool
@@ -502,19 +502,33 @@ func (o *Runtime) OpenUpstreamScoped(ctx context.Context, acc *pool.Account, bod
 		}
 		// Recover only explicit 11135 errors before any output. Never penalize an
 		// account or cache this request-local, lossy fallback.
-		if !imageRetried && ue.StatusCode == 400 && CodeMarker(strings.ToLower(string(ue.Raw)), "11135") && attempt+1 < maxFailoverAttempts {
-			if reduced, count := withoutRequestImages(body); count > 0 {
+		if imageRecoveryStage < 2 && ue.StatusCode == 400 && BusinessCode(string(ue.Raw), "11135") && attempt+1 < maxFailoverAttempts {
+			var reduced map[string]any
+			fixed, count := 0, 0
+			mode := "partial"
+			// Reserve room for the full fallback rather than spend the final
+			// dispatch on a partial repair that cannot recover unknown bad URLs.
+			if imageRecoveryStage == 0 && attempt+2 < maxFailoverAttempts {
+				reduced, fixed, count = locallyCompatibleImages(body, ue.Raw)
+				imageRecoveryStage = 1
+			}
+			if fixed+count == 0 {
+				reduced, count = withoutRequestImages(body)
+				imageRecoveryStage, mode = 2, "all"
+			}
+			if fixed+count > 0 {
 				body = reduced
 				for i := range candidates {
 					candidates[i].ready = false
 				}
-				imageRetried = true
 				compatUID, compatLevel = acc.UID, level
 				delete(tried, acc.UID)
 				if d := Diagnostic(ctx); d != nil {
-					d.ImagesRemoved = count
+					d.ImagesRemoved += count
+					d.ImagesRepaired += fixed
+					d.ImageRecovery = mode
 				}
-				log.Printf("图片降级: model=%s removed=%d attempt=%d", model, count, attempt+1)
+				log.Printf("图片恢复: model=%s mode=%s repaired=%d removed=%d attempt=%d", model, mode, fixed, count, attempt+1)
 				continue
 			}
 		}

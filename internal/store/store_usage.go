@@ -140,6 +140,8 @@ type UsageParams struct {
 // UsageDiagnostics contains protocol facts only, never prompts or credentials.
 type UsageDiagnostics struct {
 	ImagesRemoved      int                `json:"images_removed,omitempty"`
+	ImagesRepaired     int                `json:"images_repaired,omitempty"`
+	ImageRecovery      string             `json:"image_recovery,omitempty"`
 	BillingDomain      string             `json:"billing_domain,omitempty"`
 	BillingCoefficient *float64           `json:"billing_coefficient,omitempty"`
 	ContentCleared     bool               `json:"content_cleared,omitempty"`
