@@ -81,6 +81,16 @@ func (a *Account) Callable() bool {
 	return a.Enabled && (a.CreditsRemain == nil || *a.CreditsRemain > 0)
 }
 
+// CallableFor allows only the requested model's verified free entitlement to
+// bypass paid balance exhaustion. It never bypasses account disablement.
+func (a *Account) CallableFor(free bool) bool {
+	return a.Enabled && (free || a.CreditsRemain == nil || *a.CreditsRemain > 0)
+}
+
+func (a *Account) HealthyFor(now float64, free bool) bool {
+	return a.CallableFor(free) && a.CooldownUntil <= now
+}
+
 func (a *Account) markFailure(cooldownSeconds float64) {
 	a.FailureCount++
 	a.CooldownUntil = float64(time.Now().UnixNano())/1e9 + cooldownSeconds
@@ -152,6 +162,12 @@ const expiryAmountBias = 2.0
 // expiryWindowDays <= 0 falls back to DefaultExpiryWindowDays. Falls back to the
 // soonest-cooldown account when none healthy.
 func (p *Pool) Pick(allowed map[string]bool, costByUID map[string]float64, expiryWindowDays float64) *Account {
+	return p.PickFor(allowed, costByUID, expiryWindowDays, nil)
+}
+
+// PickFor uses request-specific, verified free accounts independently of the
+// cost-preference setting. The remaining selection policy is unchanged.
+func (p *Pool) PickFor(allowed map[string]bool, costByUID map[string]float64, expiryWindowDays float64, freeUIDs map[string]bool) *Account {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if expiryWindowDays <= 0 {
@@ -160,7 +176,7 @@ func (p *Pool) Pick(allowed map[string]bool, costByUID map[string]float64, expir
 	now := nowSec()
 	var candidates []*Account
 	for _, a := range p.accounts {
-		if (allowed == nil || allowed[a.UID]) && a.Healthy(now) {
+		if (allowed == nil || allowed[a.UID]) && a.HealthyFor(now, freeUIDs[a.UID]) {
 			candidates = append(candidates, a)
 		}
 	}
@@ -168,7 +184,7 @@ func (p *Pool) Pick(allowed map[string]bool, costByUID map[string]float64, expir
 		var best *Account
 		bestExpiry := math.Inf(1)
 		for _, a := range p.accounts {
-			if (allowed == nil || allowed[a.UID]) && a.Callable() && a.CooldownUntil < bestExpiry {
+			if (allowed == nil || allowed[a.UID]) && a.CallableFor(freeUIDs[a.UID]) && a.CooldownUntil < bestExpiry {
 				best = a
 				bestExpiry = a.CooldownUntil
 			}

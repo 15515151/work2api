@@ -171,14 +171,14 @@ func (o *Runtime) PickAccountExcludingIn(model, sessionKey string, tried map[str
 	if sessionKey != "" {
 		if uid := o.Sessions.Lookup(sessionKey); uid != "" && !tried[uid] {
 			if ready[uid] {
-				if a := o.Pool.Get(uid); a != nil && a.Callable() && a.CooldownUntil-now <= SessionStickyMaxCooldown {
-					return o.PreferDomesticSession(sessionKey, a, ready, o.ModelCostByUID(model, ready), o.ExpiryWindowDays()), nil
+				if a := o.Pool.Get(uid); a != nil && o.ModelCallable(a, model) && a.CooldownUntil-now <= SessionStickyMaxCooldown {
+					return o.PreferDomesticSession(model, sessionKey, a, ready, o.ModelCostByUID(model, ready), o.ExpiryWindowDays()), nil
 				}
 			}
 			o.Sessions.Unbind(sessionKey)
 		}
 	}
-	acc := o.Pool.Pick(ready, o.ModelCostByUID(model, ready), o.ExpiryWindowDays())
+	acc := o.pickModel(model, ready, o.ModelCostByUID(model, ready), o.ExpiryWindowDays())
 	if acc == nil {
 		return nil, errBody(503, "模型 "+model+" 无可用账号（全部冷却或额度耗尽），请检查账号状态", "auth_error")
 	}
@@ -228,14 +228,14 @@ func (o *Runtime) PickInScope(model, sessionKey string, tried map[string]bool, s
 	if sessionKey != "" {
 		if uid := o.Sessions.Lookup(sessionKey); uid != "" {
 			if ready[uid] {
-				if a := o.Pool.Get(uid); a != nil && a.Callable() && a.CooldownUntil-now <= SessionStickyMaxCooldown {
-					return o.PreferDomesticSession(sessionKey, a, ready, o.ModelCostByUID(model, ready), o.ExpiryWindowDays()), nil
+				if a := o.Pool.Get(uid); a != nil && o.ModelCallable(a, model) && a.CooldownUntil-now <= SessionStickyMaxCooldown {
+					return o.PreferDomesticSession(model, sessionKey, a, ready, o.ModelCostByUID(model, ready), o.ExpiryWindowDays()), nil
 				}
 			}
 			o.Sessions.Unbind(sessionKey)
 		}
 	}
-	acc := o.Pool.Pick(ready, o.ModelCostByUID(model, ready), o.ExpiryWindowDays())
+	acc := o.pickModel(model, ready, o.ModelCostByUID(model, ready), o.ExpiryWindowDays())
 	if acc == nil {
 		return nil, ErrPoolExhausted(model, nil)
 	}
@@ -248,13 +248,11 @@ func (o *Runtime) PickInScope(model, sessionKey string, tried map[string]bool, s
 	return acc, nil
 }
 
+// ModelCostByUID uses each account's own quote, retaining unknown costs as
+// unknown. Disabling cost preference does not revoke a free entitlement.
 func (o *Runtime) ModelCostByUID(model string, ready map[string]bool) map[string]float64 {
 	settings, _ := o.db.GetSettings()
 	if v, ok := settings["cost_aware_routing"]; ok && v != "1" {
-		return nil
-	}
-	cbr := o.Catalog.CreditsByRegion(model)
-	if len(cbr) == 0 {
 		return nil
 	}
 	out := map[string]float64{}
@@ -262,8 +260,8 @@ func (o *Runtime) ModelCostByUID(model string, ready map[string]bool) map[string
 		if !ready[a.UID] {
 			continue
 		}
-		if c, ok := cbr[siterouting.ProfileSite(a.Profile)]; ok {
-			out[a.UID] = c
+		if c := o.Catalog.AccountCost(a.Profile, a.UID, model); c != nil {
+			out[a.UID] = *c
 		}
 	}
 	if len(out) == 0 {
@@ -416,6 +414,11 @@ func (o *Runtime) OpenUpstreamScoped(ctx context.Context, acc *pool.Account, bod
 			if sessionKey != "" && !tracked {
 				o.Sessions.Bind(sessionKey, acc.UID)
 			}
+		}
+		// A balance or catalog refresh may have revoked the free entitlement
+		// since selection. Never dispatch an exhausted account on a paid model.
+		if !o.ModelCallable(acc, model) {
+			return acc, errBody(503, "账号当前无法调用此模型，请刷新账号或模型状态后重试", "model_unavailable")
 		}
 		SessionPhase(ctx, true)
 		tried[acc.UID] = true
@@ -615,8 +618,8 @@ func (o *Runtime) AccountSelector(model, preferred string, tried map[string]bool
 		for _, candidate := range o.Pool.Accounts() {
 			// Keep the original selected account's short account-cooldown grace;
 			// model cooldown remains a strict exclusion as in the original picker.
-			preferredGrace := candidate.UID == preferred && candidate.Callable() && candidate.CooldownUntil-now <= SessionStickyMaxCooldown
-			if !allowed[candidate.UID] || (!candidate.Healthy(now) && !preferredGrace) || o.ModelCooldownUntil(candidate.UID, model) > now {
+			preferredGrace := candidate.UID == preferred && o.ModelCallable(candidate, model) && candidate.CooldownUntil-now <= SessionStickyMaxCooldown
+			if !allowed[candidate.UID] || (!o.ModelHealthy(candidate, model, now) && !preferredGrace) || o.ModelCooldownUntil(candidate.UID, model) > now {
 				continue
 			}
 			ready[candidate.UID] = true
@@ -656,7 +659,7 @@ func (o *Runtime) AccountSelector(model, preferred string, tried map[string]bool
 				baseCost, baseKnown := cost[baseline]
 				targetCost, targetKnown := cost[target]
 				candidate := o.Pool.Get(target)
-				if !ready[target] || candidate == nil || !candidate.Healthy(now) || !baseKnown || !targetKnown || baseCost < 0 || targetCost < 0 || math.IsNaN(baseCost) || math.IsNaN(targetCost) || math.IsInf(baseCost, 0) || math.IsInf(targetCost, 0) || targetCost > baseCost+1e-9 {
+				if !ready[target] || candidate == nil || !o.ModelHealthy(candidate, model, now) || !baseKnown || !targetKnown || baseCost < 0 || targetCost < 0 || math.IsNaN(baseCost) || math.IsNaN(targetCost) || math.IsInf(baseCost, 0) || math.IsInf(targetCost, 0) || targetCost > baseCost+1e-9 {
 					o.Sessions.Reject(selection.Key, version)
 					return nil, nil // Retry selection against the new version on the queue wakeup.
 				}
@@ -677,7 +680,7 @@ func (o *Runtime) AccountSelector(model, preferred string, tried map[string]bool
 				if migrationFrom == routePreferred && ready[migrationTarget] && !o.Sessions.ManuallyPinned(key, routePreferred) {
 					selected = o.Pool.Get(migrationTarget)
 				} else {
-					selected = o.PreferDomesticSession(key, selected, ready, cost, window)
+					selected = o.PreferDomesticSession(model, key, selected, ready, cost, window)
 					if selected != nil && selected.UID != routePreferred {
 						migrationFrom, migrationTarget = routePreferred, selected.UID
 					} else {
@@ -686,7 +689,7 @@ func (o *Runtime) AccountSelector(model, preferred string, tried map[string]bool
 				}
 			}
 		} else {
-			selected = o.Pool.Pick(ready, cost, window)
+			selected = o.pickModel(model, ready, cost, window)
 			if selected != nil {
 				preferred = selected.UID
 			}
@@ -704,7 +707,7 @@ func (o *Runtime) AccountSelector(model, preferred string, tried map[string]bool
 // Migrate automatic paid international bindings only when the cheapest healthy
 // authorized group has a domestic option. Explicit administrator pins win.
 
-func (o *Runtime) PreferDomesticSession(key string, current *pool.Account, ready map[string]bool, costs map[string]float64, window float64) *pool.Account {
+func (o *Runtime) PreferDomesticSession(model, key string, current *pool.Account, ready map[string]bool, costs map[string]float64, window float64) *pool.Account {
 	if current == nil || siterouting.ProfileSite(current.Profile) != siterouting.International || o.Sessions.ManuallyPinned(key, current.UID) {
 		return current
 	}
@@ -714,7 +717,7 @@ func (o *Runtime) PreferDomesticSession(key string, current *pool.Account, ready
 	}
 	minimum := math.Inf(1)
 	for _, candidate := range o.Pool.Accounts() {
-		if !ready[candidate.UID] || !candidate.Healthy(nowSec()) {
+		if !ready[candidate.UID] || !o.ModelHealthy(candidate, model, nowSec()) {
 			continue
 		}
 		if cost, ok := costs[candidate.UID]; ok && cost >= 0 && !math.IsNaN(cost) && !math.IsInf(cost, 0) && cost < minimum {
@@ -726,8 +729,8 @@ func (o *Runtime) PreferDomesticSession(key string, current *pool.Account, ready
 	}
 	for _, candidate := range o.Pool.Accounts() {
 		cost, ok := costs[candidate.UID]
-		if ready[candidate.UID] && candidate.Healthy(nowSec()) && siterouting.ProfileSite(candidate.Profile) == siterouting.Domestic && ok && math.Abs(cost-minimum) <= 1e-9 {
-			if selected := o.Pool.Pick(ready, costs, window); selected != nil {
+		if ready[candidate.UID] && o.ModelHealthy(candidate, model, nowSec()) && siterouting.ProfileSite(candidate.Profile) == siterouting.Domestic && ok && math.Abs(cost-minimum) <= 1e-9 {
+			if selected := o.pickModel(model, ready, costs, window); selected != nil {
 				return selected
 			}
 		}
@@ -741,8 +744,50 @@ func ErrPoolExhausted(model string, tried map[string]bool) *apiError {
 	return errBody(503, "共享池中模型 "+model+" 暂无可用账号（冷却或额度耗尽），请稍后重试", "auth_error")
 }
 
-// modelCostByUID maps each ready account UID to its per-model cost coefficient
-// (the model's per-site catalog credits), for cost-aware selection. Returns nil
-// when cost_aware_routing is off or no cost data exists, so Pick stays cost-blind.
-// Accounts on a site the catalog gave no value for are omitted → unknown, which
-// Pick ranks last.
+// Free entitlement comes only from this account's own model quote. Regional
+// aggregates, display promotions and routing preferences cannot grant it.
+func (o *Runtime) ModelFree(a *pool.Account, model string) bool {
+	if a == nil || o.Catalog == nil {
+		return false
+	}
+	cost := o.Catalog.AccountCost(a.Profile, a.UID, model)
+	return cost != nil && *cost == 0
+}
+
+func (o *Runtime) ModelCallable(a *pool.Account, model string) bool {
+	return a != nil && a.CallableFor(o.ModelFree(a, model))
+}
+
+func (o *Runtime) ModelHealthy(a *pool.Account, model string, now float64) bool {
+	return a != nil && a.HealthyFor(now, o.ModelFree(a, model))
+}
+
+// AccountHealthy reports whether at least one model can use this account.
+// Per-model rows must use ModelHealthy instead of this aggregate status.
+func (o *Runtime) AccountHealthy(a *pool.Account, now float64) bool {
+	if a == nil || !a.Enabled || a.CooldownUntil > now {
+		return false
+	}
+	if a.Callable() {
+		return true
+	}
+	if o.Catalog == nil {
+		return false
+	}
+	for _, cost := range o.Catalog.AccountCosts(a.Profile, a.UID) {
+		if cost == 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (o *Runtime) pickModel(model string, ready map[string]bool, costs map[string]float64, window float64) *pool.Account {
+	free := map[string]bool{}
+	for _, a := range o.Pool.Accounts() {
+		if ready[a.UID] && o.ModelFree(a, model) {
+			free[a.UID] = true
+		}
+	}
+	return o.Pool.PickFor(ready, costs, window, free)
+}

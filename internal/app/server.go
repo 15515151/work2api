@@ -430,7 +430,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	accounts := s.o.wb.Pool.Accounts()
 	healthy := 0
 	for _, a := range accounts {
-		if a.Healthy(float64(time.Now().UnixNano()) / 1e9) {
+		if s.o.wb.AccountHealthy(a, float64(time.Now().UnixNano())/1e9) {
 			healthy++
 		}
 	}

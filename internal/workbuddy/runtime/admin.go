@@ -15,6 +15,7 @@ func (r *Runtime) AccountsForDisplay() []map[string]any {
 	today := time.Now().Format("2006-01-02")
 	for _, a := range accounts {
 		uid, _ := a["uid"].(string)
+		a["healthy"] = r.AccountHealthy(r.Pool.Get(uid), nowSec())
 		// 前端读取的是 checkin_today（见 webui Accounts.vue / types）——
 		// 曾误写成 checked_in_today，导致签到成功后页面状态永不同步。
 		a["checkin_today"] = dates[uid] == today
@@ -89,7 +90,7 @@ func (r *Runtime) AttachModelAccounts(entries []map[string]any) {
 					}
 				}
 				modelCd := mcd[uid+"\x00"+id]
-				healthy, _ := a["healthy"].(bool)
+				healthy := r.ModelHealthy(r.Pool.Get(uid), id, now)
 				coolUntil, _ := a["cooldown_until"].(float64)
 				if modelCd > coolUntil {
 					coolUntil = modelCd

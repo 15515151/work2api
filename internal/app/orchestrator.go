@@ -584,8 +584,8 @@ func (o *Orchestrator) accountSelector(model, preferred string, tried map[string
 	return o.wb.AccountSelector(model, preferred, tried, scope, routing...)
 }
 
-func (o *Orchestrator) preferDomesticSession(key string, current *pool.Account, ready map[string]bool, costs map[string]float64, window float64) *pool.Account {
-	return o.wb.PreferDomesticSession(key, current, ready, costs, window)
+func (o *Orchestrator) preferDomesticSession(model, key string, current *pool.Account, ready map[string]bool, costs map[string]float64, window float64) *pool.Account {
+	return o.wb.PreferDomesticSession(model, key, current, ready, costs, window)
 }
 
 func (o *Orchestrator) refreshCreditsFor(ctx context.Context, acc *pool.Account) {

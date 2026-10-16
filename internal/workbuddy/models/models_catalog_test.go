@@ -7,13 +7,61 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"work2api/internal/workbuddy/credentials"
 	"work2api/internal/workbuddy/pool"
 )
+
+func TestLiveAccountQuotes(t *testing.T) {
+	if os.Getenv("WORK2API_LIVE_QUOTES") != "1" {
+		t.Skip("explicit live verification only")
+	}
+	files := credentials.FindAuthFiles("", filepath.Join("..", "..", "..", "auths"))
+	if len(files) == 0 {
+		t.Fatal("no local credentials")
+	}
+	r := New(nil, nil)
+	defer r.client.CloseIdleConnections()
+	success := 0
+	for i, file := range files {
+		mgr := credentials.NewManager(file)
+		headers, err := mgr.CatalogHeaders()
+		if err != nil {
+			t.Logf("account %d: authorization unavailable", i+1)
+			continue
+		}
+		sources, err := catalogSources(mgr.Profile())
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, source := range sources {
+			ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+			data := r.fetchCatalogDocument(ctx, source, headers)
+			cancel()
+			if data == nil {
+				t.Logf("account %d profile=%s catalog unavailable", i+1, mgr.Profile())
+				continue
+			}
+			success++
+			rawModels, _ := data["models"].([]any)
+			for _, raw := range rawModels {
+				m, _ := raw.(map[string]any)
+				if m["id"] == "deepseek-v4.1-flash" || m["id"] == "glm-5.3-flash" {
+					t.Logf("account %d profile=%s model=%s raw_credits=%v", i+1, mgr.Profile(), m["id"], m["credits"])
+				}
+			}
+		}
+	}
+	if success == 0 {
+		t.Fatal("no live catalog response")
+	}
+}
 
 func TestPromotionRulesRespectDatesScopeAndTrialEnrollment(t *testing.T) {
 	var data map[string]any

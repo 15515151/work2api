@@ -135,15 +135,15 @@ func TestPaidSessionMigrationHonorsManualPinCostAndScope(t *testing.T) {
 	cn.Profile = "cn-cli"
 	ready := map[string]bool{intl.UID: true, cn.UID: true}
 	paid := map[string]float64{intl.UID: 1, cn.UID: 1}
-	if got := o.preferDomesticSession("s", intl, ready, paid, 7); got != cn {
+	if got := o.preferDomesticSession("test-model", "s", intl, ready, paid, 7); got != cn {
 		t.Fatal("paid session did not migrate")
 	}
 	for _, cost := range []map[string]float64{nil, {intl.UID: 0, cn.UID: 0}, {intl.UID: 1, cn.UID: 2}} {
-		if got := o.preferDomesticSession("s", intl, ready, cost, 7); got != intl {
+		if got := o.preferDomesticSession("test-model", "s", intl, ready, cost, 7); got != intl {
 			t.Fatal("free/unknown/cost priority changed")
 		}
 	}
-	if got := o.preferDomesticSession("s", intl, map[string]bool{intl.UID: true}, paid, 7); got != intl {
+	if got := o.preferDomesticSession("test-model", "s", intl, map[string]bool{intl.UID: true}, paid, 7); got != intl {
 		t.Fatal("migration escaped scope")
 	}
 	o.sessions.Bind("s", cn.UID)
@@ -153,7 +153,7 @@ func TestPaidSessionMigrationHonorsManualPinCostAndScope(t *testing.T) {
 	o.sessions.Control("s", v.Version, "switch", intl.UID)
 	v, _ = o.sessions.View("s")
 	o.sessions.Commit(&sessionSelection{Key: "s", Version: v.Version, Action: "switch"}, intl.UID)
-	if got := o.preferDomesticSession("s", intl, ready, paid, 7); got != intl {
+	if got := o.preferDomesticSession("test-model", "s", intl, ready, paid, 7); got != intl {
 		t.Fatal("automatic migration overrode manual international pin")
 	}
 }
@@ -382,6 +382,115 @@ type sessionCostCatalog struct{}
 
 func (sessionCostCatalog) RoundTrip(r *http.Request) (*http.Response, error) {
 	return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"data":{"models":[{"id":"test-model","name":"Test","credits":1}],"agents":[{"name":"cli","models":["test-model"]}]}}`)), Request: r}, nil
+}
+
+type accountQuoteCatalog struct{ paidFree bool }
+
+func (c *accountQuoteCatalog) RoundTrip(r *http.Request) (*http.Response, error) {
+	price := any(nil)
+	switch r.Header.Get("x-test-models") {
+	case "free":
+		price = float64(0)
+		if c.paidFree {
+			price = float64(1)
+		}
+	case "paid":
+		price = float64(1)
+	}
+	raw, _ := json.Marshal(map[string]any{"data": map[string]any{
+		"models": []any{map[string]any{"id": "test-model", "credits": price}, map[string]any{"id": "other-model", "credits": 1}},
+		"agents": []any{map[string]any{"name": "cli", "models": []string{"test-model", "other-model"}}},
+	}})
+	return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(string(raw))), Request: r}, nil
+}
+
+func TestAccountSpecificFreeRoutingAndLiveRevocation(t *testing.T) {
+	o, original := newDNSFailoverOrch(t, &failingUpstream{})
+	o.wb.Pool = pool.New(map[string]pool.Credential{
+		"free":    portalCatalogCredential{original.Mgr, "free"},
+		"paid":    portalCatalogCredential{original.Mgr, "paid"},
+		"unknown": portalCatalogCredential{original.Mgr, "unknown"},
+	}, "")
+	transport := &accountQuoteCatalog{}
+	o.wb.Catalog = models.NewWithCatalogClient(o.wb.Pool, o.db, &http.Client{Transport: transport})
+	o.wb.Catalog.Refresh()
+	zero, positive := 0.0, 10.0
+	for _, uid := range []string{"free", "paid", "unknown"} {
+		o.wb.Pool.SetCredits(uid, &zero, &positive, nil, nil)
+	}
+	cost := o.modelCostByUID("test-model", map[string]bool{"free": true, "paid": true, "unknown": true})
+	if len(cost) != 2 || cost["free"] != 0 || cost["paid"] != 1 {
+		t.Fatal("account quotes mixed", cost)
+	}
+	for _, mode := range []string{"1", "0"} {
+		if err := o.db.SaveSettings(map[string]string{"cost_aware_routing": mode}); err != nil {
+			t.Fatal(err)
+		}
+		for _, scope := range []map[string]bool{nil, {"free": true}} {
+			for i := 0; i < 2; i++ {
+				a, err := o.pickAccountExcludingIn("test-model", "free-session", nil, scope)
+				if err != nil || a.UID != "free" {
+					t.Fatal("free account unavailable or lost sticky binding", a, err)
+				}
+			}
+			choose, err := o.accountSelector("test-model", "free", nil, scope)
+			if err != nil {
+				t.Fatal(err)
+			}
+			a, err := choose(nil)
+			if err != nil || a == nil || a.UID != "free" {
+				t.Fatal("selector discarded free account", a, err)
+			}
+		}
+		for _, scope := range []map[string]bool{{"paid": true}, {"unknown": true}} {
+			if a, err := o.pickAccountExcludingIn("test-model", "", nil, scope); err == nil || a != nil {
+				t.Fatal("borrowed another account's free quote", a)
+			}
+		}
+	}
+	if a, err := o.pickAccountExcludingIn("other-model", "", nil, map[string]bool{"free": true}); err == nil || a != nil {
+		t.Fatal("free entitlement applied to paid model")
+	}
+	account := o.wb.Pool.Get("free")
+	if !o.wb.AccountHealthy(account, nowSec()) {
+		t.Fatal("free-only account marked unavailable")
+	}
+	rows := o.wb.Catalog.ListCached()
+	o.wb.AttachModelAccounts(rows)
+	for _, row := range rows {
+		for _, raw := range row["accounts"].([]map[string]any) {
+			if raw["uid"] == "free" && raw["healthy"] != (row["id"] == "test-model") {
+				t.Fatal("model status ignored per-model entitlement", row)
+			}
+		}
+	}
+	o.wb.Pool.SetEnabled("free", false, "manual")
+	if a, err := o.pickAccountExcludingIn("test-model", "", nil, nil); err == nil || a != nil {
+		t.Fatal("free pricing bypassed disablement")
+	}
+	o.wb.Pool.SetEnabled("free", true, "")
+	o.wb.Pool.OnFailure("free", 600)
+	if a, err := o.pickAccountExcludingIn("test-model", "", nil, nil); err == nil || a != nil {
+		t.Fatal("free pricing bypassed cooldown")
+	}
+	o.wb.Pool.ClearCooldown("free")
+	choose, err := o.accountSelector("test-model", "free", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport.paidFree = true
+	o.wb.Catalog.Refresh()
+	if a, err := choose(nil); err == nil && a != nil {
+		t.Fatal("queued selection retained revoked free entitlement")
+	}
+	if o.wb.AccountHealthy(account, nowSec()) {
+		t.Fatal("revoked free account still marked healthy")
+	}
+	// Restoring paid balance re-enables a paid model without needing a free quote.
+	o.wb.Pool.SetCredits("free", &positive, &positive, nil, nil)
+	if a, err := o.pickAccountExcludingIn("other-model", "", nil, map[string]bool{"free": true}); err != nil || a == nil {
+		t.Fatal("balance refresh did not restore paid models", err)
+	}
 }
 func TestSessionSelectorPendingAndScope(t *testing.T) {
 	o, acc := newDNSFailoverOrch(t, &failingUpstream{})

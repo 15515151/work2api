@@ -91,10 +91,15 @@ func LockPaths() []string {
 }
 
 func (r *Runtime) HealthSnapshot() map[string]any {
-	healthy := r.Pool.HealthyCount(nil)
+	healthy := 0
+	for _, a := range r.Pool.Accounts() {
+		if r.AccountHealthy(a, nowSec()) {
+			healthy++
+		}
+	}
 	row := map[string]any{"name": r.Name(), "ready": healthy > 0, "callable_accounts": healthy, "model_count": len(r.Catalog.ListCached()), "model_source": r.Catalog.Source()}
 	if healthy == 0 {
-		row["reason"] = "没有启用且有额度的非冷却账号"
+		row["reason"] = "没有启用且可调用模型的非冷却账号"
 	}
 	return row
 }

@@ -131,7 +131,7 @@ func (s *Server) sessionOptions(v sessionView) ([]sessionAccountOption, *apiErro
 		switch {
 		case a.UID == v.UID:
 			option.Reason = "当前账号"
-		case !a.Healthy(now) || s.o.modelCooldownUntil(a.UID, v.Model) > now:
+		case !s.o.wb.ModelHealthy(a, v.Model, now) || s.o.modelCooldownUntil(a.UID, v.Model) > now:
 			option.Reason = "账号或模型暂不可用"
 		case !baseKnown || base < 0 || math.IsNaN(base) || math.IsInf(base, 0) || option.Cost == nil:
 			option.Reason = "成本未知，不能指定"

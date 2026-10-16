@@ -34,6 +34,72 @@ type failingUpstream struct {
 	lines []string
 }
 
+func TestLiveFreeAccountDispatch(t *testing.T) {
+	if os.Getenv("WORK2API_LIVE_FREE_DISPATCH") != "1" {
+		t.Skip("explicit live verification only")
+	}
+	o, _ := newDNSFailoverOrch(t, &failingUpstream{})
+	var mgr *credentials.Manager
+	for _, file := range credentials.FindAuthFiles("", filepath.Join("..", "..", "auths")) {
+		candidate := credentials.NewManager(file)
+		if siterouting.ProfileSite(candidate.Profile()) == siterouting.International {
+			mgr = candidate
+			break
+		}
+	}
+	if mgr == nil {
+		t.Fatal("international free-model credential unavailable")
+	}
+	// Simulate an exhausted balance only in this isolated, temporary runtime.
+	// The real account, gateway database and credential file are not changed.
+	o.wb.Pool = pool.New(map[string]pool.Credential{"live-free": mgr}, "")
+	o.wb.Managers = map[string]*credentials.Manager{"live-free": mgr}
+	o.wb.Catalog = models.New(o.wb.Pool, o.db)
+	o.wb.Catalog.Refresh()
+	const model = "deepseek-v4.1-flash"
+	a := o.wb.Pool.Get("live-free")
+	if !o.wb.ModelFree(a, model) {
+		t.Fatal("live account does not declare this model free")
+	}
+	zero := 0.0
+	o.wb.Pool.SetCredits(a.UID, &zero, &zero, nil, nil)
+	o.wb.UpstreamClient = upstream.Shared()
+	selected, err := o.pickAccountExcludingIn(model, "", nil, map[string]bool{a.UID: true})
+	if err != nil || selected == nil {
+		t.Fatal("free model lost at gateway selection")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 70*time.Second)
+	defer cancel()
+	body := map[string]any{"model": model, "stream": true, "max_tokens": 1024, "reasoning_effort": "off", "messages": []any{map[string]any{"role": "user", "content": "Reply with just OK."}}}
+	body = o.wb.EnhanceBody(upstream.BuildUpstreamBody(body))
+	var output strings.Builder
+	finish := ""
+	start := time.Now()
+	_, callErr := o.openUpstreamScoped(ctx, selected, body, model, "", func(line string) error {
+		chunk := upstream.DecodeFrame(ctx, line)
+		choices, _ := chunk["choices"].([]any)
+		for _, raw := range choices {
+			choice, _ := raw.(map[string]any)
+			delta, _ := choice["delta"].(map[string]any)
+			if text, ok := delta["content"].(string); ok {
+				output.WriteString(text)
+			}
+			if reason, ok := choice["finish_reason"].(string); ok && reason != "" {
+				finish = reason
+			}
+		}
+		return nil
+	}, nil, nil)
+	if callErr != nil || output.Len() == 0 || finish != "stop" {
+		var remote *upstream.UpstreamError
+		if errors.As(callErr, &remote) {
+			t.Logf("synthetic call rejection: %s", remote.Raw)
+		}
+		t.Fatalf("live free dispatch failed: error=%v finish=%s output_bytes=%d", callErr, finish, output.Len())
+	}
+	t.Logf("model=%s isolated_balance=0 declared_cost=0 duration=%s finish=%s output_bytes=%d", model, time.Since(start).Round(time.Millisecond), finish, output.Len())
+}
+
 func (f *failingUpstream) StreamUpstream(_ context.Context, _ map[string]string, _ map[string]any, target string, yield upstream.LineFunc) error {
 	if target == "" {
 		return errors.New("test account has no upstream URL")
