@@ -313,6 +313,12 @@ func buildQuotaEntry(q *account.QuotaInfo) quotaEntry {
 		e.remaining += p.Remaining
 		e.total += p.Total
 		pkg := map[string]any{"name": p.Label, "remain": p.Remaining, "used": p.Used, "total": p.Total, "budget_restricted": true}
+		if p.Description != "" {
+			pkg["description"] = p.Description
+		}
+		if p.Unit != "" {
+			pkg["unit"] = p.Unit
+		}
 		if expiry := quotaExpirySeconds(p.ExpireAt); expiry > 0 {
 			pkg["expire_at"] = float64(expiry)
 		}

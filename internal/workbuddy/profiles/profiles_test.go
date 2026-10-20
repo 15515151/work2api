@@ -22,7 +22,11 @@ func TestChatHeadersRequestIDs(t *testing.T) {
 	if h["X-Conversation-Message-ID"] != rid || h["X-Conversation-Request-ID"] != rid {
 		t.Fatal("三个 id 头应共享同一值（对账用）")
 	}
-	for _, k := range []string{"X-Conversation-ID", "X-Session-ID"} {
+	conversation := h["X-Conversation-ID"]
+	if len(conversation) != 36 || conversation[14] != '4' || !strings.ContainsRune("89ab", rune(conversation[19])) {
+		t.Fatal("conversation id must be UUID v4")
+	}
+	for _, k := range []string{"X-Session-ID"} {
 		if _, ok := h[k]; ok {
 			t.Fatalf("%s 不应发送（疑似缓存归属键）", k)
 		}
@@ -31,6 +35,9 @@ func TestChatHeadersRequestIDs(t *testing.T) {
 	h2 := ChatHeaders(testAuth(), Account{"uid": "u1"})
 	if h2["X-Request-ID"] == rid {
 		t.Fatal("request id 应每次重新生成")
+	}
+	if h2["X-Conversation-ID"] == conversation {
+		t.Fatal("conversation transport id should be fresh")
 	}
 	// 基础身份头仍在
 	if !strings.Contains(h["User-Agent"], "CLI/") {

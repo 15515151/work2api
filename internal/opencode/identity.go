@@ -16,6 +16,7 @@ import (
 // RequestIDs are the correlation identifiers sent on upstream requests.
 type RequestIDs struct {
 	Session       string
+	ChildSession  string
 	Request       string
 	Project       string
 	ParentSession string
@@ -39,7 +40,7 @@ func deriveRequestIDs(body map[string]any, headers ...Header) RequestIDs {
 	}
 	signal := ""
 	if h != nil {
-		signal = firstNonEmpty(provider.BoundedSessionID(h.Get("x-opencode-session-id")), provider.BoundedSessionID(h.Get("x-opencode-session")), provider.BoundedSessionID(h.Get("x-session-affinity")), provider.HeaderSessionID(h))
+		signal = firstNonEmpty(provider.BoundedSessionID(h.Get("x-opencode-session")), provider.BoundedSessionID(h.Get("x-opencode-session-id")), provider.BoundedSessionID(h.Get("x-session-affinity")), provider.HeaderSessionID(h))
 	}
 	if signal == "" {
 		signal = jsonutil.FirstString(
@@ -61,9 +62,18 @@ func deriveRequestIDs(body map[string]any, headers ...Header) RequestIDs {
 	if projectSignal == "" {
 		projectSignal = "work2api-opencode:default-project"
 	}
-	parentSession := jsonutil.StringAt(body, "metadata", "parent_session_id")
+	parentSession := provider.BoundedSessionID(jsonutil.StringAt(body, "metadata", "parent_session_id"))
+	childSession := ""
+	if h != nil {
+		parentSession = firstNonEmpty(provider.BoundedSessionID(h.Get("x-parent-session-id")), parentSession)
+		childSession = provider.BoundedSessionID(h.Get("x-opencode-session-id"))
+	}
+	if childSession != "" {
+		childSession = CanonicalSessionID(childSession)
+	}
 	return RequestIDs{
 		Session:       session,
+		ChildSession:  childSession,
 		Request:       RandomID("req", 16),
 		Project:       StableID("prj", projectSignal),
 		ParentSession: parentSession,
@@ -79,6 +89,9 @@ func deriveCallerRequestIDs(req provider.ServeRequest) RequestIDs {
 		caller.AppName = req.AppName
 	}
 	ids.Session = CanonicalSessionID(provider.ScopedSessionID(caller, req.Headers, runtimeName, "", ids.Session))
+	if ids.ChildSession != "" {
+		ids.ChildSession = CanonicalSessionID(provider.ScopedSessionID(caller, req.Headers, runtimeName, "", ids.ChildSession))
+	}
 	if ids.ParentSession != "" {
 		ids.ParentSession = CanonicalSessionID(provider.ScopedSessionID(caller, req.Headers, runtimeName, "", CanonicalSessionID(ids.ParentSession)))
 	}

@@ -28,7 +28,7 @@ func HeaderSessionID(headers SessionHeaders) string {
 	if headers == nil {
 		return ""
 	}
-	for _, name := range []string{"X-Claude-Code-Session-Id", "X-Session-Id", "Session-Id", "X-Conversation-Id", "Conversation-Id"} {
+	for _, name := range []string{"X-Claude-Code-Session-Id", "X-Session-Id", "Session-Id", "X-Conversation-Id", "Conversation-Id", "session_id", "conversation_id"} {
 		if value := BoundedSessionID(headers.Get(name)); value != "" {
 			return value
 		}

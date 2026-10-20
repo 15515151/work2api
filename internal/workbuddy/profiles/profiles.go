@@ -60,16 +60,28 @@ func newRequestID() string {
 // to have ZERO impact on prompt cache hit rate (cache is account+prompt-prefix
 // keyed, not request-id keyed).
 //
-// X-Conversation-ID / X-Session-ID are deliberately NOT sent: likely the
-// upstream conversation/prompt-cache ownership key; sending a fresh random
-// value per request risks shattering cache ownership for no measured benefit.
+// X-Conversation-ID is required by the current international chat endpoint.
+// It is a transport identifier, independent of the gateway's scoped session
+// and sticky routing. Live prefix-cache verification accepts fresh IDs.
 func ChatHeaders(auth siterouting.Auth, account Account) map[string]string {
 	headers := CredentialHeaders(auth, account)
 	rid := newRequestID()
 	headers["X-Request-ID"] = rid
 	headers["X-Conversation-Message-ID"] = rid
 	headers["X-Conversation-Request-ID"] = rid
+	headers["X-Conversation-ID"] = newConversationID()
 	return headers
+}
+
+func newConversationID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		panic(err)
+	}
+	b[6] = b[6]&0x0f | 0x40
+	b[8] = b[8]&0x3f | 0x80
+	s := hex.EncodeToString(b[:])
+	return s[:8] + "-" + s[8:12] + "-" + s[12:16] + "-" + s[16:20] + "-" + s[20:]
 }
 
 // Account is the credential's account blob (subset used for headers).

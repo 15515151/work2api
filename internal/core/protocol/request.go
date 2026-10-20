@@ -85,8 +85,8 @@ func ForcedEffort(protocol Protocol, body map[string]any, effort string) {
 func clientEffortExplicit(protocol Protocol, body map[string]any) bool {
 	switch protocol {
 	case Chat:
-		_, ok := body["reasoning_effort"].(string)
-		return ok
+		effort, ok := body["reasoning_effort"].(string)
+		return ok && strings.TrimSpace(effort) != ""
 	case Anthropic:
 		if effort, ok := jsonutil.AnyAt(body, "output_config", "effort").(string); ok && strings.TrimSpace(effort) != "" {
 			return true
@@ -94,8 +94,8 @@ func clientEffortExplicit(protocol Protocol, body map[string]any) bool {
 		effort, ok := body["effort"].(string)
 		return ok && strings.TrimSpace(effort) != ""
 	case Responses:
-		_, ok := jsonutil.AnyAt(body, "reasoning", "effort").(string)
-		return ok
+		effort, ok := jsonutil.AnyAt(body, "reasoning", "effort").(string)
+		return ok && strings.TrimSpace(effort) != ""
 	default:
 		return false
 	}
@@ -883,7 +883,7 @@ func missingToolIDs(order []string, pending map[string]bool) []string {
 func responsesReasoning(value any) any {
 	if object, ok := value.(map[string]any); ok {
 		if jsonutil.StringAt(object, "type") == "disabled" {
-			return object
+			return nil
 		}
 		// "effort" is authoritative here for the same reason as in
 		// encodeChatRequest: it either came from the client verbatim or was

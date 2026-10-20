@@ -356,7 +356,7 @@ func TestLiveOpenCodeCompatibility(t *testing.T) {
 			w := httptest.NewRecorder()
 			report, err := rt.Serve(ctx, provider.ServeRequest{Protocol: provider.Protocol(external), Payload: converted, Writer: w})
 			if err != nil || w.Code != 200 || report.Status != "ok" {
-				t.Fatalf("automatic tool call failed HTTP=%d outcome=%s", w.Code, report.Status)
+				t.Fatalf("automatic tool call failed protocol=%s HTTP=%d outcome=%s error=%v response=%s", external, w.Code, report.Status, err, w.Body.String())
 			}
 			var response map[string]any
 			encoded, convertErr := protocol.ConvertResponse(external, protocol.Chat, w.Body.Bytes())

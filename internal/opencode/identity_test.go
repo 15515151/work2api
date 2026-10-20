@@ -1,13 +1,47 @@
 package opencode
 
 import (
+	"context"
 	"hash/fnv"
 	"net/http"
 	"strings"
 	"testing"
 	"time"
+	"work2api/internal/core/protocol"
 	"work2api/internal/core/provider"
 )
+
+func TestRootChildIdentityKeepsAffinityAndCallerIsolation(t *testing.T) {
+	h := http.Header{"X-Opencode-Session": {"root"}, "X-Opencode-Session-Id": {"child"}, "X-Parent-Session-Id": {"parent"}}
+	request := provider.ServeRequest{Headers: h, Caller: provider.Caller{AppID: 1}}
+	first := deriveCallerRequestIDs(request)
+	if first.Session == first.ChildSession || first.ParentSession == "" {
+		t.Fatal("lost root or child", first)
+	}
+	h.Set("X-Opencode-Session-Id", "other-child")
+	second := deriveCallerRequestIDs(request)
+	if first.Session != second.Session || first.ChildSession == second.ChildSession {
+		t.Fatal("child changed root affinity")
+	}
+	request.Caller.AppID = 2
+	third := deriveCallerRequestIDs(request)
+	if third.Session == second.Session || third.ChildSession == second.ChildSession || third.ParentSession == second.ParentSession {
+		t.Fatal("caller isolation lost")
+	}
+	req, err := newUpstreamRequest(context.Background(), "https://example.invalid", protocol.Chat, []byte(`{}`), first, "public")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Header.Get("x-opencode-session") != first.Session || req.Header.Get("x-opencode-session-id") != first.ChildSession || req.Header.Get("x-session-affinity") != first.Session {
+		t.Fatal("wire lost root/child distinction")
+	}
+	for _, name := range []string{"session_id", "conversation_id"} {
+		ids := deriveRequestIDs(nil, http.Header{http.CanonicalHeaderKey(name): {"underscore-session"}})
+		if ids.Session != CanonicalSessionID("underscore-session") {
+			t.Fatal("underscore session header ignored")
+		}
+	}
+}
 
 // E2 回归：会话亲和信号按上游优先级取请求头，回落 body 信号。
 func TestDeriveRequestIDsHeaderSignals(t *testing.T) {

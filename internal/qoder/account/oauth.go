@@ -377,11 +377,13 @@ func extractDedicatedPackages(result map[string]interface{}) []QuotaPackage {
 			continue
 		}
 		out = append(out, QuotaPackage{
-			Label:     pkgLabel(pkg),
-			Used:      used,
-			Total:     total,
-			Remaining: remaining,
-			ExpireAt:  int64(toFloat(pkg, "expiresAt")),
+			Label:       pkgLabel(pkg),
+			Description: pkgDisplayValue(pkg, "description", ""),
+			Unit:        strings.TrimSpace(strGet(pkg, "unit")),
+			Used:        used,
+			Total:       total,
+			Remaining:   remaining,
+			ExpireAt:    int64(toFloat(pkg, "expiresAt")),
 		})
 	}
 	return out
@@ -389,10 +391,14 @@ func extractDedicatedPackages(result map[string]interface{}) []QuotaPackage {
 
 // pkgLabel 按上游 displayLabels 的 zh-CN → en-US → value → name 回退取展示名。
 func pkgLabel(pkg map[string]interface{}) string {
+	return pkgDisplayValue(pkg, "title", "专属积分")
+}
+
+func pkgDisplayValue(pkg map[string]interface{}, dimension, fallback string) string {
 	if labels, ok := pkg["displayLabels"].([]interface{}); ok {
 		for _, li := range labels {
 			entry, ok := li.(map[string]interface{})
-			if !ok || strGet(entry, "dimension") != "title" {
+			if !ok || strGet(entry, "dimension") != dimension {
 				continue
 			}
 			i18n, _ := entry["valueI18n"].(map[string]interface{})
@@ -408,10 +414,14 @@ func pkgLabel(pkg map[string]interface{}) string {
 			}
 		}
 	}
-	if t := strings.TrimSpace(strGet(pkg, "name")); t != "" {
+	key := dimension
+	if dimension == "title" {
+		key = "name"
+	}
+	if t := strings.TrimSpace(strGet(pkg, key)); t != "" {
 		return t
 	}
-	return "专属积分"
+	return fallback
 }
 
 func extractBucket(data map[string]interface{}, key string) *QuotaBucket {

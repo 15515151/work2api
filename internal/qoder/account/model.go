@@ -66,10 +66,12 @@ type QuotaInfo struct {
 // QuotaPackage 是一个专属资源包的额度切片。available/status 双信号判活：
 // 失效时上游翻哪个字段没有真样本，只信一个可能把「少显示」翻成「多显示」。
 type QuotaPackage struct {
-	Label     string  `json:"label"`
-	Used      float64 `json:"used"`
-	Total     float64 `json:"total"`
-	Remaining float64 `json:"remaining"`
+	Label       string  `json:"label"`
+	Description string  `json:"description,omitempty"`
+	Unit        string  `json:"unit,omitempty"`
+	Used        float64 `json:"used"`
+	Total       float64 `json:"total"`
+	Remaining   float64 `json:"remaining"`
 	// ExpireAt 包自带的过期时间（毫秒 epoch），通常比账号级的更早；0 表示上游未给。
 	ExpireAt int64 `json:"expire_at,omitempty"`
 }

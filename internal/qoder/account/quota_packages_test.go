@@ -44,7 +44,7 @@ func TestExtractDedicatedPackages(t *testing.T) {
 	raw := `{
 	  "dedicatedResourcePackages": [
 	    {"available": true, "status": "QUOTA_DETAIL_STATUS_ACTIVE", "used": 10, "total": 2000, "remaining": 1990,
-	     "expiresAt": 1790000000000,
+	     "expiresAt": 1790000000000, "description": "Only selected models", "unit": "Credits",
 	     "displayLabels": [{"dimension": "title", "valueI18n": {"zh-CN": "Qwen 专属积分", "en-US": "Qwen credits"}, "value": "fallback"}]},
 	    {"available": false, "used": 1, "total": 100, "remaining": 99},
 	    {"available": true, "status": "QUOTA_DETAIL_STATUS_EXPIRED", "used": 1, "total": 100, "remaining": 99},
@@ -63,6 +63,9 @@ func TestExtractDedicatedPackages(t *testing.T) {
 	}
 	if pkgs[0].Label != "Qwen 专属积分" {
 		t.Errorf("label fallback zh-CN: %q", pkgs[0].Label)
+	}
+	if pkgs[0].Description != "Only selected models" || pkgs[0].Unit != "Credits" {
+		t.Fatal("package usage metadata lost", pkgs[0])
 	}
 	if pkgs[0].Remaining != 1990 || pkgs[0].Total != 2000 {
 		t.Errorf("bucket values: %+v", pkgs[0])

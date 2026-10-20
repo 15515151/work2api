@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 	"work2api/internal/streamwatch"
@@ -115,6 +116,7 @@ func (rt *Runtime) doUpstreamTiers(ctx context.Context, route Route, bodies map[
 	var lastResponse *http.Response
 	var lastErr error
 	effectiveRoute := route
+	lastResponseUID := ""
 	attempts := attemptOffset
 	if route.Anonymous {
 		lastErr = provider.CheckDispatch(ctx, provider.AccountRef{Provider: runtimeName, LocalID: "opencode:anonymous"}, runtimePrefix+route.ID)
@@ -126,6 +128,9 @@ func (rt *Runtime) doUpstreamTiers(ctx context.Context, route Route, bodies map[
 			return resp, route, attempts, nil
 		}
 		lastResponse, lastErr = resp, err
+		if resp != nil && ids.AccountUID != nil {
+			lastResponseUID = *ids.AccountUID
+		}
 	}
 	if ctx.Err() != nil {
 		if lastResponse != nil {
@@ -142,28 +147,67 @@ func (rt *Runtime) doUpstreamTiers(ctx context.Context, route Route, bodies map[
 	}
 	for _, tier := range keyTiers {
 		if lastResponse != nil {
-			drainAndClose(lastResponse.Body)
-			lastResponse = nil
+			lastResponse = bufferedErrorResponse(lastResponse)
 		}
 		keyRoute := route
 		keyRoute.Tier = tier
 		keyRoute.Anonymous = false
 		keyRoute.Protocol = route.ProtocolFor(tier)
-		effectiveRoute = keyRoute
 		resp, err, used := rt.doKeyUpstream(ctx, keyRoute, bodies, ids, attempts)
 		attempts += used
+		if ctx.Err() != nil {
+			if lastResponse != nil {
+				_ = lastResponse.Body.Close()
+			}
+			if resp != nil {
+				_ = resp.Body.Close()
+			}
+			return nil, keyRoute, attempts, ctx.Err()
+		}
 		if err == nil && resp != nil && resp.StatusCode/100 == 2 {
+			if lastResponse != nil {
+				_ = lastResponse.Body.Close()
+			}
 			return resp, keyRoute, attempts, nil
 		}
-		lastResponse, lastErr = resp, err
+		if resp != nil {
+			if lastResponse != nil {
+				_ = lastResponse.Body.Close()
+			}
+			lastResponse, effectiveRoute = resp, keyRoute
+			if ids.AccountUID != nil {
+				lastResponseUID = *ids.AccountUID
+			}
+		}
+		lastErr = err
 	}
 	if lastResponse != nil {
+		if ids.AccountUID != nil {
+			*ids.AccountUID = lastResponseUID
+		}
 		return lastResponse, effectiveRoute, attempts, nil
 	}
 	if lastErr == nil {
 		lastErr = errors.New("no usable upstream route")
 	}
 	return nil, effectiveRoute, attempts, lastErr
+}
+
+// Preserve a real rejection while trying a different tier. A subsequent
+// connection failure must not hide its status, Retry-After or provider body.
+// Only error bodies are buffered; successful generation stays streaming.
+func bufferedErrorResponse(resp *http.Response) *http.Response {
+	if resp == nil || resp.Body == nil {
+		return resp
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	_ = resp.Body.Close()
+	copy := *resp
+	copy.Header = resp.Header.Clone()
+	copy.Body = io.NopCloser(bytes.NewReader(body))
+	copy.ContentLength = int64(len(body))
+	copy.Header.Del("Content-Length")
+	return &copy
 }
 
 // doAnonymousUpstream tries every currently available proxy at most once via
@@ -518,6 +562,18 @@ func upstreamStatus(resp *http.Response) int {
 
 func newUpstreamRequest(ctx context.Context, baseURL string, proto protocol.Protocol, body []byte, ids RequestIDs, key string) (*http.Request, error) {
 	endpoint := strings.TrimRight(baseURL, "/") + protocol.Path(proto)
+	// The 2.x inference Messages endpoint uses the official client's beta
+	// query flag. Keep legacy Zen and custom endpoints unchanged.
+	if proto == protocol.Anthropic && strings.TrimRight(baseURL, "/") == "https://opencode.ai/inference" {
+		parsed, err := url.Parse(endpoint)
+		if err != nil {
+			return nil, err
+		}
+		query := parsed.Query()
+		query.Set("beta", "true")
+		parsed.RawQuery = query.Encode()
+		endpoint = parsed.String()
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -526,7 +582,8 @@ func newUpstreamRequest(ctx context.Context, baseURL string, proto protocol.Prot
 	req.Header.Set("Accept", "application/json, text/event-stream")
 	req.Header.Set("User-Agent", userAgent())
 	req.Header.Set("x-opencode-client", "cli")
-	req.Header.Set("x-opencode-session-id", ids.Session)
+	req.Header.Set("x-opencode-session", ids.Session)
+	req.Header.Set("x-opencode-session-id", firstNonEmpty(ids.ChildSession, ids.Session))
 	req.Header.Set("x-session-affinity", ids.Session)
 	req.Header.Set("X-Session-Id", ids.Session)
 	sum := sha256.Sum256([]byte(ids.Project))

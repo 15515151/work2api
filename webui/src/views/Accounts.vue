@@ -214,6 +214,8 @@ function statusTextClass(r: any): string {
 // 弹层 Teleport 到 body——表格容器 overflow-x-auto 会裁剪行内绝对定位。
 interface Pkg {
   name: string
+  description?: string
+  unit?: string
   remain: number | null
   used: number | null
   total: number | null
@@ -1033,6 +1035,7 @@ async function saveConfig() {
                 {{ Math.round(pkgPct(p)!) }}%
               </span>
             </div>
+            <div v-if="p.description" class="mt-1 break-words text-micro leading-snug text-faint">{{ p.description }}</div>
             <div v-if="pkgPct(p) != null" class="mt-1.5 h-1.5 overflow-hidden rounded-full bg-line/60">
               <div
                 v-if="pkgPct(p) != null"
@@ -1045,6 +1048,7 @@ async function saveConfig() {
             <div class="mt-1.5 flex flex-wrap items-baseline gap-x-3 gap-y-0.5 text-micro text-faint">
               <span class="mono whitespace-nowrap">{{ p.unlimited ? '上游额度不限' : '剩 ' + (p.remain == null ? '未知' : fmtCredits(p.remain)) + ' / ' + (p.total == null ? '未知' : fmtCredits(p.total)) }}</span>
               <span class="mono whitespace-nowrap">已用 {{ p.used == null ? '未知' : fmtCredits(p.used) }}</span>
+              <span v-if="p.unit" class="whitespace-nowrap">{{ p.unit }}</span>
               <!-- 临期包：过期时间精确到分钟并标黄，一眼看出紧迫度 -->
               <span v-if="p.expire_at" class="ml-auto mono whitespace-nowrap" :class="pkgExpiring(p) ? 'text-warn' : ''">
                 到期：{{ dt(p.expire_at, 'YYYY-MM-DD HH:mm') }}

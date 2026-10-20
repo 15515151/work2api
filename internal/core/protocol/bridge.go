@@ -301,6 +301,13 @@ func anthropicThinking(value any) (any, map[string]any) {
 		if kind == "disabled" {
 			return nil, nil
 		}
+		if kind == "adaptive" {
+			return map[string]any{"type": "adaptive"}, nil
+		}
+		if kind == "enabled" {
+			effort := effortForThinkingBudget(budget)
+			return thinkingFor(effort, budget), map[string]any{"effort": effort}
+		}
 		// A level carried in "type" (Chat's {"reasoning":{"type":"high"}}), or a
 		// one-sided {"type":"enabled"} whose only control is its budget.
 		if effort, stated := normalizeEffortValue(object["type"]); stated {
