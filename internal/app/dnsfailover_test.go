@@ -572,6 +572,7 @@ func (f *channelRetryUpstream) StreamUpstream(_ context.Context, _ map[string]st
 
 func TestChannelIdentityCompatibilityPreservesCapabilitiesAndBounds(t *testing.T) {
 	const banner = "You are Claude Code, Anthropic's official CLI for Claude."
+	const harnessBanner = "You are an AI agent powered by DeepSeek Harness."
 	const codexBanner = "You are a coding agent running in the Codex CLI, a terminal-based coding assistant. Codex CLI is an open source project led by OpenAI."
 	const zcodeBranch = "You are ZCode, an interactive coding agent\nMain branch (you will usually use this for PRs): main"
 	const zcodeCompatible = "You are ZCode, an interactive coding agent\nDefault branch (you will usually use this for PRs): main"
@@ -588,6 +589,11 @@ func TestChannelIdentityCompatibilityPreservesCapabilitiesAndBounds(t *testing.T
 		lateDomestic                      bool
 	}{
 		{name: "domestic", profile: "cn-cli", prompt: banner + tail, errorBody: denial, wantCalls: 2, wantCompat: true},
+		{name: "harness domestic", profile: "cn-cli", prompt: harnessBanner + tail, errorBody: denial, wantCalls: 2, wantCompat: true},
+		{name: "harness domestic work", profile: "cn-work", prompt: harnessBanner + tail, errorBody: denial, wantCalls: 2, wantCompat: true},
+		{name: "harness international work", profile: "intl-work", prompt: harnessBanner + tail, errorBody: denial, wantCalls: 2, wantCompat: true},
+		{name: "harness disabled", profile: "cn-cli", prompt: harnessBanner + tail, errorBody: denial, disabled: true, wantCalls: 2},
+		{name: "harness partial output", profile: "cn-cli", prompt: harnessBanner + tail, errorBody: denial, partial: true, wantCalls: 1},
 		{name: "zcode branch", profile: "cn-cli", prompt: zcodeBranch + tail, errorBody: denial, wantCalls: 2, wantCompat: true, wantRewrite: zcodeCompatible + tail},
 		{name: "zcode disabled", profile: "cn-cli", prompt: zcodeBranch + tail, errorBody: denial, disabled: true, wantCalls: 2},
 		{name: "zcode international", profile: "intl-cli", prompt: zcodeBranch + tail, errorBody: denial, wantCalls: 2, wantCompat: true, wantRewrite: zcodeCompatible + tail},

@@ -12,6 +12,7 @@ import (
 
 	"work2api/internal/workbuddy/credentials"
 	"work2api/internal/workbuddy/reasoning"
+	wbruntime "work2api/internal/workbuddy/runtime"
 	"work2api/internal/workbuddy/siterouting"
 	"work2api/internal/workbuddy/upstream"
 )
@@ -22,16 +23,36 @@ func TestLiveInternationalConversationHeaders(t *testing.T) {
 	if os.Getenv("WORK2API_LIVE_INTL_HEADERS") != "1" {
 		t.Skip("explicit live verification only")
 	}
+	runLiveConversationHeaders(t, siterouting.International, os.Getenv("WORK2API_LIVE_INTL_CLIENTS") == "1")
+}
+
+func TestLiveDomesticClientCompatibility(t *testing.T) {
+	if os.Getenv("WORK2API_LIVE_CN_CLIENTS") != "1" {
+		t.Skip("explicit live verification only")
+	}
+	runLiveConversationHeaders(t, siterouting.Domestic, true)
+}
+
+func runLiveConversationHeaders(t *testing.T, site string, probeClients bool) {
+	t.Helper()
 	var mgr *credentials.Manager
-	for _, file := range credentials.FindAuthFiles("", filepath.Join("..", "..", "..", "auths")) {
+	project := filepath.Join("..", "..", "..", "auths")
+	files := append(credentials.FindAuthFiles(project, ""), credentials.FindAuthFiles("", "")...)
+	for _, file := range files {
 		candidate := credentials.NewManager(file)
-		if siterouting.ProfileSite(candidate.Profile()) == siterouting.International {
+		if siterouting.ProfileSite(candidate.Profile()) == site {
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			_, err := candidate.GetChatHeadersContext(ctx)
+			cancel()
+			if err != nil {
+				continue // Desktop encrypted or stale credentials are not usable test identities.
+			}
 			mgr = candidate
 			break
 		}
 	}
 	if mgr == nil {
-		t.Fatal("international credential unavailable")
+		t.Fatal("credential unavailable for requested site")
 	}
 	url, err := siterouting.ChatURLForProfile(mgr.Profile())
 	if err != nil {
@@ -43,7 +64,45 @@ func TestLiveInternationalConversationHeaders(t *testing.T) {
 		"messages": []any{map[string]any{"role": "system", "content": "Answer briefly."}, map[string]any{"role": "user", "content": prefix + "Reply with just OK."}},
 	})
 	body = reasoning.InjectThinking(body)
-	for _, mode := range []string{"legacy", "current", "current-repeat"} {
+	modes := []string{"legacy", "current", "current-repeat"}
+	if probeClients {
+		modes = []string{"current", "harness-agent", "harness-coding", "harness-built"}
+		if site == siterouting.Domestic {
+			modes = append(modes, "harness-agent-compatible")
+		}
+	}
+	if site == siterouting.Domestic && os.Getenv("WORK2API_LIVE_CN_TOOLS") == "1" {
+		modes = []string{"harness-tool-compatible"}
+	}
+	for _, mode := range modes {
+		requestBody := body
+		if strings.HasPrefix(mode, "harness-") {
+			intro := "You are an AI agent powered by DeepSeek Harness."
+			if mode == "harness-coding" {
+				intro = "You are a coding agent powered by the deepseek-v4.1-flash model."
+			}
+			if mode == "harness-built" {
+				intro = "You are an AI assistant built on DeepSeek Harness."
+			}
+			requestBody = upstream.BuildUpstreamBody(map[string]any{
+				"model": "deepseek-v4.1-flash", "max_tokens": 1024, "reasoning_effort": "off",
+				"messages": []any{map[string]any{"role": "system", "content": intro + "\nAnswer briefly."}, map[string]any{"role": "user", "content": prefix + "Reply with just OK."}},
+			})
+			requestBody = reasoning.InjectThinking(requestBody)
+			if mode == "harness-tool-compatible" {
+				requestBody["messages"] = []any{map[string]any{"role": "system", "content": intro + "\nUse the supplied tool to report status."}, map[string]any{"role": "user", "content": "Call report_status with status OK."}}
+				requestBody["tools"] = []any{map[string]any{"type": "function", "function": map[string]any{"name": "report_status", "description": "Report a synthetic test status.", "parameters": map[string]any{"type": "object", "properties": map[string]any{"status": map[string]any{"type": "string"}}, "required": []any{"status"}}}}}
+				requestBody["tool_choice"] = map[string]any{"type": "function", "function": map[string]any{"name": "report_status"}}
+				requestBody = reasoning.NormalizeToolChoice(requestBody)
+			}
+			if strings.HasSuffix(mode, "-compatible") {
+				var changed bool
+				requestBody, changed = wbruntime.ChannelCompatibilityBody(requestBody, 1)
+				if !changed {
+					t.Fatal("verified Harness opening was not adapted")
+				}
+			}
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 75*time.Second)
 		headers, err := mgr.GetChatHeadersContext(ctx)
 		if err != nil {
@@ -58,7 +117,8 @@ func TestLiveInternationalConversationHeaders(t *testing.T) {
 		content := 0
 		finish := ""
 		first := time.Duration(0)
-		err = upstream.Shared().StreamUpstream(ctx, headers, body, url, func(line string) error {
+		toolName, toolArguments := "", ""
+		err = upstream.Shared().StreamUpstream(ctx, headers, requestBody, url, func(line string) error {
 			if !strings.HasPrefix(line, "data: ") {
 				return nil
 			}
@@ -73,6 +133,18 @@ func TestLiveInternationalConversationHeaders(t *testing.T) {
 			for _, raw := range choices {
 				choice, _ := raw.(map[string]any)
 				delta, _ := choice["delta"].(map[string]any)
+				calls, _ := delta["tool_calls"].([]any)
+				if len(calls) > 0 && first == 0 {
+					first = time.Since(start)
+				}
+				for _, rawCall := range calls {
+					call, _ := rawCall.(map[string]any)
+					function, _ := call["function"].(map[string]any)
+					name, _ := function["name"].(string)
+					arguments, _ := function["arguments"].(string)
+					toolName += name
+					toolArguments += arguments
+				}
 				if text, _ := delta["content"].(string); text != "" {
 					content += len(text)
 					if first == 0 {
@@ -98,12 +170,19 @@ func TestLiveInternationalConversationHeaders(t *testing.T) {
 			} else {
 				t.Logf("mode=%s transport failure: %v", mode, err)
 			}
-			if mode != "legacy" {
+			if mode != "legacy" && (!strings.HasPrefix(mode, "harness-") || strings.HasSuffix(mode, "-compatible")) {
 				t.Fatal("current headers did not complete generation")
 			}
 			continue
 		}
 		t.Logf("mode=%s finish=%s bytes=%d first=%s duration=%s usage=%v", mode, finish, content, first.Round(time.Millisecond), time.Since(start).Round(time.Millisecond), usage)
+		if mode == "harness-tool-compatible" {
+			var arguments map[string]any
+			if finish != "tool_calls" || toolName != "report_status" || json.Unmarshal([]byte(toolArguments), &arguments) != nil || arguments["status"] != "OK" {
+				t.Fatal("native tool name, arguments or finish reason lost")
+			}
+			continue
+		}
 		if content == 0 || finish != "stop" {
 			t.Error("incomplete synthetic response")
 		}

@@ -128,6 +128,9 @@ func (rt *Runtime) doUpstreamTiers(ctx context.Context, route Route, bodies map[
 			return resp, route, attempts, nil
 		}
 		lastResponse, lastErr = resp, err
+		if err == nil && deterministicRequestRejection(resp) {
+			return resp, route, attempts, nil
+		}
 		if resp != nil && ids.AccountUID != nil {
 			lastResponseUID = *ids.AccountUID
 		}
@@ -165,6 +168,12 @@ func (rt *Runtime) doUpstreamTiers(ctx context.Context, route Route, bodies map[
 			return nil, keyRoute, attempts, ctx.Err()
 		}
 		if err == nil && resp != nil && resp.StatusCode/100 == 2 {
+			if lastResponse != nil {
+				_ = lastResponse.Body.Close()
+			}
+			return resp, keyRoute, attempts, nil
+		}
+		if err == nil && deterministicRequestRejection(resp) {
 			if lastResponse != nil {
 				_ = lastResponse.Body.Close()
 			}
@@ -264,6 +273,10 @@ func (rt *Runtime) doAnonymousUpstream(ctx context.Context, route Route, bodies 
 				lastErr = ctx.Err()
 			}
 			break
+		}
+		if err == nil && deterministicRequestRejection(resp) {
+			// A malformed/oversized request says nothing about this exit's health.
+			return resp, nil, attempts
 		}
 		rt.observeAnonymousResult(ctx, node, resp, err)
 		if err == nil && resp.StatusCode/100 == 2 {
@@ -603,6 +616,56 @@ func newUpstreamRequest(ctx context.Context, baseURL string, proto protocol.Prot
 
 func isNonRetryableClientResponse(resp *http.Response, err error) bool {
 	return err == nil && resp != nil && resp.StatusCode >= 400 && resp.StatusCode < 500 && resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusTooManyRequests
+}
+
+// Only explicit payload/context errors stop cross-tier fallback. In particular,
+// unknown 400s and model/tool availability can differ between tiers. Inspect a
+// bounded error prefix and replay it exactly; successful SSE is never buffered.
+func deterministicRequestRejection(resp *http.Response) bool {
+	if resp == nil {
+		return false
+	}
+	if resp.StatusCode == http.StatusRequestEntityTooLarge {
+		return true
+	}
+	if (resp.StatusCode != 400 && resp.StatusCode != 422) || resp.Body == nil {
+		return false
+	}
+	original := resp.Body
+	prefix, err := io.ReadAll(io.LimitReader(original, 16<<10))
+	resp.Body = &replayedErrorBody{Reader: io.MultiReader(bytes.NewReader(prefix), original), Closer: original}
+	if err != nil {
+		return false
+	}
+	var envelope map[string]any
+	if json.Unmarshal(prefix, &envelope) != nil {
+		return false
+	}
+	if inner, ok := envelope["error"].(map[string]any); ok {
+		envelope = inner
+	}
+	for _, field := range []string{"code", "type"} {
+		value, _ := envelope[field].(string)
+		switch strings.ToLower(value) {
+		case "context_length_exceeded", "string_above_max_length", "invalid_json":
+			return true
+		}
+	}
+	for _, field := range []string{"message", "msg"} {
+		value, _ := envelope[field].(string)
+		value = strings.ToLower(value)
+		for _, marker := range []string{"maximum context length", "context length exceeded", "prompt is too long", "request body too large", "invalid json", "malformed json"} {
+			if strings.Contains(value, marker) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+type replayedErrorBody struct {
+	io.Reader
+	io.Closer
 }
 
 func (rt *Runtime) anonymousBase() string {

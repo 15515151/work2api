@@ -36,6 +36,13 @@ func ClearCompatibility(info *SessionState) {
 
 // Recognize fixed client declarations, never arbitrary mentions in instructions.
 func CompatibleIdentity(text string) (string, bool) {
+	// CN DeepSeek live replay: this exact opening is rejected while a neutral
+	// introduction succeeds. Other Harness introductions passed the same replay;
+	// do not generalize to arbitrary brands, model names or quoted history.
+	const harnessIntro = "You are an AI agent powered by DeepSeek Harness."
+	if tail, found := strings.CutPrefix(text, harnessIntro); found && (tail == "" || strings.ContainsRune(" \t\r\n", rune(tail[0]))) {
+		return "You are a coding assistant." + tail, true
+	}
 	if match := codexCLIIntro.FindStringIndex(text); match != nil {
 		tail := text[match[1]:]
 		if tail == "" || strings.ContainsRune(" \t\r\n", rune(tail[0])) {

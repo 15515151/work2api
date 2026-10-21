@@ -64,7 +64,7 @@ const (
 var (
 	RateMarkers           = []string{"rate limit", "rate-limiting", "rate-limited", "frequency limit", "too many requests", "usage limit", "请求过于频繁", "使用频率", "限流"}
 	SessionDeadMarkers    = []string{"Offline user session not found"}
-	AccountFaultMarkers   = []string{"request illegal", "trial not activated", "trial version is not yet activated"}
+	AccountFaultMarkers   = []string{"trial not activated", "trial version is not yet activated"}
 	PromptTooLongMarkers  = []string{`"code":11115`, `"code":"11115"`, "prompt is too long"}
 	ContentBlockedMarkers = []string{"blocked by security policy", "unapproved channel", "illegal api invocation"}
 	BadParamsMarkers      = []string{"Unmarshal chat params failed"}
@@ -298,7 +298,7 @@ func ClassifyUpstream(status int, raw []byte, _ http.Header) ErrKind {
 		return ErrHardCredit
 	case status >= 400 && (BusinessCode(text, "12153") || HitFold(text, lower, SessionDeadMarkers)):
 		return ErrSessionDead
-	case HitFold(text, lower, AccountFaultMarkers):
+	case status >= 400 && (BusinessCode(text, "11140") || BusinessCode(text, "14017") || HitFold(text, lower, AccountFaultMarkers)):
 		return ErrAccountFault
 	case status == 429 && CodeMarker(lower, "14018"):
 		return ErrHardCredit
@@ -344,8 +344,8 @@ func ActionFor(kind ErrKind, raw []byte, headers http.Header, now float64) ErrAc
 	case ErrNotFound:
 		return ErrAction{Rotate: true, Cooldown: NotFoundCooldown, Reason: "上游 404"}
 	case ErrAccountFault:
-		if strings.Contains(strings.ToLower(string(raw)), "request illegal") {
-			return ErrAction{Rotate: true, Cooldown: 0, Disable: true, Reason: "账号被上游封禁（11140），请重新扫码登录"}
+		if BusinessCode(string(raw), "11140") {
+			return ErrAction{Rotate: true, Cooldown: 0, Disable: true, Reason: "账号被上游限制使用（11140），请在官方客户端核实状态"}
 		}
 		return ErrAction{Rotate: true, Cooldown: SoftCooldownSec, Reason: "账号级故障（试用未激活）"}
 	case ErrServer:

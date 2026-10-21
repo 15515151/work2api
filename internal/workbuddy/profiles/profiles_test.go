@@ -11,8 +11,7 @@ func testAuth() siterouting.Auth {
 	return siterouting.Auth{"accessToken": "tok", "domain": "copilot.tencent.com"}
 }
 
-// A8/A10 回归：chat 链路必须带三个共享同一值的请求 id 头，且绝不能发
-// X-Conversation-ID / X-Session-ID（疑似上游缓存归属键，上游刻意不发）。
+// Chat 保留三个共享请求标识，并额外发送独立的 UUID 会话头；不发送 X-Session-ID。
 func TestChatHeadersRequestIDs(t *testing.T) {
 	h := ChatHeaders(testAuth(), Account{"uid": "u1"})
 	rid := h["X-Request-ID"]

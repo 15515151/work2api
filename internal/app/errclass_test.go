@@ -21,6 +21,9 @@ func TestClassifyUpstream(t *testing.T) {
 		{"successful model output is not session dead", 200, `{"content":"12153"}`, errNone},
 		{"401 session dead 12153", 401, `{"code":12153,"msg":"Offline user session not found"}`, errSessionDead},
 		{"403 request illegal account fault", 403, `{"code":11140,"msg":"request illegal"}`, errAccountFault},
+		{"account restriction without English text", 403, `{"error":{"code":"11140","message":"账号已限制使用"}}`, errAccountFault},
+		{"ambiguous request illegal must not ban account", 400, `{"msg":"request illegal"}`, errClient},
+		{"model busy is not exhausted credit", 429, `{"code":14003,"msg":"model busy"}`, errSoftRate},
 		{"429 + 14018 hard credit", 429, `{"code":14018,"msg":"credit"}`, errHardCredit},
 		{"429 plain soft rate", 429, `{"msg":"slow down"}`, errSoftRate},
 		// 关键顺序：429 的 body 常带 "quota exceeded"，状态码必须先判为限流，
@@ -72,8 +75,11 @@ func TestActionFor(t *testing.T) {
 	if a := actionFor(errSessionDead, nil, nil, now); !a.Disable {
 		t.Errorf("session dead should disable, got %+v", a)
 	}
-	if a := actionFor(errAccountFault, []byte("request illegal"), nil, now); !a.Disable {
+	if a := actionFor(errAccountFault, []byte(`{"code":11140,"msg":"request illegal"}`), nil, now); !a.Disable {
 		t.Errorf("11140 request illegal should disable, got %+v", a)
+	}
+	if a := actionFor(errAccountFault, []byte(`{"msg":"request illegal"}`), nil, now); a.Disable {
+		t.Fatal("ambiguous prose must not disable an account", a)
 	}
 	// 试用未激活：软冷却，不禁用
 	if a := actionFor(errAccountFault, []byte("trial not activated"), nil, now); a.Disable || a.Cooldown != softCooldownSec {
