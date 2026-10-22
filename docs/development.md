@@ -4,7 +4,7 @@
 
 ## 源码运行
 
-需要 Go ≥ 1.26。前端已内嵌，纯后端构建不需要 Node。
+需要 Go 1.26.10 或更新的安全补丁版本（使用 Go 1.27 时至少为 1.27.3）。前端已内嵌，纯后端构建不需要 Node。
 
 ```bash
 go build -o work2api ./cmd/server
@@ -18,9 +18,11 @@ pwsh -File scripts/run.ps1
 pwsh -File scripts/run.ps1 -NoRun
 ```
 
+一键脚本使用当前安装的 Go 工具链；手工构建与一键构建都应保持工具链安全补丁更新。
+
 ## 修改前端
 
-需要 Node ≥ 22，在项目根目录执行：
+需要已修复安全问题的 Node.js 版本，例如 22.23.4、24.22.1 或更新的安全补丁版本。在项目根目录执行：
 
 ```bash
 npm --prefix webui ci
