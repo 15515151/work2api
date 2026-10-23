@@ -190,6 +190,7 @@ export const api = {
   // 设为激活账号（qoder 对应 workbuddy 的优先级：由哪个账号服务请求）
   providerAccountSettings: (name: string, id: string, patch: { enabled?: boolean; priority?: number }) =>
     http.post<unknown, { ok: boolean }>(`/admin/providers/${encodeURIComponent(name)}/accounts/${encodeURIComponent(id)}/settings`, patch),
+  providerRenewAccount: (name: string, id: string) => http.post(`/admin/providers/${encodeURIComponent(name)}/accounts/${encodeURIComponent(id)}/renew`),
   providerActivateAccount: (name: string, id: string) =>
     http.post<unknown, { ok: boolean }>(
       `/admin/providers/${encodeURIComponent(name)}/accounts/${encodeURIComponent(id)}/activate`),

@@ -35,6 +35,7 @@ const rows = ref<Row[]>([])
 const loading = ref(true)
 const busy = ref(false)
 const rowBusy = ref(new Set<string>())
+async function renewAccount(r: Record<string, any>) { try { await mutateRow(r, () => api.providerRenewAccount(r.provider, r.id)); toast.success("授权已续期") } catch(e: any) { toast.error(e?.response?.data?.error?.message || "续期失败") } }
 async function mutateRow(r: Record<string, any>, operation: () => Promise<unknown>) {
   const key = r.provider + '/' + r.id
   if (rowBusy.value.has(key)) return
@@ -124,17 +125,21 @@ async function batchToggle(enabled: boolean) {
 // 状态归一
 function statusOf(r: any): { tone: 'live' | 'warn' | 'fault' | 'muted'; text: string } {
   const a = r.raw
-  if (a.enabled === false) return { tone: 'muted', text: a.disabled_reason || '已停用' }
+  if (a.enabled === false) return { tone: 'muted', text: '已停用' }
+  if (a.quota_login_expired) return { tone: 'warn', text: '授权已失效' }
+  if (a.quota_reauthorize) return { tone: 'warn', text: '授权需核实' }
   const cd = a.cooldown_until && a.cooldown_until > Date.now() / 1000
-  if (cd) return { tone: 'fault', text: '冷却 ' + cooldown(a.cooldown_until) }
+  if (cd) return { tone: 'warn', text: '冷却 ' + cooldown(a.cooldown_until) }
+  if (a.health_basis === 'credential' && !a.health?.last_success && a.healthy && !a.quota_exceeded) return { tone: 'muted', text: '待验证' }
   const states: Record<string, { tone: 'live' | 'warn' | 'fault' | 'muted'; text: string }> = {
     disabled: { tone: 'muted', text: '已停用' }, configured: { tone: 'live', text: '已配置' }, unconfigured: { tone: 'muted', text: '未配置' },
-    quota_exceeded: { tone: 'warn', text: '额度不足' }, healthy: { tone: 'live', text: '正常' }, unauthorized: { tone: 'warn', text: '未授权' }, unhealthy: { tone: 'warn', text: '异常' }, unknown: { tone: 'muted', text: '未上报' },
+    quota_exceeded: { tone: 'warn', text: '额度受限' }, paid_exhausted: { tone: 'warn', text: '付费额度不足' }, healthy: { tone: 'live', text: '可调度' }, unauthorized: { tone: 'warn', text: '未授权' }, unhealthy: { tone: 'warn', text: '暂不可用' }, unknown: { tone: 'muted', text: '待验证' },
+    cooling: { tone: 'warn', text: '冷却中' }, unavailable: { tone: 'warn', text: '暂不可用' }, degraded: { tone: 'warn', text: '部分可用' },
   }
   if (r.resource?.status && states[r.resource.status]) return states[r.resource.status]
   if (a.tier) return { tone: a.key_count > 0 ? 'live' : 'muted', text: a.key_count > 0 ? '已配置' : '未配置' }
   if (a.quota_exceeded) return { tone: 'warn', text: '额度不足' }
-  if (a.healthy) return { tone: 'live', text: '正常' }
+  if (a.healthy) return { tone: 'live', text: '可调度' }
   return { tone: 'warn', text: a.has_secret === false ? '未授权' : '异常' }
 }
 
@@ -144,7 +149,9 @@ const filtered = computed(() =>
     if (statusFilter.value) {
       const st = statusOf(r)
       if (statusFilter.value === 'healthy' && st.tone !== 'live') return false
-      if (statusFilter.value === 'unhealthy' && st.tone === 'live') return false
+      if (statusFilter.value === 'unhealthy' && st.tone !== 'warn' && st.tone !== 'fault') return false
+      if (statusFilter.value === 'pending' && (st.tone !== 'muted' || r.raw.enabled === false)) return false
+      if (statusFilter.value === 'disabled' && r.raw.enabled !== false) return false
     }
     const q = search.value.trim().toLowerCase()
     if (q) {
@@ -225,6 +232,10 @@ interface Pkg {
 }
 
 const pkgOpenFor = ref<string | null>(null) // `${provider}:${id}`
+const healthOpenFor = ref<string | null>(null)
+const healthStyle = ref<Record<string, string>>({})
+const healthAnchor = ref<HTMLElement | null>(null)
+const healthPinned = ref(false)
 const pkgStyle = ref<Record<string, string>>({})
 const pkgAnchor = ref<HTMLElement | null>(null)
 // v-for 内的模板 ref：Vue 3 会收集为数组，这里恒只有 0/1 个面板
@@ -287,8 +298,69 @@ function closePkgs() {
 
 function dismissPopovers() {
   cancelClose()
-  pkgOpenFor.value = calOpenFor.value = null
-  pkgAnchor.value = calAnchor.value = null
+  pkgOpenFor.value = calOpenFor.value = healthOpenFor.value = null
+  pkgAnchor.value = calAnchor.value = healthAnchor.value = null
+  healthPinned.value = false
+}
+
+function openHealth(r: Record<string, any>, e: MouseEvent | FocusEvent) {
+  if (healthOpenFor.value === pkgKey(r)) { cancelClose(); return }
+  dismissPopovers()
+  healthAnchor.value = e.currentTarget as HTMLElement
+  healthOpenFor.value = pkgKey(r)
+  nextTick(() => {
+    const rect = healthAnchor.value?.getBoundingClientRect()
+    const panel = Array.isArray(panelEl.value) ? panelEl.value[0] : panelEl.value
+    if (!rect) return
+    const width = panel?.offsetWidth || 320
+    const height = panel?.offsetHeight || 250
+    healthStyle.value = {
+      left: Math.max(8, Math.min(rect.left, window.innerWidth - width - 8)) + 'px',
+      top: Math.max(8, rect.bottom + height + 14 > window.innerHeight ? rect.top - height - 6 : rect.bottom + 6) + 'px',
+    }
+  })
+}
+function pinHealth(r: Record<string, any>, e: MouseEvent) {
+  if (healthOpenFor.value === pkgKey(r) && healthPinned.value) { dismissPopovers(); return }
+  openHealth(r, e)
+  healthPinned.value = true
+}
+function closeHealth() { if (!healthPinned.value) scheduleClose() }
+const healthReasons: Record<string, string> = {
+  plan_limit: '上游权益额度不足', hard_credit: '上游积分不足',
+  soft_rate: '上游暂时限流', session_dead: '授权已失效', auth_error: '授权校验失败',
+  server: '上游服务暂时异常', not_found: '上游资源暂不可用',
+  account_fault: '上游账号受限', channel_denied: '上游请求校验拒绝',
+  content_policy: '上游内容校验拒绝', content_blocked: '上游内容校验拒绝',
+  transport: '网络连接异常', upstream_error: '上游请求失败', timeout: '等待上游超时',
+  local_network: '本地网络异常', response_limit: '响应超过大小保护阈值',
+  bad_params: '上游请求参数校验失败', model_blocked: '该账号暂不支持此模型',
+  waf_block: '上游网络防护拒绝', prompt_too_long: '输入超过模型上下文',
+  gateway: '网关请求校验失败', incomplete: '输出未完整结束', request_failed: '请求失败',
+}
+function healthDetails(r: Record<string, any>): { label: string; value: string }[] {
+  const a = r.raw
+  const details = [{ label: '当前状态', value: statusOf(r).text }]
+  if (a.quota_reauthorize) details.push({ label: '额度授权', value: a.quota_login_expired ? '登录授权已失效，请重新授权' : '额度接口鉴权失败，请重新授权或在官方客户端核实' })
+  else if (a.quota_refresh_failed && a.quota_error_kind) details.push({ label: '额度查询', value: ({ network: '网络连接异常，请稍后重试', upstream: '上游额度服务异常', forbidden: '上游访问权限或防护拒绝', invalid_response: '额度响应格式异常', credential: '暂时无法刷新凭据', incomplete: '额度明细读取不完整，保留上次额度', unavailable: '未能获取完整额度明细' } as Record<string, string>)[a.quota_error_kind] || '刷新失败' })
+  if (a.disabled_reason) details.push({ label: '停用原因', value: String(a.disabled_reason) })
+  if (a.cooldown_until > Date.now() / 1000) {
+    if (a.cooldown_kind) details.push({ label: '冷却原因', value: healthReasons[a.cooldown_kind] || '上游暂不可用' })
+    details.push({ label: '预计恢复', value: dt(a.cooldown_until) })
+  }
+  if (a.available_count != null && a.total_count != null) details.push({ label: a.tier === 'anonymous' ? '可用出口' : '可用密钥', value: `${a.available_count} / ${a.total_count}` })
+  if (a.health?.last_success) details.push({ label: '最近调用成功', value: dt(a.health.last_success) })
+  else if (!a.tier) details.push({ label: '调用验证', value: '本次运行尚无成功记录' })
+  if (a.health?.last_failure) {
+    const code = a.health.business_code
+    const failure = code === '11140' ? '上游账号限制，请在官方客户端核实' : code === '11128' ? '上游请求校验拒绝' : code === '11135' ? '上游图片无法识别' : healthReasons[a.health.failure_kind] || '请求失败'
+    details.push({ label: '最近失败', value: `${failure}${code ? `（${code}）` : ''}` })
+    details.push({ label: '失败时间', value: dt(a.health.last_failure) })
+  }
+  if (a.quota_updated_at) details.push({ label: '额度更新', value: `${dt(a.quota_updated_at)}${a.quota_refresh_failed ? '，最近刷新失败' : a.quota_stale ? '，待刷新' : ''}` })
+  else if (a.quota_refresh_failed) details.push({ label: '额度刷新', value: '刷新失败，调用状态单独判断' })
+  if (a.catalog_stale) details.push({ label: '模型目录', value: '使用上次成功快照，等待刷新' })
+  return details
 }
 
 function scheduleClose() {
@@ -298,14 +370,20 @@ function scheduleClose() {
 
 function dismissOutside(e: Event) {
   const target = e.target as Node | null
-  if (!target || (!pkgOpenFor.value && !calOpenFor.value)) return
+  if (!target || (!pkgOpenFor.value && !calOpenFor.value && !healthOpenFor.value)) return
   const panels: HTMLElement[] = Array.isArray(panelEl.value) ? panelEl.value : [panelEl.value]
-  if (pkgAnchor.value?.contains(target) || calAnchor.value?.contains(target) || panels.some(p => p?.contains(target))) return
+  if (pkgAnchor.value?.contains(target) || calAnchor.value?.contains(target) || healthAnchor.value?.contains(target) || panels.some(p => p?.contains(target))) return
   dismissPopovers()
 }
 
 function dismissOnEscape(e: KeyboardEvent) {
   if (e.key === 'Escape') dismissPopovers()
+}
+function dismissOnScroll(e: Event) {
+  const target = e.target as Node | null
+  const panels: HTMLElement[] = Array.isArray(panelEl.value) ? panelEl.value : [panelEl.value]
+  if (target && panels.some(panel => panel?.contains(target))) return
+  dismissPopovers()
 }
 
 watch([providerFilter, search, statusFilter], dismissPopovers)
@@ -471,6 +549,7 @@ async function refreshCreditsAll() { await runMaintenance('credits') }
 
 // ---------- 添加账号 ----------
 const addOpen = ref(false)
+const reauthorizationLabel = ref('')
 const addProvider = ref('')
 const addMethod = ref<'upload' | 'oauth' | 'token'>('oauth')
 const oauthOptions = ref<OAuthOption[]>([])
@@ -522,9 +601,18 @@ const addProviderOptions = computed(() =>
 )
 
 async function openAdd() {
+	 reauthorizationLabel.value = ''
   addProvider.value = addProviderOptions.value.find(p => p.value === providerFilter.value)?.value || addProviderOptions.value[0]?.value || ''
   addOpen.value = true
   await onAddProviderChange()
+}
+async function reauthorizeAccount(r: Record<string, any>) {
+	 reauthorizationLabel.value = label(r)
+  dismissPopovers()
+  addProvider.value = r.provider
+  addOpen.value = true
+  await onAddProviderChange()
+  if (r.provider === 'workbuddy') oauthChoice.value.site = r.raw.profile === 'intl-cli' ? 'intl-codebuddy' : r.raw.site === 'international' ? 'intl' : 'cn'
 }
 
 async function onAddProviderChange() {
@@ -681,7 +769,7 @@ onMounted(() => {
   document.addEventListener('keydown', dismissOnEscape)
   window.addEventListener('blur', dismissPopovers)
   window.addEventListener('resize', dismissPopovers)
-  window.addEventListener('scroll', dismissPopovers, true)
+  window.addEventListener('scroll', dismissOnScroll, true)
 })
 // 组件卸载时停掉可能残留的扫码轮询/悬浮层关闭定时器，避免离开页面后仍在轮询
 onUnmounted(() => {
@@ -695,7 +783,7 @@ onUnmounted(() => {
   document.removeEventListener('keydown', dismissOnEscape)
   window.removeEventListener('blur', dismissPopovers)
   window.removeEventListener('resize', dismissPopovers)
-  window.removeEventListener('scroll', dismissPopovers, true)
+  window.removeEventListener('scroll', dismissOnScroll, true)
 })
 
 // ---------- 配置型供应商（opencode 密钥层级） ----------
@@ -779,11 +867,11 @@ async function saveConfig() {
         </WInput>
         <WSelect
           v-model="statusFilter"
-          :options="[{ value: 'healthy', label: '仅正常' }, { value: 'unhealthy', label: '仅异常' }]"
+          :options="[{ value: 'healthy', label: '可调度 / 已配置' }, { value: 'unhealthy', label: '需关注' }, { value: 'pending', label: '待配置 / 验证' }, { value: 'disabled', label: '已停用' }]"
           placeholder="全部状态"
           class="w-32"
         />
-        <span class="ml-auto text-small text-faint">正常 / 已配置 <span class="mono text-live">{{ summary.healthy }}</span> / {{ summary.total }}</span>
+        <span class="ml-auto text-small text-faint">可调度 / 已配置 <span class="mono text-live">{{ summary.healthy }}</span> / {{ summary.total }}</span>
       </div>
 
       <div v-if="selectedRows.length" class="mb-3 flex flex-wrap items-center gap-2 rounded-lg border border-line p-3">
@@ -811,11 +899,10 @@ async function saveConfig() {
             <span class="text-muted">{{ siteLabel(row.resource?.region || row.raw.site || row.raw.region) || '—' }}</span>
           </template>
           <template #cell-status="{ row }">
-            <span class="inline-flex items-center gap-1.5">
+            <button type="button" class="inline-flex items-center gap-1.5 rounded text-left focus-visible:outline focus-visible:outline-2 focus-visible:outline-brand" :aria-label="label(row) + '，查看健康状态'" :aria-expanded="healthOpenFor === pkgKey(row)" aria-controls="account-health-details" @mouseenter="openHealth(row, $event)" @mouseleave="closeHealth" @focus="openHealth(row, $event)" @click="pinHealth(row, $event)">
               <WLed :tone="statusOf(row).tone" :pulse="statusOf(row).tone === 'live'" />
               <span class="text-small" :class="statusTextClass(row)">{{ statusOf(row).text }}</span>
-            </span>
-            <div v-if="row.raw.failure_count" class="text-micro text-faint">失败 {{ row.raw.failure_count }} 次</div>
+            </button>
             <div v-if="row.raw.catalog_stale" class="text-micro text-warn" title="使用上次成功发现的模型目录；刷新成功后自动更新">模型目录待刷新</div>
           </template>
           <template #cell-credits="{ row }">
@@ -825,7 +912,7 @@ async function saveConfig() {
             </template>
             <span v-else-if="row.raw.tier" class="text-muted">{{ row.raw.key_count }} {{ row.raw.tier === 'anonymous' ? '个入口' : '个密钥' }}</span>
             <span v-else class="text-faint">未上报</span>
-            <div v-if="row.raw.quota_refresh_failed || row.raw.quota_stale || row.raw.plan" class="mt-1 flex justify-end gap-2 text-micro text-faint"><span v-if="row.raw.quota_refresh_failed" class="text-warn" :title="row.raw.quota_updated_at ? '最后成功：' + dt(row.raw.quota_updated_at) : '尚未成功获取额度'">刷新失败</span><span v-else-if="row.raw.quota_stale">缓存过期</span><span v-if="row.raw.plan" :title="`上游账号套餐：${row.raw.plan}；不代表模型调用免费`">套餐：{{ String(row.raw.plan).toLowerCase() === 'free' ? '免费' : row.raw.plan }}</span></div>
+            <div v-if="row.raw.quota_refresh_failed || row.raw.quota_stale || row.raw.plan" class="mt-1 flex justify-end gap-2 text-micro text-faint"><button v-if="row.raw.quota_reauthorize" type="button" class="text-warn hover:underline" @click="reauthorizeAccount(row)">需重新授权</button><span v-else-if="row.raw.quota_refresh_failed" class="text-warn" :title="row.raw.quota_updated_at ? '最后成功：' + dt(row.raw.quota_updated_at) : '尚未成功获取额度'">刷新失败</span><span v-else-if="row.raw.quota_stale">缓存过期</span><span v-if="row.raw.plan" :title="`上游账号套餐：${row.raw.plan}；不代表模型调用免费`">套餐：{{ String(row.raw.plan).toLowerCase() === 'free' ? '免费' : row.raw.plan }}</span></div>
           </template>
           <template #cell-expire="{ row }">
             <template v-if="expiryOf(row) || pkgsOf(row).length">
@@ -882,7 +969,7 @@ async function saveConfig() {
           </template>
           <template #cell-actions="{ row }">
             <WButton v-if="can(row, 'config')" size="sm" @click="openConfig(row.provider)">编辑配置</WButton>
-            <ResourceActions v-else :resource="row.resource" :enabled="row.raw.enabled === true" :busy="rowBusy.has(row.provider + '/' + row.id)" @rename="openRename(row)" @remove="removeAccount(row)" @enabled="toggleEnabled(row)" />
+            <ResourceActions v-else :resource="row.resource" :enabled="row.raw.enabled === true" :busy="rowBusy.has(row.provider + '/' + row.id)" @renew="renewAccount(row)" @rename="openRename(row)" @remove="removeAccount(row)" @enabled="toggleEnabled(row)" />
           </template>
           <template #empty>
             <WEmpty title="还没有账号" hint="添加一个上游账号，网关才能开始转发请求。">
@@ -905,7 +992,8 @@ async function saveConfig() {
     </WModal>
 
     <!-- 添加账号 -->
-    <WModal v-model:open="addOpen" title="添加账号" @update:open="(v) => !v && stopPoll()">
+    <WModal v-model:open="addOpen" :title="reauthorizationLabel ? '重新授权' : '添加账号'" @update:open="(v) => !v && stopPoll()">
+      <p v-if="reauthorizationLabel" class="mb-3 text-small text-muted">请登录 {{ reauthorizationLabel }} 对应的同一上游账号；登录其他账号会新增账号，不会替换原账号。</p>
       <label class="mb-1.5 block text-small text-muted">供应商</label>
       <WSelect v-model="addProvider" :options="addProviderOptions" :disabled="patSaving" class="mb-4" @update:model-value="onAddProviderChange" />
 
@@ -1014,6 +1102,10 @@ async function saveConfig() {
 
     <!-- 积分构成悬浮层：逐资源包明细（对齐官方控制台"积分明细"口径） -->
     <Teleport to="body">
+      <div v-for="r in rows.filter(x => pkgKey(x) === healthOpenFor)" id="account-health-details" :key="'health-' + pkgKey(r)" ref="panelEl" role="region" aria-label="账号健康详情" class="fixed z-50 max-h-[calc(100vh-16px)] w-80 max-w-[calc(100vw-16px)] overflow-y-auto rounded-xl border border-line bg-elevated p-4 shadow-glass" :style="healthStyle" @mouseenter="cancelClose" @mouseleave="closeHealth">
+        <div class="mb-3 flex items-center justify-between gap-3"><span class="font-medium text-ink">健康状态</span><span class="truncate text-micro text-muted">{{ label(r) }}</span></div>
+        <dl class="space-y-2 text-small"><div v-for="item in healthDetails(r)" :key="item.label" class="grid grid-cols-[6rem_minmax(0,1fr)] gap-3"><dt class="text-faint">{{ item.label }}</dt><dd class="min-w-0 break-words text-ink">{{ item.value }}</dd></div></dl>
+      </div>
       <div
         v-for="r in rows.filter((x) => pkgKey(x) === pkgOpenFor)"
         :key="pkgKey(r)"

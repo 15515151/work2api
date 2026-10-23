@@ -134,7 +134,7 @@ const systemOne = computed(() => String(m.value.native_protocol || '').toLowerCa
       <div class="grid grid-cols-3 items-start gap-2 border-t border-line pt-2.5 text-center">
         <div>
           <div class="mono text-small font-semibold text-ink">{{ ctx ? int(ctx) : '—' }}</div>
-          <div class="text-micro text-faint">上下文</div>
+          <div class="text-micro text-faint" :title="Array.isArray(m.context_tiers) ? m.context_tiers.map((t: any) => `${t.name}${t.is_default ? '（默认）' : ''}`).join(' / ') : undefined">上下文<span v-if="Array.isArray(m.context_tiers) && m.context_tiers.length > 1" class="ml-1 text-muted">· {{ m.context_tiers.length }} 档</span></div>
         </div>
         <div>
           <div class="mono text-small font-semibold text-ink">{{ maxOut ? int(maxOut) : '—' }}</div>
