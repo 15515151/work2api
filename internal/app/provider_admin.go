@@ -12,6 +12,7 @@ import (
 )
 
 func (s *Server) mountProviderAdmin(mux *http.ServeMux) {
+	mux.HandleFunc("POST /admin/providers/{name}/accounts/{id}/renew", s.adminProviderRenew)
 	mux.HandleFunc("GET /admin/providers", s.adminProviders)
 	mux.HandleFunc("GET /admin/providers/{name}", s.adminProviderDetail)
 	mux.HandleFunc("POST /admin/providers/{name}/checkin", s.adminProviderCheckin)
@@ -28,6 +29,23 @@ func (s *Server) mountProviderAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /admin/providers/{name}/accounts/{id}", s.adminProviderDeleteAccount)
 	mux.HandleFunc("GET /admin/providers/{name}/config", s.adminProviderGetConfig)
 	mux.HandleFunc("POST /admin/providers/{name}/config", s.adminProviderSaveConfig)
+}
+
+func (s *Server) adminProviderRenew(w http.ResponseWriter, r *http.Request) {
+	rt, ok := s.accountManager(w, r.PathValue("name"))
+	if !ok {
+		return
+	}
+	renewer, ok := rt.(provider.AccountRenewer)
+	if !ok {
+		writeAPIErr(w, errBody(400, "该渠道不支持授权续期", "invalid_request_error"))
+		return
+	}
+	if err := renewer.RenewAccount(r.Context(), r.PathValue("id")); err != nil {
+		writeAPIErr(w, errBody(400, err.Error(), "renewal_failed"))
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
 func (s *Server) adminProviderImportLocal(w http.ResponseWriter, r *http.Request) {
@@ -371,6 +389,9 @@ func (s *Server) adminProviderDetail(w http.ResponseWriter, r *http.Request) {
 		}
 		if name == "qoder" {
 			uid = "qoder:" + uid
+		}
+		if health, ok := s.o.accountHealth.snapshot(name, uid); ok {
+			row["health"] = health
 		}
 		if c, ok := owners[uid]; ok {
 			row["owner_username"] = names[c.UserID]

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // 文件存储密钥（服务器友好，不依赖 macOS Keychain）
@@ -54,11 +55,50 @@ func normalizeSecret(raw string) string {
 }
 
 func SaveSecret(accountID, secret string) error {
+	mu.Lock()
+	defer mu.Unlock()
 	path, err := secretPath(accountID)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, []byte(normalizeSecret(secret)), 0600)
+	return writeAtomic(path, []byte(normalizeSecret(secret)))
+}
+
+func SecretAge(id string) (time.Duration, error) {
+	p, e := secretPath(id)
+	if e != nil {
+		return 0, e
+	}
+	st, e := os.Stat(p)
+	if e != nil {
+		return 0, e
+	}
+	return time.Since(st.ModTime()), nil
+}
+
+// CAS avoids overwriting a newer import or resurrecting a deleted account.
+func RotateSecret(id, previous, next string) error {
+	mu.Lock()
+	defer mu.Unlock()
+	d, e := dir()
+	if e != nil {
+		return e
+	}
+	if _, e = os.Stat(filepath.Join(d, SanitizeID(id)+".json")); e != nil {
+		return e
+	}
+	p, e := secretPath(id)
+	if e != nil {
+		return e
+	}
+	raw, e := os.ReadFile(p)
+	if e != nil {
+		return e
+	}
+	if normalizeSecret(string(raw)) != previous {
+		return fmt.Errorf("账号凭据已改变，请重新检查")
+	}
+	return writeAtomic(p, []byte(normalizeSecret(next)))
 }
 
 func GetSecret(accountID string) (string, error) {
@@ -80,6 +120,8 @@ func GetSecret(accountID string) (string, error) {
 }
 
 func DeleteSecret(accountID string) error {
+	mu.Lock()
+	defer mu.Unlock()
 	path, err := secretPath(accountID)
 	if err != nil {
 		return err

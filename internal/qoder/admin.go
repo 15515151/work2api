@@ -79,6 +79,7 @@ func (r *Runtime) queryQuota(ctx context.Context, id, region, token string) (*ac
 func (r *Runtime) AdminData(ctx context.Context) provider.AdminData {
 	d := provider.AdminData{
 		Maintenance: []provider.MaintenanceOption{
+			{Key: "qoder_auto_renew", Label: "自动续期授权", Description: "每六小时检查；OAuth凭据满十二天续期，PAT及桌面原始凭据不改写"},
 			{Key: "qoder_auto_checkin", Label: "中国站自动签到", Description: "按活动窗口补领，失败最多重试三次；默认关闭"},
 			{Key: "qoder_auto_quota", Label: "定期刷新额度", Description: "沿用全局额度刷新间隔；默认关闭"},
 		},
@@ -117,6 +118,7 @@ func (r *Runtime) AdminData(ctx context.Context) provider.AdminData {
 			reason = "桌面登录态由客户端管理"
 		}
 		d.Resources = append(d.Resources, provider.ResourceMetadata(row, "account", map[string]provider.ResourceAction{
+			"renew":    {Label: "续期", Enabled: !local && row["auth_mode"] == "oauth"},
 			"rename":   {Label: "重命名", Enabled: !local, Value: name, Reason: reason},
 			"activate": {Label: "设为激活", Enabled: !local, Reason: reason},
 			"delete":   {Label: removeLabel, Enabled: true, Confirmation: confirmation},
@@ -169,7 +171,7 @@ func (r *Runtime) accountRow(id, label, region, source, authMode string, active 
 	row := map[string]any{
 		"id": id, "label": label, "region": region, "source": source,
 		"auth_mode": authMode, "active": active, "has_secret": hasSecret,
-		"healthy": hasSecret,
+		"healthy": hasSecret, "health_basis": "credential",
 	}
 	// Use the same full credential identity as dispatch, including refresh tokens.
 	cooldownRegion := account.Region(region)

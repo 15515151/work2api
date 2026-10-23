@@ -300,6 +300,12 @@ func TestAdminProjectionIncludesModelsAndStatus(t *testing.T) {
 	if len(data.Models) != 1 || data.Models[0]["id"] != "trae/casesensitive-id" || data.Status["model_count"] != 1 || data.Status["account_count"] != 1 || data.Status["healthy_count"] != 1 {
 		t.Fatalf("incomplete admin projection: models=%v status=%v", data.Models, data.Status)
 	}
+	r.accounts["test"].Cooldown = time.Now().Add(time.Hour)
+	r.accounts["test"].CooldownKind = upstream.ErrSoftRate
+	data = r.AdminData(context.Background())
+	if data.Accounts[0]["cooldown_kind"] != "soft_rate" || data.Accounts[0]["cooldown_until"] == nil || data.Resources[0].Status != "cooling" {
+		t.Fatal("lost cooldown evidence", data.Accounts[0])
+	}
 }
 
 func TestImageCapabilityDoesNotPromoteUnknownModels(t *testing.T) {

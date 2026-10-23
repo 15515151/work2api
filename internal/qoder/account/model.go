@@ -8,20 +8,30 @@ import (
 )
 
 type Account struct {
-	UpstreamID string     `json:"upstream_id,omitempty"`
-	ID         string     `json:"id"`
-	Name       string     `json:"name"`
-	Email      string     `json:"email,omitempty"`
-	UserType   string     `json:"user_type,omitempty"`
-	Plan       string     `json:"plan,omitempty"`
-	Region     Region     `json:"region,omitempty"` // "global" | "cn"，空值视为 global
-	AuthMode   string     `json:"auth_mode"`        // "pat" | "oauth"
-	APIMode    string     `json:"api_mode"`         // "openai" | "anthropic" | "gemini" | "claude-code"
-	Tags       []string   `json:"tags"`
-	CreatedAt  time.Time  `json:"created_at"`
-	LastUsed   *time.Time `json:"last_used,omitempty"`
-	Active     bool       `json:"active"`
-	SortOrder  int        `json:"sort_order"`
+	CheckinFingerprint *CheckinFingerprint `json:"checkin_fingerprint,omitempty"`
+	UpstreamID         string              `json:"upstream_id,omitempty"`
+	ID                 string              `json:"id"`
+	Name               string              `json:"name"`
+	Email              string              `json:"email,omitempty"`
+	UserType           string              `json:"user_type,omitempty"`
+	Plan               string              `json:"plan,omitempty"`
+	Region             Region              `json:"region,omitempty"` // "global" | "cn"，空值视为 global
+	AuthMode           string              `json:"auth_mode"`        // "pat" | "oauth"
+	APIMode            string              `json:"api_mode"`         // "openai" | "anthropic" | "gemini" | "claude-code"
+	Tags               []string            `json:"tags"`
+	CreatedAt          time.Time           `json:"created_at"`
+	LastUsed           *time.Time          `json:"last_used,omitempty"`
+	Active             bool                `json:"active"`
+	SortOrder          int                 `json:"sort_order"`
+}
+
+// Optional real desktop identity, imported with the native account. OAuth-only
+// accounts retain their existing stable legacy identity.
+type CheckinFingerprint struct {
+	MachineID    string `json:"machine_id"`
+	MachineToken string `json:"machine_token"`
+	MachineType  string `json:"machine_type"`
+	ClientIP     string `json:"client_ip,omitempty"`
 }
 
 type OAuthSession struct {

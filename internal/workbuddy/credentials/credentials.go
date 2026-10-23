@@ -422,6 +422,12 @@ func (m *Manager) GetHeaders() (map[string]string, error) {
 func (m *Manager) GetHeadersContext(ctx context.Context) (map[string]string, error) {
 	return m.headersContext(ctx, false)
 }
+
+// Share the existing cancellable/CAS-safe refresh flight after billing rejects
+// an otherwise locally fresh access token.
+func (m *Manager) RefreshBillingAuthorization(ctx context.Context) error {
+	return m.ensureFresh(ctx, true)
+}
 func (m *Manager) GetChatHeaders() (map[string]string, error) {
 	return m.GetChatHeadersContext(context.Background())
 }

@@ -17,6 +17,10 @@ func (r *Runtime) Maintain(ctx context.Context, settings map[string]string, now 
 	if !r.Ready() || ctx.Err() != nil {
 		return
 	}
+	if settings["qoder_auto_renew"] == "1" && now.Sub(r.lastTokenMaintenance) >= 6*time.Hour {
+		r.lastTokenMaintenance = now
+		r.renewTokens(ctx)
+	}
 	if settings["qoder_auto_checkin"] == "1" {
 		window := checkin.WindowDate(now)
 		if r.autoWindow != window {

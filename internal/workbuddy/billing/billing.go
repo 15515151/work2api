@@ -58,6 +58,7 @@ const browserUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 
 // httpClient bypasses the system proxy (mirrors upstream trust_env=False): a
 // running intl proxy would otherwise break domestic billing calls.
 var httpClient = httpclient.New(20 * time.Second)
+var errIncompleteBilling = errors.New("额度明细分页未完成")
 
 func billingHeaders(ctx context.Context, mgr Credential) (map[string]string, error) {
 	var h map[string]string
@@ -91,6 +92,7 @@ func postJSON(ctx context.Context, mgr Credential, url string, body map[string]a
 func postJSONStatus(ctx context.Context, mgr Credential, url string, body map[string]any) (map[string]any, int, error) {
 	headers, err := billingHeaders(ctx, mgr)
 	if err != nil {
+		noteQuery(ctx, "credential", err)
 		return nil, 0, err
 	}
 	payload, _ := json.Marshal(body)
@@ -103,12 +105,27 @@ func postJSONStatus(ctx context.Context, mgr Credential, url string, body map[st
 	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
+		noteQuery(ctx, "network", err)
 		return nil, 0, err
 	}
 	defer resp.Body.Close()
+	switch {
+	case resp.StatusCode == 401:
+		noteQuery(ctx, "unauthorized", nil)
+	case resp.StatusCode == 403:
+		noteQuery(ctx, "forbidden", nil)
+	case resp.StatusCode >= 500:
+		noteQuery(ctx, "upstream", nil)
+	}
 	var data map[string]any
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&data); err != nil {
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			noteQuery(ctx, "invalid_response", nil)
+		}
 		return map[string]any{}, resp.StatusCode, nil
+	}
+	if code, ok := data["code"].(float64); ok && code == 12153 {
+		noteQuery(ctx, "login_expired", nil)
 	}
 	return data, resp.StatusCode, nil
 }
@@ -338,11 +355,15 @@ func fetchNewCredits(ctx context.Context, mgr Credential) *Credit {
 		}},
 	}
 	for _, e := range endpoints {
-		j, err := postJSON(ctx, mgr, e.url, e.body)
+		pageAccounts, err := pagedAccounts(ctx, mgr, e.url, e.body)
 		if err != nil {
+			if errors.Is(err, errIncompleteBilling) {
+				noteQuery(ctx, "incomplete", nil)
+				return nil
+			}
 			continue
 		}
-		accounts = append(accounts, extractAccounts(j)...)
+		accounts = append(accounts, pageAccounts...)
 	}
 	if len(accounts) == 0 {
 		return nil
@@ -360,11 +381,13 @@ func fetchOldCredits(ctx context.Context, mgr Credential) *Credit {
 		"PackageEndTimeRangeBegin": now.Format("2006-01-02 15:04:05"),
 		"PackageEndTimeRangeEnd":   now.AddDate(10, 0, 0).Format("2006-01-02 15:04:05"),
 	}
-	j, err := postJSON(ctx, mgr, url, body)
+	accounts, err := pagedAccounts(ctx, mgr, url, body)
 	if err != nil {
+		if errors.Is(err, errIncompleteBilling) {
+			noteQuery(ctx, "incomplete", nil)
+		}
 		return nil
 	}
-	accounts := extractAccounts(j)
 	if len(accounts) == 0 {
 		return nil
 	}
@@ -373,15 +396,111 @@ func fetchOldCredits(ctx context.Context, mgr Credential) *Credit {
 	return &Credit{Remain: math.Round(remain), Total: math.Round(total), ExpireAt: earliestPackageExpiry(pkgs), Packages: pkgs}
 }
 
+// Only read-only billing lists are paged. Incomplete lists must not replace a
+// last-known balance. Summary endpoints without paging stay single-request.
+func pagedAccounts(ctx context.Context, mgr Credential, url string, body map[string]any) ([]any, error) {
+	_, paged := body["PageSize"]
+	query := make(map[string]any, len(body))
+	for k, v := range body {
+		query[k] = v
+	}
+	var result []any
+	var previous string
+	for page := 1; page <= 100; page++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if paged {
+			query["PageNumber"] = page
+		}
+		data, err := postJSON(ctx, mgr, url, query)
+		if err != nil {
+			if page > 1 {
+				return nil, fmt.Errorf("%w: %v", errIncompleteBilling, err)
+			}
+			return nil, err
+		}
+		rows := extractAccounts(data)
+		total := billingTotalCount(data)
+		encoded, _ := json.Marshal(rows)
+		if page > 1 && len(rows) > 0 && string(encoded) == previous {
+			return nil, errIncompleteBilling
+		}
+		previous = string(encoded)
+		result = append(result, rows...)
+		if len(rows) == 0 && total > len(result) {
+			return nil, errIncompleteBilling
+		}
+		if !paged || total > 0 && len(result) >= total || total <= 0 && len(rows) < 100 {
+			return result, nil
+		}
+	}
+	return nil, errIncompleteBilling
+}
+
+func billingTotalCount(data map[string]any) int {
+	for _, path := range [][]string{{"data", "Response", "Data"}, {"data"}, {}} {
+		m := data
+		for _, k := range path {
+			next, _ := m[k].(map[string]any)
+			m = next
+		}
+		if n := num(m["TotalCount"]); n > 0 && n < 1<<30 {
+			return int(n)
+		}
+	}
+	return 0
+}
+
 // FetchCredits queries the account's spendable credit balance.
 func FetchCredits(ctx context.Context, mgr Credential) (*Credit, error) {
+	observation := &QueryError{Kind: "unavailable"}
+	ctx = context.WithValue(ctx, queryKey{}, observation)
 	if res := fetchNewCredits(ctx, mgr); res != nil {
 		return res, nil
 	}
 	if res := fetchOldCredits(ctx, mgr); res != nil {
 		return res, nil
 	}
-	return nil, errors.New("额度查询失败：新计费三接口与旧接口均不可用")
+	return nil, observation
+}
+
+type queryKey struct{}
+type QueryError struct {
+	Kind  string
+	cause error
+}
+
+func (e *QueryError) Unwrap() error { return e.cause }
+func (e *QueryError) Error() string {
+	switch e.Kind {
+	case "login_expired":
+		return "登录授权已失效，请重新授权"
+	case "incomplete":
+		return "额度明细读取不完整，保留上次额度"
+	case "unauthorized":
+		return "额度接口鉴权失败，请重新授权"
+	case "credential":
+		return "无法获取有效授权，请核实登录状态"
+	case "network":
+		return "额度查询网络异常，请稍后重试"
+	case "forbidden":
+		return "额度接口访问被拒绝，请核实上游权限或防护"
+	case "upstream":
+		return "上游额度服务暂时异常"
+	case "invalid_response":
+		return "额度响应格式异常"
+	default:
+		return "未能获取完整额度数据，请稍后重试"
+	}
+}
+func noteQuery(ctx context.Context, kind string, cause error) {
+	if q, ok := ctx.Value(queryKey{}).(*QueryError); ok {
+		rank := map[string]int{"unavailable": 0, "invalid_response": 1, "incomplete": 1, "upstream": 2, "network": 3, "forbidden": 4, "unauthorized": 5, "credential": 6, "login_expired": 7}
+		if rank[kind] >= rank[q.Kind] {
+			q.Kind, q.cause = kind, cause
+		}
+	}
 }
 
 // DailyCheckin performs the daily check-in.

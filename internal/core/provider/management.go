@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"math"
+	"time"
 )
 
 type LocalAccountImporter interface {
@@ -77,6 +78,9 @@ type MaintenanceOption struct {
 // Small optional contracts let channels expose independent operations.
 type AccountRenamer interface{ RenameAccount(string, string) error }
 type AccountActivator interface{ ActivateAccount(string) error }
+type AccountRenewer interface {
+	RenewAccount(context.Context, string) error
+}
 type AccountDeleter interface{ DeleteAccount(string) error }
 type AccountEnabler interface{ SetAccountEnabled(string, bool) error }
 type AccountPrioritizer interface{ SetAccountPriority(string, int) error }
@@ -110,13 +114,24 @@ func ResourceMetadata(row map[string]any, kind string, actions map[string]Resour
 		status = "unconfigured"
 		if n := resourceNumber(row["key_count"]); n != nil && *n > 0 {
 			status = "configured"
+			if available := resourceNumber(row["available_count"]); available != nil {
+				if *available == 0 {
+					status = "unavailable"
+				} else if total := resourceNumber(row["total_count"]); total != nil && *available < *total {
+					status = "degraded"
+				}
+			}
 		}
-	case row["quota_exceeded"] == true:
-		status = "quota_exceeded"
-	case row["healthy"] == true:
-		status = "healthy"
 	case row["has_secret"] == false:
 		status = "unauthorized"
+	case resourceNumber(row["cooldown_until"]) != nil && *resourceNumber(row["cooldown_until"]) > float64(time.Now().UnixMilli())/1000:
+		status = "cooling"
+	case row["quota_exceeded"] == true:
+		status = "quota_exceeded"
+	case row["healthy"] == false && resourceNumber(row["credits_remaining"]) != nil && *resourceNumber(row["credits_remaining"]) <= 0:
+		status = "paid_exhausted"
+	case row["healthy"] == true:
+		status = "healthy"
 	case row["healthy"] == false:
 		status = "unhealthy"
 	}

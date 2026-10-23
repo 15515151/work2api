@@ -5,6 +5,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"math"
 	"path/filepath"
@@ -31,6 +32,9 @@ type Streamer interface {
 // Runtime owns the mutable WorkBuddy resources for exactly one gateway.
 // AccountMu coordinates import/delete with the gateway's ownership transaction.
 type Runtime struct {
+	creditMu       sync.Mutex
+	creditStates   map[string]creditState
+	creditRefresh  map[string]*provider.RefreshGate
 	modelRefresh   provider.RefreshGate
 	MaintenanceMu  sync.Mutex
 	maintenance    *maintenanceState
@@ -49,6 +53,15 @@ type Runtime struct {
 	Sessions       *SessionRouter
 	CooldownMu     sync.Mutex
 	Cooldowns      map[string]CooldownEntry
+}
+
+type creditState struct {
+	Manager      *credentials.Manager
+	Updated      float64
+	Failed       bool
+	Kind         string
+	Reauthorize  bool
+	LoginExpired bool
 }
 
 func New(cfg *config.Config, db *store.DB) (*Runtime, error) {
@@ -272,11 +285,61 @@ func (r *Runtime) enhanceBody(body map[string]any) map[string]any {
 }
 
 func (r *Runtime) RefreshCreditsFor(ctx context.Context, db *store.DB, acc *pool.Account) {
+	r.creditMu.Lock()
+	if r.creditRefresh == nil {
+		r.creditRefresh = map[string]*provider.RefreshGate{}
+	}
+	gate := r.creditRefresh[acc.UID]
+	if gate == nil {
+		gate = &provider.RefreshGate{}
+		r.creditRefresh[acc.UID] = gate
+	}
+	r.creditMu.Unlock()
+	_ = gate.Do(ctx, fmt.Sprintf("%p", r.Manager(acc.UID)), func(ctx context.Context) error { r.refreshCreditsFor(ctx, db, acc); return nil })
+}
+func (r *Runtime) refreshCreditsFor(ctx context.Context, db *store.DB, acc *pool.Account) {
 	mgr := r.Manager(acc.UID)
 	if mgr == nil {
 		return
 	}
 	cr, err := billing.FetchCredits(ctx, mgr)
+	var queryErr *billing.QueryError
+	if errors.As(err, &queryErr) && (queryErr.Kind == "unauthorized" || queryErr.Kind == "login_expired") && ctx.Err() == nil {
+		if refreshErr := mgr.RefreshBillingAuthorization(ctx); refreshErr == nil {
+			cr, err = billing.FetchCredits(ctx, mgr)
+		} else {
+			err = refreshErr
+		}
+	}
+	r.AccountMu.Lock()
+	defer r.AccountMu.Unlock()
+	if ctx.Err() != nil || r.Manager(acc.UID) != mgr {
+		return
+	}
+	r.creditMu.Lock()
+	if r.creditStates == nil {
+		r.creditStates = map[string]creditState{}
+	}
+	state := r.creditStates[acc.UID]
+	if state.Manager != mgr {
+		state = creditState{Manager: mgr}
+	}
+	state.Failed = err != nil
+	state.Reauthorize = false
+	state.LoginExpired = errors.Is(err, credentials.ErrLoginRequired)
+	state.Kind = ""
+	queryErr = nil
+	if errors.As(err, &queryErr) {
+		state.Kind = queryErr.Kind
+		state.LoginExpired = state.LoginExpired || queryErr.Kind == "login_expired"
+		state.Reauthorize = queryErr.Kind == "unauthorized" || queryErr.Kind == "credential" && state.LoginExpired
+	}
+	state.Reauthorize = state.Reauthorize || state.LoginExpired
+	if err == nil {
+		state.Updated = nowSec()
+	}
+	r.creditStates[acc.UID] = state
+	r.creditMu.Unlock()
 	if err != nil {
 		// 与上游一致：额度查询失败要留日志，否则「刷新额度没反应」无从排查
 		log.Printf("额度查询失败 %s: %v", acc.UID, err)

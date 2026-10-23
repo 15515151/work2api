@@ -2,6 +2,7 @@ package opencode
 
 import (
 	"context"
+	"time"
 
 	"work2api/internal/core/provider"
 )
@@ -34,18 +35,56 @@ func (rt *Runtime) AdminData(ctx context.Context) provider.AdminData {
 	if rt.cfg.Anonymous {
 		accts = append(accts, map[string]any{"id": "anonymous", "label": "匿名（public）", "tier": "anonymous", "key_count": 1})
 	}
+	now := time.Now().UnixNano()
+	for _, row := range accts {
+		available, total := 0, 0
+		if row["tier"] == "anonymous" {
+			for _, node := range rt.anonymous.nodes {
+				total++
+				if node.proxy.healthy.Load() && node.cooldownUntil.Load() <= now {
+					available++
+				}
+			}
+		} else {
+			pool := rt.zenNodes
+			if row["tier"] == "go" {
+				pool = rt.goNodes
+			}
+			for _, node := range pool.nodes {
+				total++
+				if p := pool.Proxy(node); p != nil && p.healthy.Load() && node.cooldownUntil.Load() <= now {
+					available++
+				}
+			}
+		}
+		row["available_count"], row["total_count"] = available, total
+	}
 	seen := map[string]bool{}
+	keyRows := map[string]map[string]any{}
 	for _, tier := range []struct {
 		name string
 		pool *nodePool
 	}{{"zen", rt.zenNodes}, {"go", rt.goNodes}} {
 		for _, node := range tier.pool.nodes {
 			uid := PortalKeyUID(node.key)
+			available := false
+			if p := tier.pool.Proxy(node); p != nil {
+				available = p.healthy.Load() && node.cooldownUntil.Load() <= now
+			}
 			if seen[uid] {
+				if available {
+					keyRows[uid]["healthy"] = true
+					delete(keyRows[uid], "cooldown_until")
+				}
 				continue
 			}
 			seen[uid] = true
-			accts = append(accts, map[string]any{"id": uid, "label": "OpenCode " + tier.name + " · " + uid[len(uid)-8:], "source": "native", "credential": true, "key_count": 1, "enabled": true})
+			row := map[string]any{"id": uid, "label": "OpenCode " + tier.name + " · " + uid[len(uid)-8:], "source": "native", "credential": true, "key_count": 1, "enabled": true, "healthy": available}
+			if until := node.cooldownUntil.Load(); !available && until > now {
+				row["cooldown_until"] = float64(until) / 1e9
+			}
+			keyRows[uid] = row
+			accts = append(accts, row)
 		}
 	}
 	d.Accounts = accts

@@ -91,12 +91,19 @@ type Bridge struct {
 }
 
 // QoderModel 是返回给前端的精简模型条目（仅保留下拉选择必要字段）
+type ContextTier struct {
+	Name    string `json:"name"`
+	Tokens  int    `json:"tokens"`
+	Default bool   `json:"is_default"`
+}
+
 type QoderModel struct {
-	Key         string `json:"key"`
-	DisplayName string `json:"display_name"`
-	Enable      bool   `json:"enable"`
-	IsDefault   bool   `json:"is_default"`
-	IsReasoning bool   `json:"is_reasoning,omitempty"`
+	ContextTiers []ContextTier `json:"context_tiers,omitempty"`
+	Key          string        `json:"key"`
+	DisplayName  string        `json:"display_name"`
+	Enable       bool          `json:"enable"`
+	IsDefault    bool          `json:"is_default"`
+	IsReasoning  bool          `json:"is_reasoning,omitempty"`
 	// IsVL 上游 vision-language 标记（model/list 条目的 is_vl 字段）：
 	// true 表示该模型接受图片输入（多模态）。Go 版此前漏读该字段导致
 	// 整个 qoder 目录被标成纯文本。
@@ -124,7 +131,7 @@ func NewBridge(pat string, region account.Region, templateBase map[string]interf
 	return NewBridgeContext(context.Background(), pat, region, templateBase)
 }
 
-func NewBridgeContext(ctx context.Context, pat string, region account.Region, templateBase map[string]interface{}) (*Bridge, error) {
+func NewBridgeContext(ctx context.Context, pat string, region account.Region, templateBase map[string]interface{}, fingerprints ...*account.CheckinFingerprint) (*Bridge, error) {
 	logger.Debug("Bridge using token: %s (prefix: %s)", tokenPrefix(pat, 10), tokenPrefix(pat, 4))
 
 	var identity cosy.AuthIdentity
@@ -180,6 +187,18 @@ func NewBridgeContext(ctx context.Context, pat string, region account.Region, te
 		return nil, err
 	}
 	client := NewBearerClient(sess)
+	if len(fingerprints) > 0 && fingerprints[0] != nil {
+		fp := *fingerprints[0]
+		if fp.MachineID == "" || fp.MachineToken == "" || fp.MachineType == "" {
+			return nil, errors.New("桌面设备指纹不完整")
+		}
+		for _, v := range []string{fp.MachineID, fp.MachineToken, fp.MachineType, fp.ClientIP} {
+			if len(v) > 4096 || strings.ContainsAny(v, "\r\n") {
+				return nil, errors.New("桌面设备指纹格式无效")
+			}
+		}
+		client.fingerprint = &fp
+	}
 
 	return &Bridge{
 		sess:         sess,
@@ -289,33 +308,34 @@ func extractModels(rawList []interface{}) []QoderModel {
 			model.PriceFactor = &value
 		}
 		if cc, ok := m["context_config"].(map[string]interface{}); ok {
-			var defaultCfg map[string]interface{}
-			for _, cfg := range cc {
-				cfgMap, _ := cfg.(map[string]interface{})
-				if cfgMap == nil {
+			for name, value := range cc {
+				cfg, _ := value.(map[string]interface{})
+				if cfg == nil {
 					continue
 				}
-				isDefault, _ := cfgMap["is_default"].(bool)
-				if isDefault {
-					defaultCfg = cfgMap
+				n := cosy.FloatVal(cfg, "token_count")
+				if n <= 0 || n > 1<<30 || math.IsNaN(n) || math.IsInf(n, 0) {
+					continue
+				}
+				def, _ := cfg["is_default"].(bool)
+				model.ContextTiers = append(model.ContextTiers, ContextTier{Name: name, Tokens: int(n), Default: def})
+			}
+			sort.Slice(model.ContextTiers, func(i, j int) bool {
+				a, b := model.ContextTiers[i], model.ContextTiers[j]
+				if a.Tokens != b.Tokens {
+					return a.Tokens < b.Tokens
+				}
+				return a.Name < b.Name
+			})
+			for _, tier := range model.ContextTiers {
+				if tier.Default {
+					model.ContextWindow = tier.Tokens
 					break
 				}
 			}
-			if defaultCfg == nil {
-				for _, cfg := range cc {
-					cfgMap, _ := cfg.(map[string]interface{})
-					if cfgMap != nil {
-						defaultCfg = cfgMap
-						break
-					}
-				}
+			if model.ContextWindow == 0 && len(model.ContextTiers) > 0 {
+				model.ContextWindow = model.ContextTiers[len(model.ContextTiers)-1].Tokens
 			}
-			if defaultCfg != nil {
-				model.ContextWindow = int(cosy.FloatVal(defaultCfg, "token_count"))
-			}
-		}
-		if model.ContextWindow == 0 {
-			model.ContextWindow = model.MaxInputTokens
 		}
 		if model.ContextWindow == 0 {
 			model.ContextWindow = model.MaxInputTokens

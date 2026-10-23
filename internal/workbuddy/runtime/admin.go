@@ -15,6 +15,15 @@ func (r *Runtime) AccountsForDisplay() []map[string]any {
 	today := time.Now().Format("2006-01-02")
 	for _, a := range accounts {
 		uid, _ := a["uid"].(string)
+		r.creditMu.Lock()
+		state := r.creditStates[uid]
+		r.creditMu.Unlock()
+		if state.Manager != nil && state.Manager == r.Manager(uid) {
+			a["quota_refresh_failed"], a["quota_reauthorize"], a["quota_error_kind"], a["quota_login_expired"] = state.Failed, state.Reauthorize, state.Kind, state.LoginExpired
+			if state.Updated > 0 {
+				a["quota_updated_at"] = state.Updated
+			}
+		}
 		a["healthy"] = r.AccountHealthy(r.Pool.Get(uid), nowSec())
 		// 前端读取的是 checkin_today（见 webui Accounts.vue / types）——
 		// 曾误写成 checked_in_today，导致签到成功后页面状态永不同步。

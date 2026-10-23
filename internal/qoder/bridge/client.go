@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"work2api/internal/qoder/account"
 	"work2api/internal/qoder/cosy"
 	"work2api/internal/streamwatch"
 
@@ -18,7 +19,8 @@ import (
 )
 
 type BearerClient struct {
-	sess *cosy.SessionContext
+	sess        *cosy.SessionContext
+	fingerprint *account.CheckinFingerprint
 }
 
 var streamHTTPClient = func() *http.Client {
@@ -62,6 +64,15 @@ func (c *BearerClient) buildHeaders(pathSig, body, accept string, extra map[stri
 	}
 	for k, v := range extra {
 		h[k] = v
+	}
+	if fp := c.fingerprint; fp != nil {
+		h["cosy-machineid"], h["cosy-machinetoken"], h["cosy-machinetype"] = fp.MachineID, fp.MachineToken, fp.MachineType
+		h["cosy-clienttype"], h["cosy-version"], h["user-agent"] = "10", "1.1.69", "undici"
+		h["cosy-scene"], h["cosy-business-product"] = "app", "app"
+		h["cosy-clientip"] = fp.ClientIP
+		if fp.ClientIP == "" {
+			h["cosy-clientip"] = fp.MachineID
+		}
 	}
 	return h, nil
 }

@@ -60,6 +60,7 @@ type Runtime struct {
 	autoAttempts         int
 	autoRetry            time.Time
 	lastQuotaMaintenance time.Time
+	lastTokenMaintenance time.Time
 	mu                   sync.Mutex
 	bridges              map[string]*bridge.Bridge
 	bridgeKeys           map[string][32]byte
@@ -285,7 +286,7 @@ func (r *Runtime) bridgeFor(ctx context.Context, acct *account.Account, secret s
 		var templateBase map[string]interface{}
 		_ = json.Unmarshal([]byte(tmpl), &templateBase)
 
-		b, err := bridge.NewBridgeContext(ctx, secret, acct.Region, templateBase)
+		b, err := bridge.NewBridgeContext(ctx, secret, acct.Region, templateBase, acct.CheckinFingerprint)
 		// Re-read native credentials before publishing; external imports may change
 		// the secret while the network initialization is in progress.
 		if err == nil && !strings.HasPrefix(acct.ID, "qoder-local-") {
@@ -466,6 +467,7 @@ func (r *Runtime) refreshAccountModels(ctx context.Context, acct *account.Accoun
 				"is_default":       m.IsDefault,
 				"is_reasoning":     m.IsReasoning,
 				"price_factor":     m.PriceFactor,
+				"context_tiers":    m.ContextTiers,
 				"pricing_source":   "upstream_catalog",
 				"pricing_unit":     "relative_multiplier",
 				"pricing_known":    m.PriceFactor != nil,
@@ -503,7 +505,8 @@ func (r *Runtime) refreshAccountModels(ctx context.Context, acct *account.Accoun
 }
 
 func modelCatalogKey(acct *account.Account, secret string) [32]byte {
-	return sha256.Sum256([]byte(acct.ID + "\x00" + string(acct.Region) + "\x00" + secret))
+	fp, _ := json.Marshal(acct.CheckinFingerprint)
+	return sha256.Sum256([]byte(acct.ID + "\x00" + string(acct.Region) + "\x00" + secret + "\x00" + string(fp)))
 }
 
 func (r *Runtime) markCatalogStale(key [32]byte) {

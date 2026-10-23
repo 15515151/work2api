@@ -567,6 +567,11 @@ func (r *Runtime) AdminData(context.Context) provider.AdminData {
 		}
 		healthy := a.Enabled && !time.Now().Before(a.Cooldown)
 		row := map[string]any{"id": id, "uid": id, "provider": "trae", "label": label, "nickname": a.Auth.Nickname, "alias": a.Alias, "source": "import", "product": a.Auth.Variant, "site": "domestic", "enabled": a.Enabled, "healthy": healthy, "priority": a.Priority, "credits_remaining": a.Remaining, "credits_total": a.Total, "credits_expire_at": a.Expiry, "quota_stale": time.Since(a.QuotaAt) > 30*time.Minute, "quota_refresh_failed": a.QuotaFailed, "last_checkin_date": a.CheckinDate, "quota_unit": "credits", "credit_packages": a.CreditPackages, "catalog_stale": catalogStale(a)}
+		row["failure_count"] = a.Failures
+		if time.Now().Before(a.Cooldown) {
+			row["cooldown_until"] = float64(a.Cooldown.UnixMilli()) / 1000
+			row["cooldown_kind"] = a.CooldownKind.String()
+		}
 		if !a.QuotaAt.IsZero() {
 			row["quota_updated_at"] = float64(a.QuotaAt.Unix())
 		}

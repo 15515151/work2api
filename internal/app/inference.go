@@ -25,6 +25,13 @@ func (o *Orchestrator) extractInputText(body map[string]any) string {
 	return o.wb.ExtractInputText(body)
 }
 func (o *Orchestrator) recordUsage(ctx context.Context, params store.UsageParams) {
+	if ctx == nil || ctx.Err() == nil {
+		name := "workbuddy"
+		if rt, ok := o.runtimes.Resolve(params.Model); ok {
+			name = rt.Name()
+		}
+		o.accountHealth.observe(name, params)
+	}
 	id, err := o.db.LogUsageWithID(params)
 	if err == nil {
 		trackUsageTiming(ctx, id)

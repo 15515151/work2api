@@ -11,6 +11,7 @@ package bridge
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -96,6 +97,9 @@ func IsContentPolicy(detail string) bool {
 //   - 其余 4xx 带 provider_error（"Error in upstream response"）→ 瞬时
 //   - 401/403/429：凭证/频控各有专门路径，不属瞬时重试类
 func IsTransientUpstream(code int, detail string) bool {
+	if resourceFailure(detail, 0) != "" {
+		return false
+	}
 	if code == 401 || code == 403 || code == 429 {
 		return false
 	}
@@ -167,6 +171,12 @@ func (e *UpstreamError) Unwrap() error { return e.cause }
 // 返回 (message, errType)。与 hub friendly_upstream_error 逐句对齐。
 func FriendlyUpstreamError(code int, detail string) (string, string) {
 	detail = strings.TrimSpace(detail)
+	if kind := resourceFailure(detail, 0); kind != "" {
+		if kind == "upstream_queued" {
+			return "上游模型正在排队，请稍后重试或选择其他模型", kind
+		}
+		return "上游模型资源或权益受限，请核实账号套餐及模型可用性", kind
+	}
 	// 1) 内容安全审核（确定性拒绝，先于瞬时判断——重试无效）
 	if IsContentPolicy(detail) {
 		return "上游内容安全审核未通过 (DataInspectionFailed)：输入可能含不当内容，" +
@@ -195,11 +205,57 @@ func NewUpstreamError(code int, detail string) *UpstreamError {
 // NewStreamBusinessError 流内业务错误（HTTP 200 帧内 code != 0）：
 // 不是 HTTP 层瞬时故障，除内容审核外不做重试指引。
 func NewStreamBusinessError(detail string) *UpstreamError {
+	if kind := resourceFailure(detail, 0); kind != "" {
+		msg, _ := FriendlyUpstreamError(0, detail)
+		status := 403
+		if kind == "upstream_queued" {
+			status = 429
+		}
+		return &UpstreamError{Status: status, Detail: detail, ErrType: kind, Message: msg}
+	}
 	if IsContentPolicy(detail) {
 		msg, et := FriendlyUpstreamError(502, detail)
 		return &UpstreamError{Status: 502, Detail: detail, ErrType: et, Message: msg}
 	}
 	return &UpstreamError{Status: 0, Detail: detail, ErrType: ErrTypeUpstream, Message: detail}
+}
+
+// Decode only bounded structured envelopes; prose cannot establish entitlement
+// or queue state. This observation does not introduce automatic waiting.
+func resourceFailure(detail string, depth int) string {
+	if depth > 4 || len(detail) > 65536 {
+		return ""
+	}
+	var m map[string]json.RawMessage
+	if json.Unmarshal([]byte(detail), &m) != nil {
+		return ""
+	}
+	var sub string
+	_ = json.Unmarshal(m["subCode"], &sub)
+	if sub == "RESOURCE_LIMIT" {
+		var queued bool
+		var wait int
+		_ = json.Unmarshal(m["isQueued"], &queued)
+		_ = json.Unmarshal(m["retryAfterSeconds"], &wait)
+		if queued || wait > 0 {
+			return "upstream_queued"
+		}
+		return "resource_limit"
+	}
+	for _, key := range []string{"error", "message", "body", "data"} {
+		raw := m[key]
+		if len(raw) == 0 {
+			continue
+		}
+		var text string
+		if json.Unmarshal(raw, &text) != nil {
+			text = string(raw)
+		}
+		if kind := resourceFailure(text, depth+1); kind != "" {
+			return kind
+		}
+	}
+	return ""
 }
 
 // WrapTransportError 传输层错误包装：瞬时类转成带友好消息的 UpstreamError，
@@ -241,6 +297,10 @@ func ErrorStatus(err error) int {
 			return 400
 		case ErrTypeTransient:
 			return 502
+		case "upstream_queued":
+			return 429
+		case "resource_limit":
+			return 403
 		}
 		if ue.Status >= 400 && ue.Status <= 599 {
 			return ue.Status

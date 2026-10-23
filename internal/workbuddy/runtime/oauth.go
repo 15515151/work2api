@@ -1,9 +1,11 @@
 package runtime
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"time"
 	"work2api/internal/workbuddy/oauth"
 )
 
@@ -23,6 +25,15 @@ func (r *Runtime) PollLogin(state, site string) (map[string]any, error) {
 		return nil, ae
 	}
 	reg["status"] = "ready"
+	if uid, ok := reg["uid"].(string); ok {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+			defer cancel()
+			if acc := r.Pool.Get(uid); acc != nil {
+				r.RefreshCreditsFor(ctx, r.db, acc)
+			}
+		}()
+	}
 	return reg, nil
 }
 func (r *Runtime) OAuthOptions() []map[string]any {
