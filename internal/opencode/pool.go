@@ -236,14 +236,17 @@ func (p *transportPool) checkClaimedProxy(ctx context.Context, proxy *proxyTrans
 		resp, requestErr := proxy.client.Do(req)
 		err = requestErr
 		if resp != nil {
-			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+			_, readErr := io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+			if err == nil {
+				err = readErr
+			}
 			_ = resp.Body.Close()
 		}
 	}
 	result := proxyHealthResult{proxy: proxy, err: err, wasHealthy: proxy.healthy.Load()}
 	if err == nil {
 		result.wasHealthy = proxy.healthy.Swap(true)
-	} else if isProxyFailure(err) {
+	} else if !errors.Is(err, context.Canceled) && !isLocalDNSFailure(err) && ctx.Err() == nil {
 		result.failed = true
 		result.wasHealthy = proxy.healthy.Swap(false)
 	}

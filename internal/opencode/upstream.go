@@ -259,7 +259,7 @@ func (rt *Runtime) doAnonymousUpstream(ctx context.Context, route Route, bodies 
 		if ids.AccountUID != nil {
 			*ids.AccountUID = "opencode:anonymous"
 		}
-		resp, err := doInferenceAttempt(node.proxy.client, req, route.Protocol, time.Duration(rt.cfg.Performance.AttemptTimeoutSeconds)*time.Second)
+		resp, err := doCompatibleInferenceAttempt(node.proxy.client, req, route.Protocol, time.Duration(rt.cfg.Performance.AttemptTimeoutSeconds)*time.Second)
 		err = classifyProxyRoute(node.proxy, err)
 		attemptStatus := 0
 		if resp != nil {
@@ -510,7 +510,7 @@ func (rt *Runtime) doKeyUpstream(ctx context.Context, route Route, bodies map[Ti
 		if ids.AccountUID != nil {
 			*ids.AccountUID = uid
 		}
-		resp, err := doInferenceAttempt(proxy.client, req, route.Protocol, time.Duration(rt.cfg.Performance.AttemptTimeoutSeconds)*time.Second)
+		resp, err := doCompatibleInferenceAttempt(proxy.client, req, route.Protocol, time.Duration(rt.cfg.Performance.AttemptTimeoutSeconds)*time.Second)
 		err = classifyProxyRoute(proxy, err)
 		attemptStatus := 0
 		if resp != nil {
@@ -575,6 +575,13 @@ func upstreamStatus(resp *http.Response) int {
 
 func newUpstreamRequest(ctx context.Context, baseURL string, proto protocol.Protocol, body []byte, ids RequestIDs, key string) (*http.Request, error) {
 	endpoint := strings.TrimRight(baseURL, "/") + protocol.Path(proto)
+	if strings.TrimRight(baseURL, "/") == "https://opencode.ai/inference" {
+		family := "openai"
+		if proto == protocol.Anthropic {
+			family = "anthropic"
+		}
+		endpoint = strings.TrimRight(baseURL, "/") + "/" + family + protocol.Path(proto)
+	}
 	// The 2.x inference Messages endpoint uses the official client's beta
 	// query flag. Keep legacy Zen and custom endpoints unchanged.
 	if proto == protocol.Anthropic && strings.TrimRight(baseURL, "/") == "https://opencode.ai/inference" {

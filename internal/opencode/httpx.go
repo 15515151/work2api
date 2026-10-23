@@ -8,7 +8,7 @@ import (
 
 // userAgent identifies as the OpenCode CLI so Zen accepts the request.
 func userAgent() string {
-	return "opencode/latest/2.0.29/cli"
+	return "opencode/latest/2.1.1/cli"
 }
 
 // drainAndClose discards and closes a response body so its connection can be

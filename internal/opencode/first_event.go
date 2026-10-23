@@ -44,6 +44,56 @@ func classifyProxyRoute(proxy *proxyTransport, err error) error {
 func (e *attemptError) Error() string { return fmt.Sprintf("%v [phase=%s]", e.err, e.phase) }
 func (e *attemptError) Unwrap() error { return e.err }
 
+// Only a missing official 2.1 route can fall back to its 2.0 equivalent.
+// Reuse the identity, body and remaining first-event budget; never replay a
+// generated response or interpret an authentication/payload error as a route miss.
+func doCompatibleInferenceAttempt(client *http.Client, req *http.Request, from protocol.Protocol, timeout time.Duration) (*http.Response, error) {
+	start := time.Now()
+	resp, err := doInferenceAttempt(client, req, from, timeout)
+	if err != nil || resp == nil || resp.StatusCode != http.StatusNotFound || req.GetBody == nil || req.Context().Err() != nil || req.URL.Host != "opencode.ai" || req.URL.Scheme != "https" {
+		return resp, err
+	}
+	path := req.URL.Path
+	legacy := strings.Replace(path, "/inference/openai/v1/", "/inference/v1/", 1)
+	legacy = strings.Replace(legacy, "/inference/anthropic/v1/", "/inference/v1/", 1)
+	if legacy == path {
+		return resp, err
+	}
+	remaining := timeout
+	if timeout > 0 {
+		remaining -= time.Since(start)
+		if remaining <= 0 {
+			return resp, err
+		}
+	}
+	body, bodyErr := req.GetBody()
+	if bodyErr != nil {
+		return resp, err
+	}
+	old := req.Clone(req.Context())
+	old.URL.Path = legacy
+	old.Body = body
+	// Retain the real 404 if the compatibility connection cannot be made.
+	saved := bufferedErrorResponse(resp)
+	if timeout > 0 {
+		remaining = timeout - time.Since(start)
+		if remaining <= 0 {
+			_ = body.Close()
+			return saved, nil
+		}
+	}
+	next, nextErr := doInferenceAttempt(client, old, from, remaining)
+	if nextErr != nil {
+		if req.Context().Err() != nil {
+			_ = saved.Body.Close()
+			return nil, req.Context().Err()
+		}
+		return saved, nil
+	}
+	_ = saved.Body.Close()
+	return next, nil
+}
+
 // Apply the configured optional timeout to the entire uncommitted attempt,
 // then disarm it atomically. A timer must never kill an established stream.
 func doInferenceAttempt(client *http.Client, req *http.Request, from protocol.Protocol, timeout ...time.Duration) (*http.Response, error) {
