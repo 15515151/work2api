@@ -2,7 +2,6 @@
 import { computed, onMounted, ref } from 'vue'
 import { api, type PortalModel } from '../api'
 import ModelInfoCard from '../../src/components/ModelInfoCard.vue'
-import { toast } from '../../src/lib/toast'
 import WButton from '../../src/components/ui/WButton.vue'
 import WInput from '../../src/components/ui/WInput.vue'
 
@@ -13,7 +12,6 @@ const error = ref('')
 const source = ref('')
 const filtered = computed(() => models.value.filter(m => `${m.id} ${m.name || ''}`.toLowerCase().includes(query.value.trim().toLowerCase())))
 function channel(model: PortalModel) { return model.provider || (model.id.includes('/') ? model.id.split('/')[0]! : 'workbuddy') }
-async function copy(id: string) { try { await navigator.clipboard.writeText(id); toast.success('调用名已复制') } catch { toast.error('复制失败，请手动复制模型 ID') } }
 async function load() {
   if (loading.value) return
   loading.value = true
@@ -39,10 +37,9 @@ onMounted(load)
     <div class="model-grid">
       <ModelInfoCard v-for="model in filtered" :key="model.id" :model="model" :provider="channel(model)">
         <template #footer>
-          <div class="flex flex-wrap items-center gap-2 border-t border-line pt-2.5 text-micro">
+          <div v-if="model.own_account || model.default_access" class="flex flex-wrap items-center gap-2 border-t border-line pt-2.5 text-micro">
             <span v-if="model.own_account" class="rounded bg-live/12 px-2 py-1 text-live">本人账号</span>
             <span v-if="model.default_access" class="rounded bg-brand/12 px-2 py-1 text-brand">默认开放授权</span>
-            <WButton size="sm" variant="subtle" class="ml-auto" @click="copy(model.id)">复制调用名</WButton>
           </div>
         </template>
       </ModelInfoCard>

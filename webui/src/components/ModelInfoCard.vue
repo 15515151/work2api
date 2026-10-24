@@ -2,12 +2,24 @@
 // 管理台与门户共用的模型参数展示；操作由包装层插槽提供，本组件不请求管理接口。
 import { computed } from 'vue'
 import WTag from '@/components/ui/WTag.vue'
+import WIcon from '@/components/ui/WIcon.vue'
+import { toast } from '@/lib/toast'
 import ModelPromotions from '@/components/ModelPromotions.vue'
 import { int } from '@/lib/format'
 import { providerMeta } from '@/lib/providers'
 
 const props = defineProps<{ model: Record<string, any>; provider: string }>()
 const m = computed(() => props.model)
+async function copyModelName() {
+  const id = m.value.id
+  if (typeof id !== 'string' || !id) return
+  try {
+    await navigator.clipboard.writeText(id)
+    toast.success('调用名已复制')
+  } catch {
+    toast.error('复制失败，请手动选择模型调用名')
+  }
+}
 const pm = computed(() => providerMeta(props.provider))
 const multimodal = computed(() => m.value.modality === 'multimodal' || m.value.vision || m.value.supports_image)
 const reasoning = computed(() => {
@@ -101,7 +113,12 @@ const systemOne = computed(() => String(m.value.native_protocol || '').toLowerCa
     <div class="model-card-header flex items-start justify-between gap-2">
       <div class="min-w-0">
         <div class="truncate font-semibold text-ink" :title="m.name || m.id">{{ m.name || m.id }}</div>
-        <div class="mono truncate text-micro text-faint" :title="m.id">{{ m.id }}</div>
+        <div class="flex min-w-0 items-center gap-1">
+          <span class="mono min-w-0 truncate select-text text-micro text-faint" :title="m.id">{{ m.id }}</span>
+          <button v-if="typeof m.id === 'string' && m.id" type="button" class="inline-flex shrink-0 items-center justify-center rounded p-0.5 text-faint transition-colors hover:text-brand focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand" title="复制完整调用名" :aria-label="`复制模型调用名 ${m.id}`" @click="copyModelName">
+            <WIcon name="copy" :size="14" />
+          </button>
+        </div>
       </div>
       <WTag :tone="pm.tone" class="shrink-0 whitespace-nowrap">{{ pm.label }}</WTag>
     </div>
