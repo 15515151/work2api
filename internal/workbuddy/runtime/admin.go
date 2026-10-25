@@ -15,10 +15,32 @@ func (r *Runtime) AccountsForDisplay() []map[string]any {
 	today := time.Now().Format("2006-01-02")
 	for _, a := range accounts {
 		uid, _ := a["uid"].(string)
+		if mgr := r.Manager(uid); mgr != nil {
+			if identity, err := mgr.MaintenanceIdentity(); err == nil {
+				state := r.billingGuard().State(uid, identity)
+				if state.Kind != "" {
+					a["maintenance"] = []map[string]any{state.Public("账单与签到")}
+				}
+			}
+		}
+		if r.authorizationInvalid(uid) {
+			a["auth_invalid"] = true
+		}
+		if r.Catalog != nil {
+			extra := r.Catalog.CatalogMaintenance(r.Pool.Get(uid))
+			if len(extra) > 0 {
+				pending, _ := a["maintenance"].([]map[string]any)
+				a["maintenance"] = append(pending, extra...)
+			}
+		}
 		r.creditMu.Lock()
 		state := r.creditStates[uid]
 		r.creditMu.Unlock()
-		if state.Manager != nil && state.Manager == r.Manager(uid) {
+		currentIdentity := ""
+		if mgr := r.Manager(uid); mgr != nil {
+			currentIdentity, _ = mgr.MaintenanceIdentity()
+		}
+		if state.Manager != nil && state.Manager == r.Manager(uid) && (state.Identity == "" || state.Identity == currentIdentity) {
 			a["quota_refresh_failed"], a["quota_reauthorize"], a["quota_error_kind"], a["quota_login_expired"] = state.Failed, state.Reauthorize, state.Kind, state.LoginExpired
 			if state.Updated > 0 {
 				a["quota_updated_at"] = state.Updated
@@ -179,7 +201,7 @@ func (r *Runtime) checkin(ctx context.Context) map[string]any {
 			results = append(results, map[string]any{"uid": a.UID, "ok": false, "message": "今日已签到", "already": true})
 			continue
 		}
-		res, err := BillingCheckin(ctx, mgr)
+		res, err := r.checkinAccount(ctx, a)
 		if err == nil && (res.OK || res.Already) {
 			_ = r.db.RecordCheckin(a.UID, today, "manual")
 		}
@@ -189,7 +211,6 @@ func (r *Runtime) checkin(ctx context.Context) map[string]any {
 		}
 		results = append(results, map[string]any{"uid": a.UID, "ok": res.OK, "message": msg, "already": res.Already})
 	}
-	r.RefreshAllCredits(ctx, r.db)
 	return map[string]any{"ok": true, "results": results, "skipped": skipped, "accounts": r.AccountsForDisplay()}
 }
 

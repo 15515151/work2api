@@ -6,6 +6,12 @@ import (
 	"time"
 )
 
+// ScopedCatalogMetadata projects account-dependent display fields without
+// exposing metadata from accounts unavailable to the current caller.
+type ScopedCatalogMetadata interface {
+	ModelMetadataForAccounts(model string, accounts map[string]bool) map[string]any
+}
+
 type LocalAccountImporter interface {
 	ImportLocalAccounts(context.Context) (map[string]any, error)
 }

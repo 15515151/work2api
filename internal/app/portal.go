@@ -667,6 +667,16 @@ func (s *Server) portalModels(w http.ResponseWriter, r *http.Request) {
 				item[field] = value
 			}
 		}
+		if runtime, ok := s.o.runtimes.ByName(str2(model["provider"])); ok {
+			if scoped, ok := runtime.(provider.ScopedCatalogMetadata); ok {
+				metadata := scoped.ModelMetadataForAccounts(id, p.ModelScopes[s.o.resolveModel(id)])
+				for _, field := range []string{"price_factors", "promotions", "pricing_stale"} {
+					if value, ok := metadata[field]; ok {
+						item[field] = value
+					}
+				}
+			}
+		}
 		if model["provider"] == "workbuddy" {
 			physical := strings.TrimPrefix(id, "workbuddy/")
 			supporters := []map[string]any{}

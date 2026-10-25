@@ -72,10 +72,16 @@ const costMetric = computed(() => {
     title: 'models.dev 的 Zen 参考价，单位为美元/百万 tokens；Go 订阅与实际账单以渠道为准。',
   }
   if (props.provider === 'trae') return {
-    value: '-', label: '成本系数',
-    title: '尚未获取可确认的模型成本系数，目录权益消耗值不能作为计费倍率。',
+    value: traeRates.value.length ? (traeRates.value[0] === traeRates.value[traeRates.value.length - 1] ? `×${traeRates.value[0]}` : `×${traeRates.value[0]}–${traeRates.value[traeRates.value.length - 1]}`) : '-', label: '成本系数',
+    title: traePriceDescription.value,
   }
   return { value: finiteCost(displayCredits.value) ? `×${displayCredits.value}` : '-', label: '成本系数', title: '上游目录成本系数；仅在该渠道及相应计费规则内比较，跨渠道数字不能直接比较；活动或时段优惠以实际扣费为准。' }
+})
+const traeRates = computed<number[]>(() => [...new Set<number>((Array.isArray(m.value.price_factors) ? m.value.price_factors : []).filter((q: any) => finiteCost(q.rate)).map((q: any) => q.rate))].sort((a, b) => a - b))
+const traePriceDescription = computed(() => {
+  const quotes = Array.isArray(m.value.price_factors) ? m.value.price_factors : []
+  const details = [...new Set(quotes.map((q: any) => `${q.product === 'cn' ? 'IDE' : q.product === 'solo' ? 'Work/SOLO' : '目录'}：${finiteCost(q.rate) ? `×${q.rate}` : '未知'}${q.stale ? '（缓存已过期）' : ''}`))]
+  return [...details, '上游目录当前相对倍率，已包含当前优惠；不是积分/百万 Tokens。适用账号与活动可能不同，实际扣费以上游结算为准。'].join('\n')
 })
 const nativeProtocol = computed(() => ({
   chat: 'Chat', messages: 'Messages', responses: 'Responses',

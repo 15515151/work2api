@@ -125,9 +125,11 @@ async function batchToggle(enabled: boolean) {
 // 状态归一
 function statusOf(r: any): { tone: 'live' | 'warn' | 'fault' | 'muted'; text: string } {
   const a = r.raw
-  if (a.enabled === false) return { tone: 'muted', text: '已停用' }
-  if (a.quota_login_expired) return { tone: 'warn', text: '授权已失效' }
-  if (a.quota_reauthorize) return { tone: 'warn', text: '授权需核实' }
+  if (a.enabled === false) return { tone: a.auth_invalid ? 'fault' : Array.isArray(a.maintenance) && a.maintenance.length ? 'warn' : 'muted', text: '已停用' }
+  if (a.auth_invalid) return { tone: 'fault', text: '授权已失效' }
+  if (a.auth_partial || Array.isArray(a.maintenance) && a.maintenance.length) return { tone: 'warn', text: a.auth_partial ? '部分可用' : '维护异常' }
+  if (a.quota_login_expired) return { tone: 'warn', text: '额度授权异常' }
+  if (a.quota_reauthorize) return { tone: 'warn', text: '额度授权异常' }
   const cd = a.cooldown_until && a.cooldown_until > Date.now() / 1000
   if (cd) return { tone: 'warn', text: '冷却 ' + cooldown(a.cooldown_until) }
   if (a.health_basis === 'credential' && !a.health?.last_success && a.healthy && !a.quota_exceeded) return { tone: 'muted', text: '待验证' }
@@ -341,8 +343,11 @@ const healthReasons: Record<string, string> = {
 function healthDetails(r: Record<string, any>): { label: string; value: string }[] {
   const a = r.raw
   const details = [{ label: '当前状态', value: statusOf(r).text }]
-  if (a.quota_reauthorize) details.push({ label: '额度授权', value: a.quota_login_expired ? '登录授权已失效，请重新授权' : '额度接口鉴权失败，请重新授权或在官方客户端核实' })
+  if (a.auth_invalid) details.push({ label: '登录授权', value: '已确认失效，暂停模型调度与相关维护，请重新授权' })
+  else if (a.auth_partial) details.push({ label: '登录授权', value: '部分产品身份失效，其他有效身份仍可调用' })
+  if (a.quota_reauthorize) details.push({ label: '额度授权', value: a.quota_login_expired ? '额度接口报告授权失效，可重新授权后核实；模型调用凭据单独判断' : '额度接口鉴权失败，请重新授权或在官方客户端核实' })
   else if (a.quota_refresh_failed && a.quota_error_kind) details.push({ label: '额度查询', value: ({ network: '网络连接异常，请稍后重试', upstream: '上游额度服务异常', forbidden: '上游访问权限或防护拒绝', invalid_response: '额度响应格式异常', credential: '暂时无法刷新凭据', incomplete: '额度明细读取不完整，保留上次额度', unavailable: '未能获取完整额度明细' } as Record<string, string>)[a.quota_error_kind] || '刷新失败' })
+  if (Array.isArray(a.maintenance) && a.maintenance.length) details.push({ label: '维护状态', value: a.maintenance.map((m: any) => `${m.scope}${m.kind === 'authorization_unverified' ? '（接口鉴权异常，未判定登录失效）' : ''}：${m.needs_login ? '请重新授权' : m.retry_at ? `暂停，${dt(m.retry_at)} 后先验证授权` : '等待授权验证'}`).join('；') })
   if (a.disabled_reason) details.push({ label: '停用原因', value: String(a.disabled_reason) })
   if (a.cooldown_until > Date.now() / 1000) {
     if (a.cooldown_kind) details.push({ label: '冷却原因', value: healthReasons[a.cooldown_kind] || '上游暂不可用' })

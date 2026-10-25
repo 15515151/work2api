@@ -7,25 +7,25 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"work2api/internal/workbuddy/billing"
 	"work2api/internal/workbuddy/siterouting"
 )
 
 const (
-	checkinRetryInterval = 2 * 3600.0
-	checkinMaxRetry      = 3
-	keepaliveFailLimit   = 3
+	checkinMaxRetry = 3
 )
 
 type maintenanceState struct {
-	r                                                    *Runtime
-	ctx                                                  context.Context
-	lastCredit                                           float64
-	lastCheckinDate, checkinCountDate, lastKeepaliveDate string
-	checkinFailCount                                     int
-	checkinRetryAt                                       float64
-	checkinAttemptedToday                                bool
-	keepaliveFails                                       map[string]int
+	r                 *Runtime
+	ctx               context.Context
+	lastCredit        float64
+	lastKeepaliveDate string
+	checkinJobs       map[string]checkinJob
+}
+type checkinJob struct {
+	date, identity string
+	attempts       int
+	retryAt        time.Time
+	complete       bool
 }
 
 func (s *maintenanceState) context() context.Context { return s.ctx }
@@ -112,24 +112,50 @@ func (s *maintenanceState) refreshCredits() {
 // Returns the UIDs that genuinely failed (excludes "already checked in").
 func (s *maintenanceState) doCheckin() []string {
 	ctx := s.context()
-	skip := s.checkedInToday()
+	var skip map[string]bool
 	t := today()
 	var failed []string
 	for _, acc := range s.r.Pool.Accounts() {
-		if skip[acc.UID] {
-			continue
-		}
 		mgr := s.r.Manager(acc.UID)
 		if mgr == nil {
+			continue
+		}
+		identity, _ := mgr.MaintenanceIdentity()
+		if s.checkinJobs == nil {
+			s.checkinJobs = map[string]checkinJob{}
+		}
+		job := s.checkinJobs[acc.UID]
+		if job.date != t || job.identity != identity {
+			job = checkinJob{date: t, identity: identity}
+		}
+		if job.complete || job.attempts >= checkinMaxRetry || time.Now().Before(job.retryAt) {
 			continue
 		}
 		// 国际站 WorkBuddy 无签到活动，跳过（避免每日两次注定失败的请求与日志噪音）
 		if acc.Provider == "workbuddy" && siterouting.ProfileSite(acc.Profile) == "international" {
 			continue
 		}
-		res, err := billing.DailyCheckin(ctx, mgr)
+		state := s.r.billingGuard().State(acc.UID, identity)
+		if state.NeedsLogin || state.Kind != "" && time.Now().Unix() < state.RetryAt {
+			continue
+		}
+		if skip == nil {
+			skip = s.checkedInToday()
+		}
+		if skip[acc.UID] {
+			job.complete = true
+			s.checkinJobs[acc.UID] = job
+			continue
+		}
+		res, err := s.r.checkinAccount(ctx, acc)
 		if err != nil {
+			if maintenancePaused(err) {
+				continue
+			}
 			log.Printf("签到失败 %s: %v", acc.UID, err)
+			job.attempts++
+			job.retryAt = time.Now().Add(2 * time.Hour)
+			s.checkinJobs[acc.UID] = job
 			failed = append(failed, acc.UID)
 			continue
 		}
@@ -139,45 +165,37 @@ func (s *maintenanceState) doCheckin() []string {
 			// 同时追加历史（签到日历数据源），already 也记（幂等）。
 			_ = s.r.db.RecordCheckin(acc.UID, t, "auto")
 		} else {
-			failed = append(failed, acc.UID)
+			// A deterministic business rejection is not a transport retry.
 		}
+		job.complete = true
+		s.checkinJobs[acc.UID] = job
 	}
 	// checkin can change balances (rewards); refresh + auto-thaw afterwards.
-	s.refreshCredits()
 	return failed
 }
 
-// doKeepalive force-refreshes each enabled account's token. A single failure
-// only increments a counter; only sustained failure (session likely dead)
-// disables the account, so a network blip never silently benches an account.
+// Keepalive never changes the administrator's dispatch switch. Authentication
+// failures enter the same maintenance recovery state as billing and check-in.
 func (s *maintenanceState) doKeepalive() {
 	if s.setting("keepalive_enabled", "1") != "1" {
 		return
 	}
 	for _, acc := range s.r.Pool.Accounts() {
-		if !acc.Enabled {
-			continue
-		}
 		mgr := s.r.Manager(acc.UID)
 		if mgr == nil {
 			continue
 		}
-		if mgr.KeepaliveContext(s.context()) {
-			delete(s.keepaliveFails, acc.UID)
+		if s.r.prepareBillingMaintenance(s.context(), acc) != nil {
 			continue
+		}
+		if err := mgr.KeepaliveErrorContext(s.context()); err == nil {
+			continue
+		} else {
+			s.r.observeBilling(acc.UID, mgr, err)
+			log.Printf("token 保活未完成，已按授权状态暂停后续维护")
 		}
 		if s.context().Err() != nil {
 			return
-		}
-		s.keepaliveFails[acc.UID]++
-		if s.keepaliveFails[acc.UID] >= keepaliveFailLimit {
-			reason := "保活连续失败（session 可能失效），请重新扫码登录"
-			log.Printf("token 保活 %s: 连续 %d 次失败，自动禁用", acc.UID, s.keepaliveFails[acc.UID])
-			s.r.Pool.SetEnabled(acc.UID, false, reason)
-			_ = s.r.db.SetAccountState(acc.UID, map[string]any{"enabled": 0, "disabled_reason": reason})
-			s.keepaliveFails[acc.UID] = 0 // reset; wait for user re-login
-		} else {
-			log.Printf("token 保活 %s: 失败 %d/%d（暂不禁用）", acc.UID, s.keepaliveFails[acc.UID], keepaliveFailLimit)
 		}
 	}
 }
@@ -202,40 +220,11 @@ func (r *Runtime) Maintain(ctx context.Context, settings map[string]string, now 
 	s.ctx = ctx
 	t := today()
 	hours := parseHours(s.setting("checkin_hours", "9,21"))
-	// --- daily checkin (catch-up + bounded retry) ---
+	// Per-account state isolates authentication pauses from transient task retries.
+	// Revisit pending credentials on the existing minute tick; completed accounts
+	// do no upstream work, and reauthorization can catch up in the same day.
 	if now.Hour() >= minInt(hours) {
-		if s.checkinCountDate != t { // cross-day reset of failure/retry state
-			s.checkinCountDate = t
-			s.checkinFailCount = 0
-			s.checkinRetryAt = 0
-			s.checkinAttemptedToday = false
-		}
-		if !s.checkinAttemptedToday {
-			// still cooling down from a prior failed attempt?
-			if s.checkinRetryAt == 0 || now.Unix() >= int64(s.checkinRetryAt) {
-				failed := s.doCheckin()
-				s.checkinAttemptedToday = true
-				if len(failed) > 0 {
-					s.checkinFailCount++
-					if s.checkinFailCount >= checkinMaxRetry {
-						log.Printf("签到连续失败 %d 次，放弃当天重试（失败账号 %v）", s.checkinFailCount, failed)
-						s.lastCheckinDate = t
-						s.checkinRetryAt = 0
-					} else {
-						s.checkinRetryAt = float64(now.Unix()) + checkinRetryInterval
-						log.Printf("签到有失败账号，%d 小时后重试（第 %d/%d 次）", int(checkinRetryInterval)/3600, s.checkinFailCount, checkinMaxRetry)
-					}
-				} else {
-					s.lastCheckinDate = t
-					s.checkinFailCount = 0
-					s.checkinRetryAt = 0
-				}
-			}
-		} else if s.checkinRetryAt != 0 && now.Unix() >= int64(s.checkinRetryAt) {
-			// retry time reached: clear the attempted flag so next tick retries
-			s.checkinAttemptedToday = false
-			s.checkinRetryAt = 0
-		}
+		s.doCheckin()
 	}
 
 	// --- daily token keepalive ---

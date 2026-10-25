@@ -2,7 +2,9 @@
 package auth
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -11,6 +13,24 @@ import (
 	"sync"
 	"time"
 )
+
+func (a *Auth) MaintenanceIdentity() string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.maintenanceIdentityLocked()
+}
+func (a *Auth) TryMaintenanceIdentity() (string, bool) {
+	if !a.mu.TryRLock() {
+		return "", false
+	}
+	defer a.mu.RUnlock()
+	return a.maintenanceIdentityLocked(), true
+}
+func (a *Auth) maintenanceIdentityLocked() string {
+	raw, _ := json.Marshal([]string{a.AccessToken, a.RefreshToken, a.Variant, a.UID})
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
+}
 
 type Auth struct {
 	mu sync.RWMutex

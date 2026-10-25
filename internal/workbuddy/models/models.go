@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"work2api/internal/core/provider"
 	"work2api/internal/workbuddy/httpclient"
 	"work2api/internal/workbuddy/pool"
 	"work2api/internal/workbuddy/siterouting"
@@ -68,9 +69,10 @@ func catalogSources(profile string) ([]string, error) {
 
 // Registry is the thread-safe dynamic model catalog.
 type Registry struct {
-	pool   *pool.Pool
-	db     Settings
-	client *http.Client
+	maintenance *provider.MaintenanceGuard
+	pool        *pool.Pool
+	db          Settings
+	client      *http.Client
 
 	refreshMu    sync.Mutex
 	mu           sync.Mutex
@@ -99,6 +101,7 @@ func NewWithCatalogClient(p *pool.Pool, db Settings, client *http.Client) *Regis
 		client = httpclient.New(20 * time.Second)
 	}
 	return &Registry{
+		maintenance:  provider.NewMaintenanceGuard(""),
 		pool:         p,
 		db:           db,
 		client:       client,
@@ -680,7 +683,17 @@ func (r *Registry) fetchOneContext(ctx context.Context, account *pool.Account) [
 		noteCatalogFailure(ctx)
 		return nil
 	}
-	headers, err := cc.CatalogHeaders()
+	if m, ok := account.Mgr.(credentialAuthorization); ok && m.AuthorizationInvalid() {
+		noteCatalogFailure(ctx)
+		return nil
+	}
+	var headers map[string]string
+	var err error
+	if m, ok := account.Mgr.(contextCatalogClient); ok {
+		headers, err = m.CatalogHeadersContext(ctx)
+	} else {
+		headers, err = cc.CatalogHeaders()
+	}
 	if err != nil {
 		noteCatalogFailure(ctx)
 		return nil
@@ -693,10 +706,14 @@ func (r *Registry) fetchOneContext(ctx context.Context, account *pool.Account) [
 	merged := map[string]fetchedModel{}
 	var order []string
 	freshAny := false
+	authorizationUnavailable := false
 	for _, url := range sources {
 		fetched := r.fetchCatalogURL(ctx, url, headers, account)
 		if fetched == nil {
 			noteCatalogFailure(ctx)
+			if r.maintenance != nil && r.maintenance.State(catalogPrefix(account)+"cli:"+url, catalogIdentity(account)).Kind == "authorization_unverified" {
+				authorizationUnavailable = true
+			}
 		}
 		key := [3]string{account.Profile, account.UID, url}
 		r.mu.Lock()
@@ -731,7 +748,7 @@ func (r *Registry) fetchOneContext(ctx context.Context, account *pool.Account) [
 		return nil
 	}
 	if !freshAny { // 全部来源失败不能伪装成一次成功刷新：冷却账号、交给失败退避。
-		if ctx.Err() == nil {
+		if ctx.Err() == nil && !authorizationUnavailable {
 			r.pool.OnFailure(account.UID, 60)
 		}
 		return nil
@@ -759,7 +776,7 @@ func (r *Registry) fetchOneContext(ctx context.Context, account *pool.Account) [
 // fetchCatalogURL 拉取单路目录并共享 CLI 白名单/禁用标志/元数据解析。
 // 失败返回 nil（HTTP 错误、业务错误码、畸形响应、无 cli 白名单均算失败）。
 func (r *Registry) fetchCatalogURL(ctx context.Context, url string, headers map[string]string, account *pool.Account) []fetchedModel {
-	d := r.fetchCatalogDocument(ctx, url, headers)
+	d := r.fetchMaintainedCatalog(ctx, url, headers, account, "cli")
 	if d == nil {
 		return nil
 	}
@@ -811,44 +828,60 @@ func (r *Registry) fetchCatalogURL(ctx context.Context, url string, headers map[
 }
 
 func (r *Registry) fetchCatalogDocument(ctx context.Context, url string, headers map[string]string) map[string]any {
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	data, _ := r.fetchCatalogDocumentResult(ctx, url, headers)
+	return data
+}
+
+func (r *Registry) fetchCatalogDocumentResult(ctx context.Context, url string, headers map[string]string) (map[string]any, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
 	resp, err := r.client.Do(req)
-	if err != nil || resp == nil {
-		return nil
+	if err != nil {
+		return nil, err
+	}
+	if resp == nil {
+		return nil, errors.New("模型目录无响应")
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		log.Printf("models api status %d", resp.StatusCode)
-		return nil
+		return nil, &catalogResponseError{status: resp.StatusCode}
 	}
 	var data map[string]any
 	if json.NewDecoder(io.LimitReader(resp.Body, 2<<20)).Decode(&data) != nil {
-		return nil
+		return nil, errors.New("模型目录响应无效")
 	}
 	// 业务错误码（上游按 code 字段报错时 HTTP 仍是 200）：不信任其中的模型清单。
 	if code, hasCode := data["code"]; hasCode {
 		switch c := code.(type) {
 		case float64:
+			if c == 12153 {
+				return nil, &catalogResponseError{status: resp.StatusCode, code: 12153}
+			}
 			if c != 0 {
-				return nil
+				return nil, errors.New("模型目录响应无效")
 			}
 		case string:
+			if c == "12153" {
+				return nil, &catalogResponseError{status: resp.StatusCode, code: 12153}
+			}
 			if c != "0" {
-				return nil
+				return nil, errors.New("模型目录响应无效")
 			}
 		case nil:
 		default:
-			return nil
+			return nil, errors.New("模型目录响应无效")
 		}
 	}
 	d, _ := data["data"].(map[string]any)
 	if d == nil {
-		return nil
+		return nil, errors.New("模型目录响应无效")
 	}
-	return d
+	return d, nil
 }
 
 func entry(mid, name string, ctx, maxtok int) map[string]any {

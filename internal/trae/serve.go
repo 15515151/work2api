@@ -205,7 +205,7 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 		var identityModel string
 		var identity *auth.Auth
 		if a != nil {
-			identity, identityModel = a.modelIdentityFor(model, image)
+			identity, identityModel = a.modelIdentityFor(model, image, r.identityAvailableLocked)
 		}
 		r.mu.Unlock()
 		if a == nil || identity == nil {

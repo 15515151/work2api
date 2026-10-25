@@ -59,7 +59,9 @@ func (o *Runtime) PenalizeAccount(acc *pool.Account, model string, ue *upstream.
 	act := ActionFor(kind, ue.Raw, ue.Header, now)
 	switch {
 	case act.Disable:
-		o.Pool.SetEnabled(acc.UID, false, act.Reason)
+		if !o.authorizationInvalid(acc.UID) {
+			o.Pool.SetEnabled(acc.UID, false, act.Reason)
+		}
 	case act.ModelScoped && act.Cooldown > 0:
 		until := now + act.Cooldown
 		o.CooldownMu.Lock()
@@ -151,13 +153,18 @@ func (o *Runtime) PickAccountExcludingIn(model, sessionKey string, tried map[str
 	}
 	ready := map[string]bool{}
 	now := nowSec()
+	candidates := 0
 	for uid := range allowed {
-		if tried[uid] {
+		if tried[uid] || o.authorizationInvalid(uid) {
 			continue
 		}
+		candidates++
 		if o.ModelCooldownUntil(uid, model) <= now {
 			ready[uid] = true
 		}
+	}
+	if len(allowed) > 0 && candidates == 0 {
+		return nil, ErrPoolExhausted(model, tried)
 	}
 	if len(allowed) > 0 && len(ready) == 0 {
 		if len(tried) > 0 {
@@ -210,7 +217,7 @@ func (o *Runtime) PickInScope(model, sessionKey string, tried map[string]bool, s
 		if tried[uid] || !scope[uid] {
 			continue
 		}
-		if account := o.Pool.Get(uid); account == nil || !account.Enabled {
+		if account := o.Pool.Get(uid); account == nil || !account.Enabled || o.authorizationInvalid(uid) {
 			continue
 		}
 		scopedCandidates++
@@ -755,17 +762,17 @@ func (o *Runtime) ModelFree(a *pool.Account, model string) bool {
 }
 
 func (o *Runtime) ModelCallable(a *pool.Account, model string) bool {
-	return a != nil && a.CallableFor(o.ModelFree(a, model))
+	return a != nil && !o.authorizationInvalid(a.UID) && a.CallableFor(o.ModelFree(a, model))
 }
 
 func (o *Runtime) ModelHealthy(a *pool.Account, model string, now float64) bool {
-	return a != nil && a.HealthyFor(now, o.ModelFree(a, model))
+	return a != nil && !o.authorizationInvalid(a.UID) && a.HealthyFor(now, o.ModelFree(a, model))
 }
 
 // AccountHealthy reports whether at least one model can use this account.
 // Per-model rows must use ModelHealthy instead of this aggregate status.
 func (o *Runtime) AccountHealthy(a *pool.Account, now float64) bool {
-	if a == nil || !a.Enabled || a.CooldownUntil > now {
+	if a == nil || !a.Enabled || o.authorizationInvalid(a.UID) || a.CooldownUntil > now {
 		return false
 	}
 	if a.Callable() {
@@ -784,10 +791,23 @@ func (o *Runtime) AccountHealthy(a *pool.Account, now float64) bool {
 
 func (o *Runtime) pickModel(model string, ready map[string]bool, costs map[string]float64, window float64) *pool.Account {
 	free := map[string]bool{}
+	// Filter a private copy: caller scopes and session preferences remain intact.
+	eligible := map[string]bool{}
+	for uid, ok := range ready {
+		if ok && !o.authorizationInvalid(uid) {
+			eligible[uid] = true
+		}
+	}
+	ready = eligible
 	for _, a := range o.Pool.Accounts() {
 		if ready[a.UID] && o.ModelFree(a, model) {
 			free[a.UID] = true
 		}
 	}
 	return o.Pool.PickFor(ready, costs, window, free)
+}
+
+func (o *Runtime) authorizationInvalid(uid string) bool {
+	mgr := o.Manager(uid)
+	return mgr != nil && mgr.AuthorizationInvalid()
 }

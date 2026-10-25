@@ -6,6 +6,7 @@ import (
 	"time"
 	"work2api/internal/statebackup"
 	"work2api/internal/trae/auth"
+	"work2api/internal/trae/upstream"
 )
 
 type credentialFlight struct {
@@ -16,6 +17,18 @@ type credentialFlight struct {
 
 var errRefreshInterrupted = errors.New("credential refresh leader canceled")
 var errRefreshPublished = errors.New("credential refreshed before leader canceled")
+var errMaintenanceExpired = errors.New("Trae 登录已过期，请网页登录以取得刷新凭据")
+
+type credentialRefreshError struct{ cause error }
+
+func (e *credentialRefreshError) Error() string {
+	return "Trae 凭据刷新失败，请稍后重试或重新授权"
+}
+func (e *credentialRefreshError) Unwrap() error { return e.cause }
+func (e *credentialRefreshError) requiresLogin() bool {
+	var remote *upstream.Error
+	return errors.Is(e.cause, errMaintenanceExpired) || errors.As(e.cause, &remote) && remote.Status == 401
+}
 
 func (r *Runtime) refreshCredentials(ctx context.Context, a *auth.Auth, force bool) error {
 	for {
@@ -87,7 +100,7 @@ func (r *Runtime) refreshCredentialsOnce(ctx context.Context, a *auth.Auth, forc
 	a.RUnlock()
 	if !refreshable {
 		if expired {
-			return errors.New("Trae 登录已过期，请网页登录以取得刷新凭据")
+			return &credentialRefreshError{cause: errMaintenanceExpired}
 		}
 		return ctx.Err()
 	}
@@ -148,7 +161,7 @@ func (r *Runtime) refreshCredentialsOnce(ctx context.Context, a *auth.Auth, forc
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		return errors.New("Trae 凭据刷新失败，请重新授权")
+		return &credentialRefreshError{cause: err}
 	}
 	r.writeMu.Lock()
 	defer r.writeMu.Unlock()

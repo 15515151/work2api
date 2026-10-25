@@ -968,3 +968,214 @@ func TestTraeNullAssistantNormalizationStaysAtBoundary(t *testing.T) {
 		t.Fatal("tool history/input changed", string(wire))
 	}
 }
+
+func TestCatalogPricingAndOfferParsing(t *testing.T) {
+	contact := map[string]any{"consumption_rate": map[string]any{"enable": true, "data": map[string]any{"rate": 0.06}}, "activity_discount": map[string]any{"enable": true, "data": map[string]any{"current": map[string]any{"discount_type": "off_peak", "before_consumption_rate": 0.12, "consumption_rate": 0.06}, "off_peak": map[string]any{"time_zone": "Asia/Shanghai", "time_windows": []any{map[string]any{"weekdays": []int{6, 7}, "start_minute": 0, "end_minute": 1440}, map[string]any{"weekdays": []int{8}, "start_minute": -1, "end_minute": 0}}}}}}
+	current := map[string]any{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { json.NewEncoder(w).Encode(current) }))
+	defer server.Close()
+	client := upstream.New()
+	client.AgentHost = server.URL
+	defer client.HTTP.CloseIdleConnections()
+	for _, encoded := range []bool{false, true} {
+		var value any = contact
+		display := any(map[string]any{"display_name": "Pricing", "builder": map[string]any{}})
+		if encoded {
+			b, _ := json.Marshal(contact)
+			value = string(b)
+			b, _ = json.Marshal(display)
+			display = string(b)
+		}
+		current = map[string]any{"config_info_list": []any{map[string]any{"config_name": "pricing", "display_config": display, "display_contact_config": value}, map[string]any{"config_name": "hidden", "display_config": map[string]any{"display_name": "Hidden", "is_invisible_to_user": true}}, map[string]any{"config_name": "custom", "display_config": map[string]any{"display_name": "Custom", "is_custom_model": true}}, map[string]any{"config_name": "builder", "display_config": map[string]any{"display_name": "Builder", "builder": map[string]any{"id": "fixture"}}}, map[string]any{"config_name": "unknown", "display_config": map[string]any{"display_name": "Unknown"}}}}
+		models, err := client.FetchModels(&auth.Auth{Variant: "cn"})
+		if err != nil || len(models) != 2 {
+			t.Fatalf("filtered models=%d err=%v", len(models), err)
+		}
+		q := models[0].Pricing[0]
+		if q.Rate == nil || *q.Rate != 0.06 || q.Product != "cn" || len(q.Promotions) != 1 {
+			t.Fatal("lost rate or applied discount twice", q)
+		}
+		p := q.Promotions[0]
+		if p.Label != "错峰优惠" || p.Timezone != "Asia/Shanghai" || len(p.Weekly) != 1 || p.Weekly[0].End != "24:00" || len(p.Weekly[0].Weekdays) != 2 {
+			t.Fatal("invalid weekly offer", p)
+		}
+		if models[1].Pricing[0].Rate != nil {
+			t.Fatal("unknown rate became zero")
+		}
+	}
+	for _, rate := range []any{-1, nil, "unknown", true} {
+		contact["consumption_rate"] = map[string]any{"enable": true, "data": map[string]any{"rate": rate}}
+		current = map[string]any{"config_info_list": []any{map[string]any{"config_name": "m", "display_config": map[string]any{"display_name": "M"}, "display_contact_config": contact}}}
+		models, err := client.FetchModels(&auth.Auth{Variant: "solo"})
+		if err != nil || len(models) != 1 || models[0].Pricing[0].Rate != nil {
+			t.Fatal("invalid optional pricing affected model or became a price")
+		}
+	}
+}
+
+func TestPricingScopesProductsAndStaleSnapshots(t *testing.T) {
+	rateA, rateB := 0.06, 1.5
+	offer := upstream.ModelPromotion{Label: "错峰优惠", Region: "cn", Timezone: "Asia/Shanghai"}
+	q := upstream.ModelPrice{Product: "cn", Rate: &rateA, Promotions: []upstream.ModelPromotion{offer}}
+	model := upstream.ModelInfo{ID: "m", Name: "M", Pricing: []upstream.ModelPrice{q}}
+	r := &Runtime{accounts: map[string]*accountState{
+		"allowed": {Auth: &auth.Auth{Variant: "cn"}, Enabled: true, Models: []upstream.ModelInfo{model}, CatalogTimes: map[string]time.Time{"cn": time.Now()}},
+		"private": {Auth: &auth.Auth{Variant: "solo"}, Enabled: true, Models: []upstream.ModelInfo{{ID: "m", Pricing: []upstream.ModelPrice{{Product: "solo", Rate: &rateB}}}}, CatalogTimes: map[string]time.Time{"solo": time.Now()}},
+	}}
+	scoped := r.ModelMetadataForAccounts("trae/m", map[string]bool{"allowed": true})
+	values := scoped["price_factors"].([]upstream.ModelPrice)
+	if len(values) != 1 || *values[0].Rate != 0.06 {
+		t.Fatal("private price leaked into scoped catalog")
+	}
+	empty := r.ModelMetadataForAccounts("trae/m", nil)
+	if len(empty["price_factors"].([]upstream.ModelPrice)) != 0 {
+		t.Fatal("missing scope disclosed pricing")
+	}
+	merged := mergeModelInfo(model, r.accounts["private"].Models[0])
+	if len(merged.Pricing) != 2 || len(model.Pricing) != 1 {
+		t.Fatal("merge lost product price or mutated source")
+	}
+	raw, err := json.Marshal(catalogSnapshot{Version: 1, Models: []upstream.ModelInfo{merged}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var restored catalogSnapshot
+	if json.Unmarshal(raw, &restored) != nil || len(restored.Models[0].Pricing) != 2 {
+		t.Fatal("snapshot lost per-product pricing")
+	}
+	partial := pricingMetadata([]upstream.ModelPrice{q, {Product: "cn"}})
+	if !partial["promotions"].([]upstream.ModelPromotion)[0].Partial {
+		t.Fatal("partial offer advertised for every account")
+	}
+	r.accounts["allowed"].CatalogErrors = map[string]bool{"cn": true}
+	stale := r.ModelMetadataForAccounts("trae/m", map[string]bool{"allowed": true})
+	if stale["pricing_stale"] != true || len(stale["promotions"].([]upstream.ModelPromotion)) != 0 || model.Pricing[0].Stale {
+		t.Fatal("stale offer shown or source mutated")
+	}
+}
+
+func TestLiveTraePricing(t *testing.T) {
+	if os.Getenv("WORK2API_LIVE_TRAE_PRICING") != "1" {
+		t.Skip("explicit read-only catalog pricing verification")
+	}
+	accounts, err := auth.LoadDir(filepath.Join("..", "..", "data", "trae"))
+	if err != nil {
+		t.Fatal("cannot load local credentials")
+	}
+	client := upstream.New()
+	client.HTTP.Timeout = 30 * time.Second
+	defer client.HTTP.CloseIdleConnections()
+	seen := map[string]bool{}
+	for _, a := range accounts {
+		if seen[a.Variant] {
+			continue
+		}
+		models, err := client.FetchModels(a)
+		if err != nil {
+			t.Logf("product=%s catalog unavailable", a.Variant)
+			continue
+		}
+		known, offers := 0, 0
+		for _, m := range models {
+			for _, q := range m.Pricing {
+				if q.Rate != nil {
+					known++
+				}
+				offers += len(q.Promotions)
+				if m.ID == "deepseek-v4.1-flash" || m.ID == "kimi-k3" || m.ID == "qwen3.8-max" {
+					if q.Rate == nil {
+						t.Fatalf("product=%s public model=%s missing rate", a.Variant, m.ID)
+					}
+					t.Logf("product=%s model=%s rate=%g promotions=%d", a.Variant, m.ID, *q.Rate, len(q.Promotions))
+					for _, p := range q.Promotions {
+						t.Logf("product=%s label=%s timezone=%s weekly_windows=%d", a.Variant, p.Label, p.Timezone, len(p.Weekly))
+					}
+				}
+			}
+		}
+		if known == 0 {
+			t.Fatal("no upstream rates decoded")
+		}
+		seen[a.Variant] = true
+		t.Logf("product=%s visible_models=%d known_rates=%d offers=%d", a.Variant, len(models), known, offers)
+	}
+	if !seen["cn"] || !seen["solo"] {
+		t.Fatal("IDE and Work/SOLO were not both verified")
+	}
+}
+
+func TestMaintenanceAuthFailureStopsCheckinForDisabledAccount(t *testing.T) {
+	var calls atomic.Int32
+	r := fixtureRuntime(t, func(w http.ResponseWriter, req *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(401)
+		io.WriteString(w, `{"message":"expired"}`)
+	})
+	a := &auth.Auth{UID: "maintenance", Variant: "cn", AccessToken: "fixture", RefreshToken: "refresh", ExpiresAt: time.Now().Add(-time.Hour).Unix(), FilePath: filepath.Join(r.dir, "maintenance.json")}
+	state := &accountState{Auth: a, Enabled: false, Identities: map[string]*auth.Auth{"cn": a}}
+	r.accounts[accountID(a.UID)] = state
+	for i := 0; i < 3; i++ {
+		if _, err := r.AdminCheckin(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		_ = r.refreshQuota(context.Background(), accountID(a.UID), true)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("failed auth still triggered downstream maintenance: %d", calls.Load())
+	}
+	if state.Enabled {
+		t.Fatal("maintenance changed administrator dispatch switch")
+	}
+}
+
+func TestDisabledTraeAccountStillChecksStatus(t *testing.T) {
+	var calls atomic.Int32
+	r := fixtureRuntime(t, func(w http.ResponseWriter, req *http.Request) {
+		calls.Add(1)
+		io.WriteString(w, `{"code":0,"data":{"enable":false}}`)
+	})
+	a := &auth.Auth{UID: "disabled-maintenance", Variant: "cn", AccessToken: "fixture", RefreshToken: "refresh", ExpiresAt: time.Now().Add(time.Hour).Unix()}
+	state := &accountState{Auth: a, Enabled: false, Identities: map[string]*auth.Auth{"cn": a}}
+	r.accounts[accountID(a.UID)] = state
+	if _, err := r.AdminCheckin(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("disabled account skipped maintenance or repeated auth: %d", calls.Load())
+	}
+	if state.Enabled {
+		t.Fatal("maintenance reenabled account")
+	}
+}
+
+func TestConfirmedTraeExpiryExcludesOnlyFailedProduct(t *testing.T) {
+	r := fixtureRuntime(t, nil)
+	cn := &auth.Auth{UID: "same-user", Variant: "cn", AccessToken: "cn"}
+	solo := &auth.Auth{UID: "same-user", Variant: "solo", AccessToken: "solo"}
+	a := &accountState{Auth: cn, Enabled: true, Identities: map[string]*auth.Auth{"cn": cn, "solo": solo}, Catalogs: map[string][]upstream.ModelInfo{"cn": {{ID: "m"}}, "solo": {{ID: "m"}}}}
+	id := accountID(cn.UID)
+	r.accounts[id] = a
+	g := r.authGuard()
+	fp := cn.MaintenanceIdentity()
+	g.State(id+":cn:auth", fp)
+	g.Observe(id+":cn:auth", fp, "authorization_expired", true)
+	r.mu.Lock()
+	picked, _ := a.modelIdentityFor("m", false, r.identityAvailableLocked)
+	r.mu.Unlock()
+	if picked != solo {
+		t.Fatal("failed primary identity blocked or displaced valid alternate")
+	}
+	fp = solo.MaintenanceIdentity()
+	g.State(id+":solo:auth", fp)
+	g.Observe(id+":solo:auth", fp, "authorization_expired", true)
+	req := provider.ServeRequest{}
+	if _, err := r.selectAccountFor(req, "m", "sticky", nil, nil, false); err == nil {
+		t.Fatal("all-invalid account was still selected")
+	}
+	if err := r.ensure(context.Background(), cn); !errors.Is(err, provider.ErrMaintenanceLogin) {
+		t.Fatal("known-invalid inference attempted refresh", err)
+	}
+	if !a.Enabled {
+		t.Fatal("auth failure changed manual enablement")
+	}
+}

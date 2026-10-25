@@ -317,11 +317,12 @@ type ModelInfo struct {
 	Name                   string
 	ContextWindow          int64 // = context_window_tokens.dev（目录未给则 0）
 	MaxTokens              int64
-	Multimodal             *bool     `json:"multimodal,omitempty"`
-	Capability             string    `json:"capability,omitempty"`
-	ThinkingControl        *bool     `json:"thinking_control,omitempty"`
-	ToolResponseMultimodal *bool     `json:"tool_response_multimodal,omitempty"`
-	EntitlementCosts       []float64 `json:"entitlement_usage_cost,omitempty"`
+	Multimodal             *bool        `json:"multimodal,omitempty"`
+	Capability             string       `json:"capability,omitempty"`
+	ThinkingControl        *bool        `json:"thinking_control,omitempty"`
+	ToolResponseMultimodal *bool        `json:"tool_response_multimodal,omitempty"`
+	EntitlementCosts       []float64    `json:"entitlement_usage_cost,omitempty"`
+	Pricing                []ModelPrice `json:"pricing,omitempty"`
 }
 
 var soloAgentOnlyDeadNames = map[string]struct{}{
@@ -363,12 +364,8 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 			ContextWindowTokens struct {
 				Dev int64 `json:"dev"`
 			} `json:"context_window_tokens"`
-			DisplayConfig struct {
-				DisplayName            string `json:"display_name"`
-				Multimodal             *bool  `json:"multimodal"`
-				Capability             string `json:"model_capability"`
-				ToolResponseMultimodal *bool  `json:"tool_response_multimodal"`
-			} `json:"display_config"`
+			DisplayConfig         modelDisplay    `json:"display_config"`
+			Contact               json.RawMessage `json:"display_contact_config"`
 			ReasoningEffortConfig struct {
 				SupportThinking *bool `json:"support_thinking"`
 			} `json:"reasoning_effort_config"`
@@ -398,6 +395,9 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 		if cfg.DisplayConfig.DisplayName == "" {
 			continue // 租户自定义占位模板
 		}
+		if cfg.DisplayConfig.Invisible || cfg.DisplayConfig.Custom || builderPresent(cfg.DisplayConfig.Builder) {
+			continue
+		}
 		if configIsSoloAgentOnly(cfg.ConfigName) {
 			continue
 		}
@@ -422,6 +422,7 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 			ThinkingControl:        cfg.ReasoningEffortConfig.SupportThinking,
 			ToolResponseMultimodal: cfg.DisplayConfig.ToolResponseMultimodal,
 			EntitlementCosts:       costs,
+			Pricing:                []ModelPrice{parseModelPrice(cfg.Contact, a.Variant)},
 		})
 	}
 	return out, nil

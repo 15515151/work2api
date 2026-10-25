@@ -15,6 +15,7 @@ import (
 	"sort"
 	"sync"
 	"time"
+	"work2api/internal/core/provider"
 	"work2api/internal/statebackup"
 
 	"work2api/internal/workbuddy/httpclient"
@@ -77,13 +78,15 @@ type Session struct {
 
 // Manager manages one account's credentials: read, expiry, refresh, write-back.
 type Manager struct {
-	path    string
-	client  *http.Client
-	mu      sync.Mutex
-	cached  *Session
-	mtime   time.Time
-	retired bool
-	flight  *refreshTask
+	authGuard *provider.MaintenanceGuard
+	authKey   string
+	path      string
+	client    *http.Client
+	mu        sync.Mutex
+	cached    *Session
+	mtime     time.Time
+	retired   bool
+	flight    *refreshTask
 }
 
 type refreshTask struct {
@@ -376,10 +379,17 @@ func (m *Manager) ensureFresh(ctx context.Context, force bool) error {
 		m.mu.Unlock()
 		return errors.New("账号已移除")
 	}
-	if s, err := m.session(); err != nil {
+	s, sessionErr := m.session()
+	if sessionErr != nil {
 		m.mu.Unlock()
-		return err
+		return sessionErr
 	} else if encryptedToken(s.Auth) {
+		m.mu.Unlock()
+		return ErrLoginRequired
+	}
+	identity := maintenanceIdentity(s)
+	guard, key := m.authGuard, m.authKey
+	if guard != nil && guard.State(key, identity).NeedsLogin {
 		m.mu.Unlock()
 		return ErrLoginRequired
 	}
@@ -398,6 +408,11 @@ func (m *Manager) ensureFresh(ctx context.Context, force bool) error {
 			defer cancel()
 			err := m.refreshContext(sharedCtx)
 			m.mu.Lock()
+			if guard != nil && errors.Is(err, ErrLoginRequired) {
+				if current, e := m.session(); e == nil && maintenanceIdentity(current) == identity {
+					guard.Observe(key, identity, "authorization_expired", true)
+				}
+			}
 			task.err = err
 			m.flight = nil
 			close(task.done)
@@ -461,6 +476,12 @@ func (m *Manager) headersContext(ctx context.Context, chat bool) (map[string]str
 
 // CatalogHeaders returns model-catalog request headers.
 func (m *Manager) CatalogHeaders() (map[string]string, error) {
+	return m.CatalogHeadersContext(context.Background())
+}
+func (m *Manager) CatalogHeadersContext(ctx context.Context) (map[string]string, error) {
+	if err := m.ensureFresh(ctx, false); err != nil {
+		return nil, err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	s, err := m.session()
@@ -477,6 +498,19 @@ func (m *Manager) Keepalive() bool {
 
 func (m *Manager) KeepaliveContext(ctx context.Context) bool {
 	return m.ensureFresh(ctx, true) == nil
+}
+func (m *Manager) KeepaliveErrorContext(ctx context.Context) error { return m.ensureFresh(ctx, true) }
+
+// Fingerprint only the actual authorization material; timestamps/alias edits
+// must not restart failed maintenance. Never expose this value to clients.
+func (m *Manager) MaintenanceIdentity() (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, err := m.session()
+	if err != nil {
+		return "", err
+	}
+	return maintenanceIdentity(s), nil
 }
 
 // RawSession returns the full auth file content.

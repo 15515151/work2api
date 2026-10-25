@@ -32,12 +32,21 @@ func (r *Runtime) Maintain(ctx context.Context, settings map[string]string, now 
 			r.autoAttempts++
 			result, err := r.AdminCheckin(ctx)
 			complete := err == nil
+			waiting, failed := false, err != nil
 			if rows, ok := result["results"].([]map[string]any); ok {
 				for _, row := range rows {
-					if row["status"] == "error" || row["status"] == "no_campaign" {
+					if row["status"] == "error" {
 						complete = false
+						failed = true
+					}
+					if row["status"] == "paused" || row["status"] == "reauthorize" {
+						complete = false
+						waiting = true
 					}
 				}
+			}
+			if waiting && !failed {
+				r.autoAttempts--
 			}
 			if complete {
 				r.autoAttempts = 3

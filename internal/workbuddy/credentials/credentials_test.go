@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"work2api/internal/core/provider"
 	"work2api/internal/statebackup"
 )
 
@@ -188,5 +189,42 @@ func TestRefreshRejectsMissingTokenWithoutChangingFile(t *testing.T) {
 	after, _ := os.ReadFile(path)
 	if string(after) != string(before) {
 		t.Fatal("invalid response changed credential")
+	}
+}
+
+func TestConfirmedAuthExpiryStopsAllCredentialConsumers(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "auth.info")
+	writeTestCredential(t, path, "old")
+	m := NewManager(path)
+	g := provider.NewMaintenanceGuard(filepath.Join(t.TempDir(), "maintenance.json"))
+	m.BindMaintenance(g, "account")
+	var calls atomic.Int32
+	m.client = &http.Client{Transport: refreshTransport(func(req *http.Request) (*http.Response, error) {
+		if calls.Add(1) == 1 {
+			return &http.Response{StatusCode: 401, Body: io.NopCloser(strings.NewReader(`{}`)), Header: make(http.Header)}, nil
+		}
+		return refreshResponse(req, `{"code":0,"data":{"accessToken":"valid","expiresIn":3600}}`), nil
+	})}
+	if _, err := m.GetChatHeadersContext(context.Background()); !errors.Is(err, ErrLoginRequired) {
+		t.Fatal(err)
+	}
+	if !m.AuthorizationInvalid() {
+		t.Fatal("refresh 401 did not invalidate credential")
+	}
+	if _, err := m.CatalogHeadersContext(context.Background()); !errors.Is(err, ErrLoginRequired) {
+		t.Fatal(err)
+	}
+	if err := m.KeepaliveErrorContext(context.Background()); !errors.Is(err, ErrLoginRequired) {
+		t.Fatal(err)
+	}
+	if calls.Load() != 1 {
+		t.Fatal("known invalid credential was retried", calls.Load())
+	}
+	writeTestCredential(t, path, "new-credential")
+	if _, err := m.GetChatHeadersContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if m.AuthorizationInvalid() || calls.Load() != 2 {
+		t.Fatal("new credential could not recover")
 	}
 }

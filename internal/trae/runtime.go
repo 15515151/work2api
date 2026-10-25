@@ -48,6 +48,7 @@ type accountState struct {
 }
 
 type Runtime struct {
+	maintenanceGuard  *provider.MaintenanceGuard
 	mu                sync.Mutex
 	writeMu           sync.Mutex
 	credentialFlights map[*auth.Auth]*credentialFlight
@@ -86,7 +87,7 @@ func (a *accountState) mergeModels() {
 func (a *accountState) modelIdentity(model string) (*auth.Auth, string) {
 	return a.modelIdentityFor(model, false)
 }
-func (a *accountState) modelIdentityFor(model string, image bool) (*auth.Auth, string) {
+func (a *accountState) modelIdentityFor(model string, image bool, available ...func(*auth.Auth) bool) (*auth.Auth, string) {
 	products := []string{a.Auth.Variant}
 	for _, p := range []string{"cn", "solo"} {
 		if p != a.Auth.Variant {
@@ -96,6 +97,10 @@ func (a *accountState) modelIdentityFor(model string, image bool) (*auth.Auth, s
 	var fallback *auth.Auth
 	var fallbackModel string
 	for _, product := range products {
+		identity := a.Identities[product]
+		if identity == nil || len(available) > 0 && !available[0](identity) {
+			continue
+		}
 		for _, m := range a.Catalogs[product] {
 			if strings.EqualFold(m.ID, model) {
 				if !image {
@@ -249,7 +254,21 @@ func (r *Runtime) client(ctx context.Context) *upstream.Client {
 	return c
 }
 func (r *Runtime) ensure(ctx context.Context, a *auth.Auth) error {
-	return r.refreshCredentials(ctx, a, false)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	before, captured := a.TryMaintenanceIdentity()
+	r.mu.Lock()
+	available := r.identityAvailableLocked(a)
+	r.mu.Unlock()
+	if !available {
+		return provider.ErrMaintenanceLogin
+	}
+	err := r.refreshCredentials(ctx, a, false)
+	if err != nil && captured {
+		r.observeMaintenance(a, "auth", before, err)
+	}
+	return err
 }
 
 func (r *Runtime) Models(context.Context) []provider.CatalogModel {
@@ -265,6 +284,7 @@ func (r *Runtime) modelsLocked() []provider.CatalogModel {
 			continue
 		}
 		for _, m := range a.Models {
+			m = displayPricing(a, m)
 			name := "trae/" + strings.ToLower(m.ID)
 			entry := merged[name]
 			if entry.ID == "" {
@@ -305,19 +325,31 @@ func (r *Runtime) RefreshAccount(ctx context.Context, id string) error {
 	r.mu.Unlock()
 	var failures []error
 	for product, identity := range identities {
-		if err := r.ensure(ctx, identity); err != nil {
+		if err := r.ensureMaintenance(ctx, identity); err != nil {
 			r.markCatalogFailure(id, product, a)
 			failures = append(failures, err)
 			continue
 		}
-		models, err := r.client(ctx).FetchModels(identity)
+		fetch := func(ctx context.Context) error {
+			fingerprint := identity.MaintenanceIdentity()
+			models, err := r.client(ctx).FetchModels(identity)
+			r.observeMaintenance(identity, "catalog", fingerprint, err)
+			if err != nil {
+				return err
+			}
+			if identity.MaintenanceIdentity() != fingerprint {
+				return provider.ErrMaintenancePaused
+			}
+			return r.commitCatalog(id, product, identity, models)
+		}
+		ran, err := r.authGuard().Recover(ctx, id+":"+product+":catalog", identity.MaintenanceIdentity(), fetch)
+		if err == nil && !ran {
+			err = fetch(ctx)
+		}
 		if err != nil {
 			r.markCatalogFailure(id, product, a)
 			failures = append(failures, errors.New("Trae 模型目录刷新失败；保留上次成功目录"))
 			continue
-		}
-		if err := r.commitCatalog(id, product, identity, models); err != nil {
-			failures = append(failures, err)
 		}
 	}
 	r.mu.Lock()
@@ -327,10 +359,8 @@ func (r *Runtime) RefreshAccount(ctx context.Context, id string) error {
 func (r *Runtime) RefreshModels(ctx context.Context) error {
 	r.mu.Lock()
 	ids := []string{}
-	for id, a := range r.accounts {
-		if a.Enabled {
-			ids = append(ids, id)
-		}
+	for id := range r.accounts {
+		ids = append(ids, id)
 	}
 	r.mu.Unlock()
 	var errs []error
@@ -556,6 +586,7 @@ func (r *Runtime) DeleteAccount(id string) error {
 }
 
 func (r *Runtime) AdminData(context.Context) provider.AdminData {
+	guard := r.authGuard()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	data := provider.AdminData{DisplayName: "Trae", Capabilities: []string{"accounts", "models", "credits", "checkin", "add_account", "oauth", "local_import"}, Accounts: []map[string]any{}, Resources: []provider.ResourceSummary{}, Notes: "添加国内 IDE 或 Work/SOLO 账号；产品身份保留，模型调用自动选择符合条件的账号。"}
@@ -567,6 +598,34 @@ func (r *Runtime) AdminData(context.Context) provider.AdminData {
 		}
 		healthy := a.Enabled && !time.Now().Before(a.Cooldown)
 		row := map[string]any{"id": id, "uid": id, "provider": "trae", "label": label, "nickname": a.Auth.Nickname, "alias": a.Alias, "source": "import", "product": a.Auth.Variant, "site": "domestic", "enabled": a.Enabled, "healthy": healthy, "priority": a.Priority, "credits_remaining": a.Remaining, "credits_total": a.Total, "credits_expire_at": a.Expiry, "quota_stale": time.Since(a.QuotaAt) > 30*time.Minute, "quota_refresh_failed": a.QuotaFailed, "last_checkin_date": a.CheckinDate, "quota_unit": "credits", "credit_packages": a.CreditPackages, "catalog_stale": catalogStale(a)}
+		pending := []map[string]any{}
+		for _, product := range []string{"cn", "solo", "intl"} {
+			identity := a.Identities[product]
+			if identity == nil {
+				continue
+			}
+			for _, scope := range []string{"auth", "catalog", "quota", "checkin"} {
+				state := guard.State(id+":"+product+":"+scope, identity.MaintenanceIdentity())
+				if state.Kind != "" {
+					pending = append(pending, state.Public(product+" · "+map[string]string{"auth": "授权", "catalog": "模型目录", "quota": "额度", "checkin": "签到"}[scope]))
+				}
+			}
+		}
+		if len(pending) > 0 {
+			row["maintenance"] = pending
+		}
+		active, invalid := 0, 0
+		for _, identity := range a.Identities {
+			active++
+			if !r.identityAvailableLocked(identity) {
+				invalid++
+			}
+		}
+		if invalid > 0 {
+			row["auth_invalid"] = invalid == active
+			row["auth_partial"] = invalid < active
+			row["healthy"] = healthy && invalid < active
+		}
 		row["failure_count"] = a.Failures
 		if time.Now().Before(a.Cooldown) {
 			row["cooldown_until"] = float64(a.Cooldown.UnixMilli()) / 1000
@@ -686,7 +745,7 @@ func (r *Runtime) selectAccountFor(req provider.ServeRequest, model, session str
 		} else if excluded[id] {
 			continue
 		}
-		if identity, _ := a.modelIdentityFor(model, image); identity == nil {
+		if identity, _ := a.modelIdentityFor(model, image, r.identityAvailableLocked); identity == nil {
 			continue
 		}
 		if a.Remaining != nil && *a.Remaining == 0 {

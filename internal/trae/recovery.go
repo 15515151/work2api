@@ -71,5 +71,10 @@ func (r *Runtime) forceRefresh(ctx context.Context, id string, identity *auth.Au
 	if accountID(identity.UID) != id {
 		return errors.New("Trae 账号授权已变更")
 	}
-	return r.refreshCredentials(ctx, identity, true)
+	before, captured := identity.TryMaintenanceIdentity()
+	err := r.refreshCredentials(ctx, identity, true)
+	if err != nil && captured {
+		r.observeMaintenance(identity, "auth", before, err)
+	}
+	return err
 }

@@ -34,7 +34,8 @@ func TestDailyCheckinBoundaries(t *testing.T) {
 			}))
 			defer srv.Close()
 			res, err := DailyCheckin(context.Background(), checkinCredential{srv.URL})
-			if err != nil || res.OK != tc.ok || res.Already != tc.already || calls != 1 {
+			wantErr := tc.status >= 500 || tc.status == 429
+			if (err != nil) != wantErr || res.OK != tc.ok || res.Already != tc.already || calls != 1 {
 				t.Fatal(res, err, calls)
 			}
 		})

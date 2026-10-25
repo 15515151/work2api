@@ -32,30 +32,32 @@ type Streamer interface {
 // Runtime owns the mutable WorkBuddy resources for exactly one gateway.
 // AccountMu coordinates import/delete with the gateway's ownership transaction.
 type Runtime struct {
-	creditMu       sync.Mutex
-	creditStates   map[string]creditState
-	creditRefresh  map[string]*provider.RefreshGate
-	modelRefresh   provider.RefreshGate
-	MaintenanceMu  sync.Mutex
-	maintenance    *maintenanceState
-	Pool           *pool.Pool
-	Catalog        *models.Registry
-	Managers       map[string]*credentials.Manager
-	ManagerMu      sync.RWMutex
-	AccountMu      sync.Mutex
-	Limiters       map[string]*ratelimit.Limiter
-	LimMu          sync.Mutex
-	ProjectAuths   string
-	UpstreamClient Streamer
-	RecordUsage    func(context.Context, store.UsageParams)
-	cfg            *config.Config
-	db             *store.DB
-	Sessions       *SessionRouter
-	CooldownMu     sync.Mutex
-	Cooldowns      map[string]CooldownEntry
+	creditMu         sync.Mutex
+	maintenanceGuard *provider.MaintenanceGuard
+	creditStates     map[string]creditState
+	creditRefresh    map[string]*provider.RefreshGate
+	modelRefresh     provider.RefreshGate
+	MaintenanceMu    sync.Mutex
+	maintenance      *maintenanceState
+	Pool             *pool.Pool
+	Catalog          *models.Registry
+	Managers         map[string]*credentials.Manager
+	ManagerMu        sync.RWMutex
+	AccountMu        sync.Mutex
+	Limiters         map[string]*ratelimit.Limiter
+	LimMu            sync.Mutex
+	ProjectAuths     string
+	UpstreamClient   Streamer
+	RecordUsage      func(context.Context, store.UsageParams)
+	cfg              *config.Config
+	db               *store.DB
+	Sessions         *SessionRouter
+	CooldownMu       sync.Mutex
+	Cooldowns        map[string]CooldownEntry
 }
 
 type creditState struct {
+	Identity     string
 	Manager      *credentials.Manager
 	Updated      float64
 	Failed       bool
@@ -133,6 +135,9 @@ func (r *Runtime) Manager(uid string) *credentials.Manager {
 	return r.Managers[uid]
 }
 func (r *Runtime) SetManager(uid string, mgr *credentials.Manager) {
+	if mgr != nil {
+		mgr.BindMaintenance(r.billingGuard(), uid)
+	}
 	r.ManagerMu.Lock()
 	defer r.ManagerMu.Unlock()
 	if mgr == nil {
@@ -295,17 +300,37 @@ func (r *Runtime) RefreshCreditsFor(ctx context.Context, db *store.DB, acc *pool
 		r.creditRefresh[acc.UID] = gate
 	}
 	r.creditMu.Unlock()
-	_ = gate.Do(ctx, fmt.Sprintf("%p", r.Manager(acc.UID)), func(ctx context.Context) error { r.refreshCreditsFor(ctx, db, acc); return nil })
+	_ = gate.Do(ctx, fmt.Sprintf("%p", r.Manager(acc.UID)), func(ctx context.Context) error {
+		mgr := r.Manager(acc.UID)
+		if mgr == nil {
+			return nil
+		}
+		identity, err := mgr.MaintenanceIdentity()
+		if err != nil {
+			return err
+		}
+		ran, err := r.billingGuard().Recover(ctx, acc.UID, identity, func(ctx context.Context) error { return r.refreshCreditsFor(ctx, db, acc) })
+		if err != nil || ran {
+			return err
+		}
+		return r.refreshCreditsFor(ctx, db, acc)
+	})
 }
-func (r *Runtime) refreshCreditsFor(ctx context.Context, db *store.DB, acc *pool.Account) {
+func (r *Runtime) refreshCreditsFor(ctx context.Context, db *store.DB, acc *pool.Account) error {
 	mgr := r.Manager(acc.UID)
 	if mgr == nil {
-		return
+		return nil
 	}
+	if _, err := mgr.GetHeadersContext(ctx); err != nil {
+		r.observeBilling(acc.UID, mgr, err)
+		return err
+	}
+	identity, _ := mgr.MaintenanceIdentity()
 	cr, err := billing.FetchCredits(ctx, mgr)
 	var queryErr *billing.QueryError
 	if errors.As(err, &queryErr) && (queryErr.Kind == "unauthorized" || queryErr.Kind == "login_expired") && ctx.Err() == nil {
 		if refreshErr := mgr.RefreshBillingAuthorization(ctx); refreshErr == nil {
+			identity, _ = mgr.MaintenanceIdentity()
 			cr, err = billing.FetchCredits(ctx, mgr)
 		} else {
 			err = refreshErr
@@ -314,7 +339,11 @@ func (r *Runtime) refreshCreditsFor(ctx context.Context, db *store.DB, acc *pool
 	r.AccountMu.Lock()
 	defer r.AccountMu.Unlock()
 	if ctx.Err() != nil || r.Manager(acc.UID) != mgr {
-		return
+		return ctx.Err()
+	}
+	currentIdentity, _ := mgr.MaintenanceIdentity()
+	if currentIdentity != identity {
+		return provider.ErrMaintenancePaused
 	}
 	r.creditMu.Lock()
 	if r.creditStates == nil {
@@ -324,6 +353,7 @@ func (r *Runtime) refreshCreditsFor(ctx context.Context, db *store.DB, acc *pool
 	if state.Manager != mgr {
 		state = creditState{Manager: mgr}
 	}
+	state.Identity = identity
 	state.Failed = err != nil
 	state.Reauthorize = false
 	state.LoginExpired = errors.Is(err, credentials.ErrLoginRequired)
@@ -340,10 +370,11 @@ func (r *Runtime) refreshCreditsFor(ctx context.Context, db *store.DB, acc *pool
 	}
 	r.creditStates[acc.UID] = state
 	r.creditMu.Unlock()
+	r.observeBilling(acc.UID, mgr, err)
 	if err != nil {
 		// 与上游一致：额度查询失败要留日志，否则「刷新额度没反应」无从排查
 		log.Printf("额度查询失败 %s: %v", acc.UID, err)
-		return
+		return err
 	}
 	r.Pool.SetCredits(acc.UID, &cr.Remain, &cr.Total, cr.ExpireAt, cr.Packages)
 	fields := map[string]any{"credits_remaining": cr.Remain, "credits_total": cr.Total}
@@ -358,6 +389,7 @@ func (r *Runtime) refreshCreditsFor(ctx context.Context, db *store.DB, acc *pool
 	if cr.Remain > 0 {
 		r.Pool.ClearCooldown(acc.UID)
 	}
+	return nil
 }
 
 // refreshAllCredits refreshes every account's credits concurrently. Done in
@@ -383,7 +415,14 @@ type CooldownEntry struct {
 
 func (r *Runtime) Configure(cfg *config.Config, db *store.DB, sessions *SessionRouter) {
 	r.cfg, r.db, r.Sessions = cfg, db, sessions
-	r.maintenance = &maintenanceState{r: r, keepaliveFails: map[string]int{}}
+	guard := r.billingGuard()
+	for uid, mgr := range r.Managers {
+		mgr.BindMaintenance(guard, uid)
+	}
+	if r.Catalog != nil {
+		r.Catalog.SetMaintenanceGuard(guard)
+	}
+	r.maintenance = &maintenanceState{r: r}
 	r.Cooldowns = map[string]CooldownEntry{}
 	if rows, err := db.ActiveModelCooldowns(0); err == nil {
 		for _, row := range rows {

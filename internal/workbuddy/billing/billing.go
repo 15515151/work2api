@@ -531,6 +531,12 @@ func DailyCheckin(ctx context.Context, mgr Credential) (CheckinResult, error) {
 	}
 	// 必须存在明确的 code 字段才判成功——否则非 JSON / 网关 404 / WAF 拦截等
 	// 会被 num(nil)==0 误判为「签到成功」（国际站无签到活动即属此类）。
+	if status == http.StatusUnauthorized {
+		return CheckinResult{}, &QueryError{Kind: "unauthorized"}
+	}
+	if status >= 500 || status == http.StatusTooManyRequests {
+		return CheckinResult{}, &QueryError{Kind: "upstream"}
+	}
 	codeRaw, hasCode := data["code"]
 	msg := str(data["msg"])
 	if msg == "" {
@@ -553,6 +559,9 @@ func DailyCheckin(ctx context.Context, mgr Credential) (CheckinResult, error) {
 		validCode = true
 	}
 	code := num(codeRaw)
+	if validCode && code == 12153 {
+		return CheckinResult{}, &QueryError{Kind: "login_expired"}
+	}
 	if validCode && code == 0 && status >= 200 && status < 300 {
 		return CheckinResult{OK: true, Message: "签到成功"}, nil
 	}

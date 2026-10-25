@@ -135,6 +135,7 @@ func unionBool(a, b *bool) *bool {
 }
 
 func mergeModelInfo(a, b upstream.ModelInfo) upstream.ModelInfo {
+	a.Pricing = append(append([]upstream.ModelPrice(nil), a.Pricing...), b.Pricing...)
 	a.EntitlementCosts = append(append([]float64(nil), a.EntitlementCosts...), b.EntitlementCosts...)
 	a.Multimodal = unionBool(a.Multimodal, b.Multimodal)
 	a.ToolResponseMultimodal = unionBool(a.ToolResponseMultimodal, b.ToolResponseMultimodal)
@@ -158,6 +159,9 @@ func boolValue(v *bool) any {
 	return *v
 }
 func applyModelCapabilities(entry *provider.CatalogModel, m upstream.ModelInfo) {
+	for key, value := range pricingMetadata(m.Pricing) {
+		entry.Extra[key] = value
+	}
 	entry.Extra["entitlement_usage_cost"] = m.EntitlementCosts
 	entry.Vision = m.Multimodal != nil && *m.Multimodal
 	entry.Extra["vision"] = boolValue(m.Multimodal)
@@ -194,6 +198,7 @@ func mergeCatalogCapabilities(entry *provider.CatalogModel, m upstream.ModelInfo
 	}
 	previous := upstream.ModelInfo{Multimodal: vision, ThinkingControl: thinking, ToolResponseMultimodal: tool, Capability: text(entry.Extra["model_capability"]), ContextWindow: int64(entry.Context), MaxTokens: int64(entry.MaxOutput)}
 	previous.EntitlementCosts, _ = entry.Extra["entitlement_usage_cost"].([]float64)
+	previous.Pricing, _ = entry.Extra["price_factors"].([]upstream.ModelPrice)
 	merged := mergeModelInfo(previous, m)
 	entry.Context, entry.MaxOutput = int(merged.ContextWindow), int(merged.MaxTokens)
 	applyModelCapabilities(entry, merged)

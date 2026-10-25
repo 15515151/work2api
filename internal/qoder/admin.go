@@ -186,6 +186,9 @@ func (r *Runtime) accountRow(id, label, region, source, authMode string, active 
 		row["healthy"] = false
 		row["cooldown_until"] = float64(until.UnixMilli()) / 1000
 	}
+	if pending := checkin.PendingMaintenance(id, deviceTokenFromSecret(secret)); len(pending) > 0 {
+		row["maintenance"] = pending
+	}
 	// checkin state from local history
 	streak, _, totalCredits, claimedToday := checkin.LocalStats(id)
 	row["checkin_today"] = claimedToday

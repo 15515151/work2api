@@ -28,6 +28,9 @@ func (r *Runtime) headers(ctx context.Context, acc *pool.Account, localNetwork f
 	if mgr == nil {
 		return nil, &provider.DispatchError{Status: 503, Message: "账号凭据不可用", Type: "auth_error"}
 	}
+	if mgr.AuthorizationInvalid() {
+		return nil, &upstream.UpstreamError{StatusCode: 401, Raw: []byte(`{"error":{"message":"账号凭据失效，请重新授权","type":"auth_error"}}`)}
+	}
 	h, err := mgr.GetChatHeadersContext(ctx)
 	if err != nil {
 		if ctx.Err() != nil {

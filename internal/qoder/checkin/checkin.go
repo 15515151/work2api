@@ -22,6 +22,8 @@ const checkinHost = "openapi.qoder.com.cn"
 
 // CheckinResult 单个账号的签到结果
 type CheckinResult struct {
+	httpStatus int
+
 	Account   string `json:"account"`
 	AccountID string `json:"account_id"`
 	Status    string `json:"status"` // claimed / already_claimed / no_campaign / error / no_token
@@ -369,7 +371,9 @@ func checkinAccount(ctx context.Context, acct *account.Account) CheckinResult {
 	r := campaignsCheckin(ctx, deviceToken, &res)
 
 	// 只读补充 legacy 统计（DISABLED 时恒 0，不影响结果；上游恢复后可提供 streak）
-	readDailyCheckinStats(ctx, deviceToken, &r)
+	if r.Status != checkinStatusError && r.Status != "paused" && r.Status != "reauthorize" {
+		readDailyCheckinStats(ctx, deviceToken, &r)
+	}
 
 	return finalizeCheckin(acct.ID, r)
 }
@@ -474,9 +478,10 @@ func windowHint(res *CheckinResult, fallback string) string {
 }
 
 // campaignsCheckin 兜底：走桌面端抓包还原的 campaigns 流程
-func campaignsCheckin(ctx context.Context, deviceToken string, res *CheckinResult) CheckinResult {
+func campaignsCheckinRaw(ctx context.Context, deviceToken string, res *CheckinResult) CheckinResult {
 	// Step 1: 查询活动列表
 	status, body, raw := doCheckinRequest(ctx, "GET", "/sash/api/v1/me/campaigns", deviceToken, nil)
+	res.httpStatus = status
 	if status != 200 {
 		res.Message = fmt.Sprintf("查询活动失败 HTTP %d: %s", status, truncate(raw, 300))
 		return *res
@@ -540,6 +545,7 @@ func campaignsCheckin(ctx context.Context, deviceToken string, res *CheckinResul
 	// Step 2: 领取（空 body，抓包确认）
 	claimPath := fmt.Sprintf("/sash/api/v1/me/campaigns/%s/claim", target.CampaignID)
 	status, body, raw = doCheckinRequest(ctx, "POST", claimPath, deviceToken, nil)
+	res.httpStatus = status
 	if status != 200 {
 		res.Message = fmt.Sprintf("领取失败 HTTP %d: %s", status, truncate(raw, 300))
 		return *res
@@ -677,7 +683,9 @@ func CheckinWithTokenContext(ctx context.Context, accountID, name, deviceToken s
 		return res
 	}
 	r := campaignsCheckin(ctx, deviceToken, &res)
-	readDailyCheckinStats(ctx, deviceToken, &r)
+	if r.Status != checkinStatusError && r.Status != "paused" && r.Status != "reauthorize" {
+		readDailyCheckinStats(ctx, deviceToken, &r)
+	}
 	return finalizeCheckin(accountID, r)
 }
 

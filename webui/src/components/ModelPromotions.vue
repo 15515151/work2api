@@ -10,6 +10,7 @@ export interface ModelPromotion {
   valid_until?: string
   timezone?: string
   daily?: { start: string; end: string }[]
+  weekly?: { weekdays: number[]; start: string; end: string }[]
   trial_days?: number
 }
 
@@ -32,7 +33,15 @@ const visible = computed(() => props.promotions.filter(p => {
     && (!p.valid_until || clock.value < Date.parse(p.valid_until))
 }))
 const labels = computed(() => [...new Set(visible.value.map(p => p.label))])
-const region = (s: string) => s === 'domestic' ? '国内' : s === 'international' ? '国际' : s
+const region = (s: string) => s === 'domestic' ? '国内' : s === 'international' ? '国际' : s === 'cn' ? 'Trae IDE' : s === 'solo' ? 'Work/SOLO' : s
+function weekdays(days: number[]) {
+  const values = [...new Set(days)].filter(d => d >= 1 && d <= 7).sort((a, b) => a - b)
+  const key = values.join(',')
+  if (key === '1,2,3,4,5') return '周一至周五'
+  if (key === '6,7') return '周六、周日'
+  if (key === '1,2,3,4,5,6,7') return '每天'
+  return values.map(d => ['周一', '周二', '周三', '周四', '周五', '周六', '周日'][d - 1]).join('、')
+}
 function timestamp(value: string, timezone?: string) {
   try {
     return new Intl.DateTimeFormat('zh-CN', {
@@ -122,6 +131,9 @@ onUnmounted(() => {
           </div>
           <!-- Preserve official prose when it disagrees with structured clocks. -->
           <p v-if="!p.description && p.daily?.length" class="mt-1 text-micro text-muted">每日 {{ p.daily.map(w => `${w.start}–${w.end}`).join('、') }}</p>
+          <div v-if="p.weekly?.length" class="mt-2 space-y-1 text-micro text-muted">
+            <div v-for="(w, wi) in p.weekly" :key="wi">{{ weekdays(w.weekdays) }} {{ w.start === '00:00' && w.end === '24:00' ? '全天' : `${w.start}–${w.end}` }}</div>
+          </div>
           <p v-if="p.timezone" class="mt-1 text-micro text-faint">时区：{{ p.timezone }}</p>
         </div>
       </div>

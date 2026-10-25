@@ -35,6 +35,23 @@ func (r *Runtime) AdminRefreshCredits(ctx context.Context) (map[string]any, erro
 func (r *Runtime) refreshQuota(ctx context.Context, id string, force bool) error {
 	r.mu.Lock()
 	a := r.accounts[id]
+	r.mu.Unlock()
+	if a == nil {
+		return errors.New("账号不存在")
+	}
+	if err := r.ensureMaintenance(ctx, a.Auth); err != nil {
+		return err
+	}
+	probe := func(ctx context.Context) error { return r.refreshQuotaRaw(ctx, id, force) }
+	ran, err := r.authGuard().Recover(ctx, id+":"+a.Auth.Variant+":quota", a.Auth.MaintenanceIdentity(), probe)
+	if err != nil || ran {
+		return err
+	}
+	return probe(ctx)
+}
+func (r *Runtime) refreshQuotaRaw(ctx context.Context, id string, force bool) (result error) {
+	r.mu.Lock()
+	a := r.accounts[id]
 	if a == nil {
 		r.mu.Unlock()
 		return errors.New("账号不存在")
@@ -62,16 +79,19 @@ func (r *Runtime) refreshQuota(ctx context.Context, id string, force bool) error
 	a.QuotaProbeDone, a.QuotaProbeAt = done, time.Now()
 	identity := a.Auth
 	r.mu.Unlock()
+	fingerprint := identity.MaintenanceIdentity()
+	defer func() { r.observeMaintenance(identity, "quota", fingerprint, result) }()
 	err := r.ensure(ctx, identity)
 	var usage *upstream.EntUsageResult
 	if err == nil {
+		fingerprint = identity.MaintenanceIdentity()
 		usage, err = r.client(ctx).UserEntUsage(identity)
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	defer close(done)
 	a.QuotaProbeDone = nil
-	if r.accounts[id] != a {
+	if r.accounts[id] != a || identity.MaintenanceIdentity() != fingerprint {
 		return errors.New("Trae 账号已变更")
 	}
 	a.QuotaFailed = err != nil
@@ -170,7 +190,7 @@ func (r *Runtime) refreshBlockedQuotas(ctx context.Context, req provider.ServeRe
 		if !a.Enabled || req.Caller.UserID > 0 && !req.Caller.AccountScope[id] || req.Caller.UserID <= 0 && excluded[id] {
 			continue
 		}
-		if identity, _ := a.modelIdentityFor(model, image); identity == nil {
+		if identity, _ := a.modelIdentityFor(model, image, r.identityAvailableLocked); identity == nil {
 			continue
 		}
 		// Healthy resources should serve immediately; recovery reads must not
@@ -214,15 +234,33 @@ func (r *Runtime) AdminCheckin(ctx context.Context) (map[string]any, error) {
 		}
 		r.mu.Lock()
 		a := r.accounts[id]
+		already := a != nil && a.CheckinDate == today
 		r.mu.Unlock()
 		if a == nil {
 			continue
 		}
+		if already {
+			results = append(results, map[string]any{"uid": id, "status": "already"})
+			continue
+		}
 		result := map[string]any{"uid": id, "status": "error"}
-		err := r.ensure(ctx, a.Auth)
+		fingerprint := a.Auth.MaintenanceIdentity()
+		err := r.ensureMaintenance(ctx, a.Auth)
 		if err == nil {
+			fingerprint = a.Auth.MaintenanceIdentity()
 			c := r.client(ctx)
-			status, e := c.CheckinStatus(a.Auth)
+			var status *upstream.CheckinStatusResult
+			probe := func(ctx context.Context) error {
+				fingerprint := a.Auth.MaintenanceIdentity()
+				var e error
+				status, e = c.CheckinStatus(a.Auth)
+				r.observeMaintenance(a.Auth, "checkin", fingerprint, e)
+				return e
+			}
+			ran, e := r.authGuard().Recover(ctx, id+":"+a.Auth.Variant+":checkin", a.Auth.MaintenanceIdentity(), probe)
+			if e == nil && (!ran || status == nil) {
+				e = probe(ctx)
+			}
 			err = e
 			if err == nil {
 				if !status.Enable {
@@ -233,7 +271,9 @@ func (r *Runtime) AdminCheckin(ctx context.Context) (map[string]any, error) {
 					result["status"] = "device_checked"
 					result["message"] = "设备已参与，未确认该账号签到成功"
 				} else {
+					fingerprint := a.Auth.MaintenanceIdentity()
 					_, err = c.CheckinClaim(a.Auth)
+					r.observeMaintenance(a.Auth, "checkin", fingerprint, err)
 					if err == nil {
 						result["status"] = "ok"
 					}
@@ -242,17 +282,33 @@ func (r *Runtime) AdminCheckin(ctx context.Context) (map[string]any, error) {
 		}
 		if err != nil {
 			result["message"] = "上游未确认签到成功，请稍后重试"
+			if errors.Is(err, provider.ErrMaintenanceLogin) {
+				result["status"] = "reauthorize"
+				result["message"] = err.Error()
+			} else if errors.Is(err, provider.ErrMaintenancePaused) {
+				result["status"] = "paused"
+				result["message"] = err.Error()
+			}
 			var rejection *upstream.Error
 			if errors.As(err, &rejection) {
 				result["code"] = rejection.BizCode
 			}
+		}
+		r.mu.Lock()
+		valid := r.accounts[id] == a && a.Auth.MaintenanceIdentity() == fingerprint
+		r.mu.Unlock()
+		if !valid {
+			result["status"] = "paused"
+			result["message"] = "账号授权已变化，等待新凭据维护"
 		}
 		if result["status"] == "ok" || result["status"] == "already" {
 			if err := r.db.RecordCheckin(id, today, "trae"); err != nil {
 				return nil, err
 			}
 			r.mu.Lock()
-			a.CheckinDate = today
+			if r.accounts[id] == a && a.Auth.MaintenanceIdentity() == fingerprint {
+				a.CheckinDate = today
+			}
 			r.mu.Unlock()
 		}
 		results = append(results, result)

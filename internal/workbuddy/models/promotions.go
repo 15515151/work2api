@@ -59,7 +59,7 @@ func (r *Registry) refreshPromotionMetadata(ctx context.Context, account *pool.A
 	}
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	if data := r.fetchCatalogDocument(ctx, url, desktop); data != nil {
+	if data := r.fetchMaintainedCatalog(ctx, url, desktop, account, "desktop"); data != nil {
 		r.savePromotionMetadata(account, data)
 	}
 }
