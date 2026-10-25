@@ -64,6 +64,9 @@ func WithRequestSessionIdentity(r *http.Request, body map[string]any) *http.Requ
 }
 
 func RequestSessionKey(r *http.Request, p SessionPrincipal, model string, body map[string]any) string {
+	if p != nil && p.SessionCaller().TestAccount != "" {
+		return ""
+	}
 	if identity, ok := r.Context().Value(RequestSessionIdentityKey{}).(RequestSessionIdentity); ok {
 		return ScopedSessionKey(p, model, identity.Key)
 	}

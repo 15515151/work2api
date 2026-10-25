@@ -18,6 +18,7 @@ const saving = ref(false)
 const s = reactive<Record<string, string>>({
   checkin_hours: '',
   credit_refresh_min: '',
+ account_check_interval_min: '30',
   model_refresh_hour: '',
   model_ttl_min: '',
   aa_refresh_hour: '',
@@ -29,6 +30,7 @@ const s = reactive<Record<string, string>>({
   alert_expiry_days: '',
   qoder_machine_salt: '',
 })
+const accountChecks = ref(true)
 const keepalive = ref(true)
 const maintenanceProviders = ref<ProviderSummary[]>([])
 const maintenanceValues = reactive<Record<string, boolean>>({})
@@ -53,6 +55,7 @@ async function load() {
   try {
     const data = (await api.getSettings()) as Settings & Record<string, string>
     for (const k of Object.keys(s)) if (data[k] != null) s[k] = String(data[k])
+    accountChecks.value = String(data.account_check_enabled ?? '1') === '1'
     keepalive.value = String(data.keepalive_enabled ?? '1') === '1'
     maintenanceProviders.value = (await api.getProviders()).providers.filter(p => p.maintenance?.length)
     for (const p of maintenanceProviders.value) for (const option of p.maintenance || []) {
@@ -77,6 +80,7 @@ async function save() {
   try {
     const payload: Record<string, unknown> = {
       ...s,
+      account_check_enabled: accountChecks.value ? '1' : '0',
       keepalive_enabled: keepalive.value ? '1' : '0',
       backup_enabled: backupEnabled.value ? '1' : '0',
       cost_aware_routing: costAware.value ? '1' : '0',
@@ -144,6 +148,10 @@ onMounted(load)
           <div class="grid grid-cols-[1fr_9rem] items-center gap-3">
             <label class="text-small text-muted">额度刷新间隔（分）</label>
             <WInput v-model="s.credit_refresh_min" placeholder="30" />
+          </div>
+          <div class="rounded-lg border border-line p-3 space-y-3">
+            <div class="flex items-center justify-between gap-3"><div><label for="account-checks" class="text-small text-ink">定时账号检查</label><p class="text-micro text-faint">只读验证，复用近期维护结果；不会定时调用模型或启用已停用账号。</p></div><WToggle id="account-checks" v-model="accountChecks" /></div>
+            <div class="grid grid-cols-[1fr_9rem] items-center gap-3"><label class="text-small text-muted">检查间隔（分）</label><WInput v-model="s.account_check_interval_min" placeholder="30" :disabled="!accountChecks" /></div>
           </div>
           <div v-for="p in maintenanceProviders" :key="p.name" class="space-y-3 rounded-lg border border-line p-3">
             <div class="text-small font-medium text-ink">{{ p.display_name }} 维护</div>

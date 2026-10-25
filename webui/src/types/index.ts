@@ -34,6 +34,8 @@ export interface AccountInfo {
 }
 
 export interface Settings {
+ account_check_enabled?: string
+ account_check_interval_min?: string
   portal_public_url?: string
   portal_disabled_models?: string
   checkin_hours: string

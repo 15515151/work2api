@@ -368,3 +368,30 @@ func TestPortalQoderSelectionAndLoginIsolation(t *testing.T) {
 		t.Fatal("own cancellation did not release login")
 	}
 }
+
+func TestAccountCheckReusesCredentialScopedReadOnlyCatalog(t *testing.T) {
+	previous := account.DataRoot()
+	account.SetDataRoot(t.TempDir())
+	t.Cleanup(func() { account.SetDataRoot(previous) })
+	a := &account.Account{ID: "readonly-check", Region: account.RegionCN}
+	if err := account.Save(a); err != nil {
+		t.Fatal(err)
+	}
+	secret := "fixture"
+	if err := account.SaveSecret(a.ID, secret); err != nil {
+		t.Fatal(err)
+	}
+	key := modelCatalogKey(a, secret)
+	r := &Runtime{accountModels: map[[32]byte]accountModelSnapshot{key: {expires: time.Now().Add(5 * time.Minute)}}}
+	revision := r.CheckAccountIdentity(a.ID)
+	result := r.CheckAccount(context.Background(), a.ID, false)
+	if result.Status != "valid" || revision == "" || len(r.bridges) != 0 {
+		t.Fatal("fresh evidence did not avoid session initialization", result)
+	}
+	if err := account.SaveSecret(a.ID, "rotated"); err != nil {
+		t.Fatal(err)
+	}
+	if r.CheckAccountIdentity(a.ID) == revision {
+		t.Fatal("new credential reused old check generation")
+	}
+}

@@ -12,6 +12,9 @@ import (
 )
 
 func (s *Server) mountProviderAdmin(mux *http.ServeMux) {
+	mux.HandleFunc("GET /admin/account-checks", s.adminAccountCheckSnapshots)
+	mux.HandleFunc("POST /admin/providers/{name}/accounts/{id}/check", s.adminAccountCheck)
+	mux.HandleFunc("POST /admin/providers/{name}/accounts/{id}/test", s.adminAccountTest)
 	mux.HandleFunc("POST /admin/providers/{name}/accounts/{id}/renew", s.adminProviderRenew)
 	mux.HandleFunc("GET /admin/providers", s.adminProviders)
 	mux.HandleFunc("GET /admin/providers/{name}", s.adminProviderDetail)
@@ -377,6 +380,13 @@ func (s *Server) adminProviderDetail(w http.ResponseWriter, r *http.Request) {
 	for _, c := range contributions {
 		owners[c.AccountUID] = c
 	}
+	checker, checkSupported := rt.(provider.AccountChecker)
+	checkIDs := map[string]bool{}
+	if checkSupported {
+		for _, id := range checker.CheckAccountIDs() {
+			checkIDs[id] = true
+		}
+	}
 	rows := make([]map[string]any, 0, len(d.Accounts))
 	for _, original := range d.Accounts {
 		row := map[string]any{}
@@ -386,6 +396,16 @@ func (s *Server) adminProviderDetail(w http.ResponseWriter, r *http.Request) {
 		uid := str2(row["uid"])
 		if uid == "" {
 			uid = str2(row["id"])
+		}
+		if checkSupported && checkIDs[uid] {
+			row["account_check_supported"] = true
+			check, test := s.o.accountChecks.snapshot(rt, checker, uid)
+			if check != nil {
+				row["account_check"] = check
+			}
+			if test != nil {
+				row["account_test"] = test
+			}
 		}
 		if name == "qoder" {
 			uid = "qoder:" + uid

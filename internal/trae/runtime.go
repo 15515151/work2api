@@ -738,7 +738,7 @@ func (r *Runtime) selectAccountFor(req provider.ServeRequest, model, session str
 		if !a.Enabled || tried[id] || time.Now().Before(a.Cooldown) {
 			continue
 		}
-		if req.Caller.UserID > 0 {
+		if req.Caller.UserID > 0 || req.Caller.TestAccount != "" {
 			if !req.Caller.AccountScope[id] {
 				continue
 			}

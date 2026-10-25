@@ -722,6 +722,17 @@ func (s *Server) adminSaveSettings(w http.ResponseWriter, r *http.Request) {
 	for k, v := range body {
 		kv[k] = toStrLoose(v)
 	}
+	if raw, present := kv["account_check_enabled"]; present && raw != "0" && raw != "1" {
+		writeAPIErr(w, errBody(400, "检查开关需为0或1", "invalid_request_error"))
+		return
+	}
+	if raw, present := kv["account_check_interval_min"]; present {
+		n, e := strconv.Atoi(raw)
+		if e != nil || n < 5 || n > 1440 {
+			writeAPIErr(w, errBody(400, "检查间隔需为5至1440分钟", "invalid_request_error"))
+			return
+		}
+	}
 	if raw, present := kv["model_aliases"]; present {
 		routes, err := s.o.db.ModelRoutes()
 		if err != nil {

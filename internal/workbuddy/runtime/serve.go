@@ -407,7 +407,7 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 func writeAPIErr(w http.ResponseWriter, e *apiError) { writeJSON(w, e.Status, e.Body) }
 func (o *Runtime) pickForCaller(p *provider.Caller, model, key string) (*pool.Account, *apiError) {
-	if p != nil && p.UserID > 0 {
+	if p != nil && (p.UserID > 0 || p.TestAccount != "") {
 		return o.PickAccountExcludingIn(model, key, nil, p.AccountScope)
 	}
 	return o.PickAccount(model, key)

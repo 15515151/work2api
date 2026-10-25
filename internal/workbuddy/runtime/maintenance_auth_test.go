@@ -106,3 +106,26 @@ func TestConfirmedExpiryCannotUseStickyScopedOrAdmissionSelection(t *testing.T) 
 		t.Fatal("auth state changed manual enablement")
 	}
 }
+
+func TestDiagnosticUsageDoesNotEnterUserStatistics(t *testing.T) {
+	r := &Runtime{}
+	ctx := provider.WithInvocation(context.Background(), provider.Invocation{Diagnostic: true})
+	r.LogUsage(LogArgs{Ctx: ctx, Status: "ok", Usage: map[string]any{"prompt_tokens": 1, "completion_tokens": 1}})
+	// No configured DB/usage sink: a diagnostic must return before persistence.
+}
+
+func TestReadOnlyCheckReusesFreshBillingWithoutEnablingAccount(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "check.info")
+	body := `{"auth":{"accessToken":"fixture","refreshToken":"refresh","domain":"www.workbuddy.cn","expiresAt":` + fmt.Sprint(time.Now().Add(time.Hour).UnixMilli()) + `},"account":{"uid":"fixture"}}`
+	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	mgr := credentials.NewManager(path)
+	identity, _ := mgr.MaintenanceIdentity()
+	r := &Runtime{Managers: map[string]*credentials.Manager{"fixture": mgr}, Pool: pool.New(map[string]pool.Credential{"fixture": mgr}, ""), creditStates: map[string]creditState{"fixture": {Manager: mgr, Identity: identity, Updated: nowSec()}}}
+	r.Pool.SetEnabled("fixture", false, "手动停用")
+	result := r.CheckAccount(context.Background(), "fixture", false)
+	if result.Status != "valid" || r.Pool.Get("fixture").Enabled {
+		t.Fatal("fresh check made extra requests or enabled account", result)
+	}
+}

@@ -1179,3 +1179,31 @@ func TestConfirmedTraeExpiryExcludesOnlyFailedProduct(t *testing.T) {
 		t.Fatal("auth failure changed manual enablement")
 	}
 }
+
+func TestReadOnlyCheckPreservesDisabledAccountAndScope(t *testing.T) {
+	var gets, posts atomic.Int32
+	r := fixtureRuntime(t, func(w http.ResponseWriter, req *http.Request) {
+		if req.Method == "GET" {
+			gets.Add(1)
+		} else {
+			posts.Add(1)
+		}
+		io.WriteString(w, `{"code":0,"data":{"models":[]}}`)
+	})
+	a := &auth.Auth{UID: "check-disabled", Variant: "cn", AccessToken: "fixture", RefreshToken: "refresh", ExpiresAt: time.Now().Add(time.Hour).Unix()}
+	state := &accountState{Auth: a, Enabled: false, Identities: map[string]*auth.Auth{"cn": a}, Catalogs: map[string][]upstream.ModelInfo{}, CatalogTimes: map[string]time.Time{"cn": time.Now()}, CatalogErrors: map[string]bool{}}
+	id := accountID(a.UID)
+	r.accounts[id] = state
+	result := r.CheckAccount(context.Background(), id, false)
+	if result.Status != "valid" || gets.Load() != 0 || posts.Load() != 0 || state.Enabled {
+		t.Fatal("fresh read-only evidence was not reused or switch changed", result)
+	}
+	fp := a.MaintenanceIdentity()
+	g := r.authGuard()
+	g.State(id+":cn:auth", fp)
+	g.Observe(id+":cn:auth", fp, "authorization_expired", true)
+	result = r.CheckAccount(context.Background(), id, true)
+	if result.Status != "invalid" || gets.Load() != 0 || posts.Load() != 0 {
+		t.Fatal("known expiry bypassed maintenance gate", result)
+	}
+}

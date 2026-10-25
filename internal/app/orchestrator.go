@@ -72,6 +72,7 @@ type Orchestrator struct {
 	sessions      *sessionRouter
 	observations  provider.SessionObservations
 	accountHealth accountHealthObservations
+	accountChecks accountCheckBook
 	routes        routeAffinity
 }
 

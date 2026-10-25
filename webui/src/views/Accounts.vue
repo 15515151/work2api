@@ -43,6 +43,79 @@ async function mutateRow(r: Record<string, any>, operation: () => Promise<unknow
   try { await operation(); await load() } finally { rowBusy.value.delete(key) }
 }
 
+const checkOpen = ref(false)
+const checkTarget = ref<Row | null>(null)
+const checkResult = ref<Record<string, any> | null>(null)
+const modelTestResult = ref<Record<string, any> | null>(null)
+const checkModels = ref<{ value: string; label: string }[]>([])
+const checkModel = ref('')
+const checking = ref(false)
+const testing = ref(false)
+const modelsLoading = ref(false)
+async function openAccountCheck(source: Record<string, any>) {
+  const row = source as Row
+  dismissPopovers()
+  checkTarget.value = row
+  checkResult.value = row.raw.account_check || null
+  modelTestResult.value = row.raw.account_test || null
+  checkModels.value = []; checkModel.value = ''; checkOpen.value = true; modelsLoading.value = true
+  try {
+    const detail = await api.getProvider(row.provider)
+    if (checkTarget.value?.key !== row.key || !checkOpen.value) return
+    checkModels.value = (detail.models || []).map((m: any) => ({ value: m.id, label: m.name ? `${m.name} · ${m.id}` : m.id }))
+  } finally { modelsLoading.value = false }
+}
+async function runAccountCheck() {
+  const row = checkTarget.value; if (!row || checking.value || testing.value) return
+  checking.value = true
+  try { checkResult.value = await api.checkAccount(row.provider, row.id); await load() }
+  finally { checking.value = false }
+}
+async function runAccountTest() {
+  const row = checkTarget.value; const model = checkModel.value
+  if (!row || !model || testing.value || checking.value) return
+  testing.value = true
+  try {
+    if (!await confirm({ title: '真实调用测试', body: '会使用选定账号实际调用该模型，可能消耗额度。只发送最小测试内容，不会换号；不会加入用户用量和续航估算。', okText: '开始测试' })) return
+    modelTestResult.value = await api.testAccount(row.provider, row.id, model); await load()
+  } finally { testing.value = false }
+}
+let checkPoll: ReturnType<typeof setInterval> | null = null
+let checkPollRunning = false
+async function pollAccountChecks() {
+  if (document.hidden || checkPollRunning || loading.value || checking.value || testing.value || batchBusy.value) return
+  checkPollRunning = true
+  try {
+    const data = await api.accountCheckSnapshots()
+    const snapshots = new Map(data.results.map(r => [`${r.provider}/${r.id}`, r]))
+    const changed = rows.value.some(row => {
+      const current = snapshots.get(row.key)
+      return !!current && (JSON.stringify(current.check) !== JSON.stringify(row.raw.account_check || null) || JSON.stringify(current.test) !== JSON.stringify(row.raw.account_test || null))
+    })
+    if (changed) await load()
+  } catch { /* Keep the last successful snapshot; GET client reports failures. */ }
+  finally { checkPollRunning = false }
+}
+
+async function checkAccountsBatch() {
+  if (batchBusy.value) return
+  const targets = (selectedRows.value.length ? selectedRows.value : filtered.value).filter(r => r.raw.account_check_supported)
+  if (!targets.length) return
+  batchBusy.value = true; batchResults.value = []
+  try {
+    // Only two background checks at a time; normal model requests are unaffected.
+    let next = 0
+    await Promise.all([0, 1].map(async () => {
+      while (next < targets.length) {
+        const row = targets[next++]
+        try { const result = await api.checkAccount(row.provider, row.id); batchResults.value.push({ key: row.key, label: label(row), ok: result.status === 'valid' || result.status === 'unknown', message: result.message }) }
+        catch { batchResults.value.push({ key: row.key, label: label(row), ok: false, message: '检查失败，其余账号继续处理' }) }
+      }
+    }))
+    await load()
+  } finally { batchBusy.value = false }
+}
+
 const providerFilter = ref('')
 const statusFilter = ref('')
 const search = ref('')
@@ -97,7 +170,7 @@ function action(r: Record<string, any>, name: string) { return (r.resource as Re
 function can(r: Record<string, any>, name: string) { return action(r, name)?.enabled === true }
 const selectedKeys = ref(new Set<string>())
 const batchBusy = ref(false)
-const batchResults = ref<{ key: string; label: string; ok: boolean }[]>([])
+const batchResults = ref<{ key: string; label: string; ok: boolean; message?: string }[]>([])
 const selectedRows = computed(() => rows.value.filter(r => selectedKeys.value.has(r.key)))
 const batchEnabled = computed(() => selectedRows.value.length > 0 && selectedRows.value.every(r => can(r, 'enabled') && !rowBusy.value.has(r.key) && !readErrors.value[r.provider]))
 function selectRow(r: Record<string, any>, checked: boolean) {
@@ -128,10 +201,18 @@ function statusOf(r: any): { tone: 'live' | 'warn' | 'fault' | 'muted'; text: st
   if (a.enabled === false) return { tone: a.auth_invalid ? 'fault' : Array.isArray(a.maintenance) && a.maintenance.length ? 'warn' : 'muted', text: '已停用' }
   if (a.auth_invalid) return { tone: 'fault', text: '授权已失效' }
   if (a.auth_partial || Array.isArray(a.maintenance) && a.maintenance.length) return { tone: 'warn', text: a.auth_partial ? '部分可用' : '维护异常' }
+  const probe = a.account_check
+  if (probe?.status === 'invalid') return { tone: 'fault', text: '授权已失效' }
+  if (probe?.status === 'warning' && probe.expires_at > Date.now() / 1000) return { tone: 'warn', text: '检查异常' }
   if (a.quota_login_expired) return { tone: 'warn', text: '额度授权异常' }
   if (a.quota_reauthorize) return { tone: 'warn', text: '额度授权异常' }
   const cd = a.cooldown_until && a.cooldown_until > Date.now() / 1000
   if (cd) return { tone: 'warn', text: '冷却 ' + cooldown(a.cooldown_until) }
+  const recentCall = a.health?.last_success > Date.now() / 1000 - 1800
+  if (a.account_test?.status === 'valid' && a.account_test.expires_at > Date.now() / 1000 && a.healthy) return { tone: 'live', text: '测试通过' }
+  if (probe?.status === 'unknown' && !recentCall) return { tone: 'muted', text: '待调用验证' }
+  if (probe?.status === 'valid' && probe.expires_at > Date.now() / 1000 && !recentCall && a.healthy && !a.quota_exceeded) return { tone: 'live', text: '检查通过' }
+  if (a.account_check_supported && !recentCall && (!probe || probe.expires_at <= Date.now() / 1000)) return { tone: 'muted', text: '待验证' }
   if (a.health_basis === 'credential' && !a.health?.last_success && a.healthy && !a.quota_exceeded) return { tone: 'muted', text: '待验证' }
   const states: Record<string, { tone: 'live' | 'warn' | 'fault' | 'muted'; text: string }> = {
     disabled: { tone: 'muted', text: '已停用' }, configured: { tone: 'live', text: '已配置' }, unconfigured: { tone: 'muted', text: '未配置' },
@@ -343,6 +424,10 @@ const healthReasons: Record<string, string> = {
 function healthDetails(r: Record<string, any>): { label: string; value: string }[] {
   const a = r.raw
   const details = [{ label: '当前状态', value: statusOf(r).text }]
+  for (const [field, title] of [['account_check', '账号检查'], ['account_test', '模型测试']] as const) {
+    const result = a[field]
+    if (result) details.push({ label: title, value: `${result.scope}：${result.message}${result.model ? `（${result.model}）` : ''}；${dt(result.checked_at)}${result.expires_at <= Date.now() / 1000 ? '，结果已过期' : ''}` })
+  }
   if (a.auth_invalid) details.push({ label: '登录授权', value: '已确认失效，暂停模型调度与相关维护，请重新授权' })
   else if (a.auth_partial) details.push({ label: '登录授权', value: '部分产品身份失效，其他有效身份仍可调用' })
   if (a.quota_reauthorize) details.push({ label: '额度授权', value: a.quota_login_expired ? '额度接口报告授权失效，可重新授权后核实；模型调用凭据单独判断' : '额度接口鉴权失败，请重新授权或在官方客户端核实' })
@@ -765,6 +850,7 @@ function refreshVisibleCalendar() {
   else dismissPopovers()
 }
 onMounted(() => {
+  checkPoll = setInterval(pollAccountChecks, 30000)
   void load()
   void loadCalendar()
   calendarTimer = setInterval(refreshVisibleCalendar, 60000)
@@ -778,6 +864,7 @@ onMounted(() => {
 })
 // 组件卸载时停掉可能残留的扫码轮询/悬浮层关闭定时器，避免离开页面后仍在轮询
 onUnmounted(() => {
+  if (checkPoll) clearInterval(checkPoll)
   loadVersion++
   stopPoll()
   cancelClose()
@@ -847,6 +934,7 @@ async function saveConfig() {
 <template>
   <WPage title="账号与资源" sub="统一管理各渠道账号、密钥层级与匿名入口。">
     <template #actions>
+      <WButton variant="ghost" :loading="batchBusy" :disabled="!rows.some(r => r.raw.account_check_supported)" @click="checkAccountsBatch">{{ selectedRows.length ? '检查所选账号' : '检查筛选账号' }}</WButton>
       <WButton v-if="providers.some(p => p.capabilities.includes('credits') && (!providerFilter || p.name === providerFilter))" variant="ghost" :loading="busy" @click="refreshCreditsAll"><WIcon name="refresh" :size="15" /> 刷新额度</WButton>
       <WButton v-if="providers.some(p => p.capabilities.includes('checkin') && (!providerFilter || p.name === providerFilter))" variant="ghost" :loading="busy" @click="checkinAll"><WIcon name="check" :size="15" /> 一键签到</WButton>
       <WButton v-for="p in configProviders.filter(p => !providerFilter || p.name === providerFilter)" :key="p.name" variant="ghost" @click="openConfig(p.name)">配置 {{ p.display_name }}</WButton>
@@ -886,7 +974,7 @@ async function saveConfig() {
         <WButton variant="subtle" :disabled="batchBusy" @click="selectedKeys.clear()">清除选择</WButton>
         <span v-if="!batchEnabled" class="text-micro text-faint">所选资源须全部支持启停且状态读取成功。</span>
       </div>
-      <div v-if="batchResults.length" role="status" class="mb-3 text-micro"><div v-for="result in batchResults" :key="result.key" :class="result.ok ? 'text-muted' : 'text-warn'">{{ result.label }}：{{ result.ok ? '已更新' : '更新失败，其余账号继续处理' }}</div></div>
+      <div v-if="batchResults.length" role="status" class="mb-3 text-micro"><div v-for="result in batchResults" :key="result.key" :class="result.ok ? 'text-muted' : 'text-warn'">{{ result.label }}：{{ result.message || (result.ok ? '已更新' : '更新失败，其余账号继续处理') }}</div></div>
       <WCard flush>
         <WTable :columns="cols" :rows="filtered" row-key="key">
           <template #cell-select="{ row }"><input type="checkbox" :aria-label="'选择 ' + label(row)" :checked="selectedKeys.has(row.key)" :disabled="batchBusy || rowBusy.has(row.key)" @change="selectRow(row, ($event.target as HTMLInputElement).checked)"></template>
@@ -973,8 +1061,11 @@ async function saveConfig() {
             <span v-else class="text-faint">—</span>
           </template>
           <template #cell-actions="{ row }">
+            <div class="flex flex-wrap items-center justify-end gap-1.5">
+              <WButton v-if="row.raw.account_check_supported" size="sm" variant="subtle" :disabled="batchBusy" @click="openAccountCheck(row)">测活</WButton>
             <WButton v-if="can(row, 'config')" size="sm" @click="openConfig(row.provider)">编辑配置</WButton>
             <ResourceActions v-else :resource="row.resource" :enabled="row.raw.enabled === true" :busy="rowBusy.has(row.provider + '/' + row.id)" @renew="renewAccount(row)" @rename="openRename(row)" @remove="removeAccount(row)" @enabled="toggleEnabled(row)" />
+            </div>
           </template>
           <template #empty>
             <WEmpty title="还没有账号" hint="添加一个上游账号，网关才能开始转发请求。">
@@ -987,6 +1078,28 @@ async function saveConfig() {
     </template>
 
     <!-- 重命名 -->
+    <WModal v-model:open="checkOpen" :dismissible="!checking && !testing" :title="checkTarget ? `账号测活 · ${label(checkTarget)}` : '账号测活'">
+      <div class="space-y-5">
+        <section class="space-y-3">
+          <div class="flex items-center justify-between gap-3"><h3 class="text-small font-medium text-ink">只读检查</h3><WButton :loading="checking" :disabled="testing" @click="runAccountCheck">检查账号</WButton></div>
+          <p class="text-small text-muted">检查对应授权或目录接口，复用维护恢复机制；不生成内容、不改变启停状态。</p>
+          <div v-if="checkResult" class="rounded-lg border border-line bg-bg/70 p-3 text-small" :class="checkResult.status === 'valid' ? 'text-live' : checkResult.status === 'invalid' ? 'text-fault' : 'text-muted'">
+            <p>{{ checkResult.message }}</p><p class="mt-1 text-micro text-faint">{{ checkResult.scope }} · {{ dt(checkResult.checked_at) }}</p>
+          </div>
+        </section>
+        <section class="border-t border-line pt-4 space-y-3">
+          <h3 class="text-small font-medium text-ink">指定模型真实测试</h3>
+          <p class="text-small text-muted">仅测试这个账号，不换号。可能消耗额度；通过只代表所选模型本次调用成功。</p>
+          <WSelect v-model="checkModel" :options="[{ value: '', label: modelsLoading ? '读取模型目录…' : '请选择模型' }, ...checkModels]" :disabled="testing || checking || modelsLoading" />
+          <WButton :loading="testing" :disabled="checking || !checkModel || checkTarget?.raw.enabled === false" @click="runAccountTest">测试调用</WButton>
+          <p v-if="checkTarget?.raw.enabled === false" class="text-micro text-faint">已手动停用的账号可做只读检查；实际调用需先由你启用。</p>
+          <div v-if="modelTestResult" class="rounded-lg border border-line bg-bg/70 p-3 text-small" :class="modelTestResult.status === 'valid' ? 'text-live' : 'text-warn'">
+            <p>{{ modelTestResult.message }}</p><p class="mt-1 text-micro text-faint">{{ modelTestResult.model }} · {{ modelTestResult.latency_ms }} ms · {{ dt(modelTestResult.checked_at) }}</p>
+          </div>
+        </section>
+      </div>
+    </WModal>
+
     <WModal v-model:open="renameOpen" size="sm" :title="renameTarget ? action(renameTarget, 'rename')?.label || '修改名称' : '修改名称'">
       <p class="mb-2 text-micro text-faint">留空则恢复默认显示名（昵称 / ID 短码）。</p>
       <WInput v-model="renameValue" placeholder="输入显示名" @enter="submitRename" />

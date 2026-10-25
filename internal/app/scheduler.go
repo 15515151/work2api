@@ -213,6 +213,7 @@ func (s *Scheduler) tick() {
 			maintainer.Maintain(ctx, settings, now)
 		}
 	}
+	s.o.checkAccountsTick(ctx, settings)
 	t := today()
 	if now.Hour() == parseHour(s.setting("model_refresh_hour", "6"), 6) && s.lastModelRefreshDate != t {
 		s.o.refreshRuntimeModels(ctx)

@@ -57,6 +57,9 @@ func (o *Runtime) LogUsage(a LogArgs) {
 			o.Pool.OnFailure(a.Acc.UID, cd)
 		}
 	}
+	if provider.CurrentInvocation(a.Ctx).Diagnostic {
+		return
+	}
 	inTok, outTok := UsageTokens(a.Usage)
 	known := UsageCountsKnown(a.Usage)
 	var credits *float64

@@ -19,6 +19,8 @@ type AccountRef struct{ Provider, LocalID string }
 
 // Caller contains stable authenticated identity, never the raw API key.
 type Caller struct {
+	TestAccount string // internal administrator diagnostic target, never parsed from client input
+
 	AppID, UserID int64
 	AppName       string
 	AccountScope  map[string]bool
@@ -28,6 +30,8 @@ type Caller struct {
 // immediately before dispatch, including after credentials or queue waits.
 // It does not grant permission merely because an earlier check succeeded.
 type Invocation struct {
+	Diagnostic bool
+
 	LogCapture    *LogCapturePolicy
 	Provider      string
 	UsageObserver interface{ Observe(map[string]any) }
@@ -55,7 +59,11 @@ func CheckDispatch(ctx context.Context, account AccountRef, model string) error 
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if check := CurrentInvocation(ctx).Check; check != nil {
+	call := CurrentInvocation(ctx)
+	if target := call.Caller.TestAccount; target != "" && (account.LocalID != target || account.Provider != call.Provider) {
+		return &DispatchError{Status: 403, Message: "诊断请求不得切换到其他账号", Type: "diagnostic_target_mismatch"}
+	}
+	if check := call.Check; check != nil {
 		return check(ctx, account, model)
 	}
 	return nil

@@ -228,6 +228,10 @@ export const api = {
     http.post<unknown, { ok: boolean; config?: Record<string, unknown> }>(
       `/admin/providers/${encodeURIComponent(name)}/config`, patch),
 
+  accountCheckSnapshots: () => http.get<unknown, { results: { provider: string; id: string; check: Record<string, any> | null; test: Record<string, any> | null }[] }>('/admin/account-checks'),
+  checkAccount: (name: string, id: string) => http.post<unknown, Record<string, any>>(`/admin/providers/${encodeURIComponent(name)}/accounts/${encodeURIComponent(id)}/check`, {}, { timeout: 35000 }),
+  testAccount: (name: string, id: string, model: string) => http.post<unknown, Record<string, any>>(`/admin/providers/${encodeURIComponent(name)}/accounts/${encodeURIComponent(id)}/test`, { model }, { timeout: 95000 }),
+
   // 自动签到 / 额度刷新 设置
   getSettings: () => http.get<unknown, Settings>('/admin/settings'),
   backupStatus: () => http.get<unknown, { status: string; last_success: number | null }>('/admin/backups'),
