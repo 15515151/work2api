@@ -2,6 +2,7 @@ package opencode
 
 import (
 	"context"
+	"encoding/hex"
 	"hash/fnv"
 	"net/http"
 	"strings"
@@ -10,6 +11,34 @@ import (
 	"work2api/internal/core/protocol"
 	"work2api/internal/core/provider"
 )
+
+func TestSyntheticSessionTimestampWindow(t *testing.T) {
+	now := time.Date(2026, 10, 25, 23, 59, 59, 0, time.UTC)
+	for _, hash := range [][]byte{{0, 0, 0, 0, 0, 0}, {255, 255, 255, 255, 255, 255}, {1, 2, 3, 4, 5, 6}} {
+		part := descendingTimePartAt(now, hash)
+		if part != descendingTimePartAt(now.Add(-23*time.Hour), hash) {
+			t.Fatal("identity changes within UTC day")
+		}
+		if part == descendingTimePartAt(now.Add(24*time.Hour), hash) {
+			t.Fatal("timestamp not refreshed across days")
+		}
+		b, err := hex.DecodeString(part)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var packed uint64
+		for _, v := range b {
+			packed = packed<<8 | uint64(v)
+		}
+		// Official packing retains the low 36 bits of milliseconds. Compare
+		// modular age rather than interpreting the truncated value as Unix time.
+		stamp := (^packed & 0xffffffffffff) >> 12
+		age := (uint64(now.UTC().Truncate(24*time.Hour).UnixMilli()) - stamp) & ((1 << 36) - 1)
+		if age > uint64(30*24*time.Hour/time.Millisecond) {
+			t.Fatal("session timestamp outside accepted window")
+		}
+	}
+}
 
 func TestRootChildIdentityKeepsAffinityAndCallerIsolation(t *testing.T) {
 	h := http.Header{"X-Opencode-Session": {"root"}, "X-Opencode-Session-Id": {"child"}, "X-Parent-Session-Id": {"parent"}}

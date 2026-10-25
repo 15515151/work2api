@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math/big"
 	"regexp"
+	"time"
 
 	"work2api/internal/core/provider"
 	"work2api/internal/jsonutil"
@@ -145,13 +146,14 @@ const base62Alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrst
 
 // CanonicalSessionID returns signal unchanged when it already carries an
 // official OpenCode session id (preserving prompt-cache affinity). Any other
-// downstream identity is deterministically hashed into the canonical shape.
+// downstream identity is hashed into the canonical shape, with a recent UTC
+// date as required by upstream. Synthesized identities may change across days.
 func CanonicalSessionID(signal string) string {
 	if canonicalSessionPattern.MatchString(signal) && descendingTimePartPattern.MatchString(signal[4:16]) {
 		return signal
 	}
 	sum := sha256.Sum256([]byte("ses\x00" + signal))
-	timePart := descendingTimePart(sum[:6])
+	timePart := descendingTimePartAt(time.Now(), sum[:6])
 	randomPart := base62Fixed(new(big.Int).SetBytes(sum[6:16]), 14)
 	return "ses_" + timePart + randomPart
 }
@@ -178,10 +180,13 @@ func RandomID(prefix string, size int) string {
 
 var descendingTimePartPattern = regexp.MustCompile(`^[0-9a-f]{9}f[c-f][0-9a-f]$`)
 
-// Identifier.descending wire layout, derived deterministically from the scoped
-// conversation hash. Stable across turns without sharing identities across keys.
-func descendingTimePart(hash []byte) string {
-	current := (uint64(hash[0])<<28|uint64(hash[1])<<20|uint64(hash[2])<<12|uint64(hash[3])<<4|uint64(hash[4])>>4)<<12 | 1
+// Identifier.descending wire layout: the hash chooses a bounded date offset,
+// not an arbitrary timestamp. Stable within a UTC day and scoped per caller.
+func descendingTimePartAt(now time.Time, hash []byte) string {
+	window := uint64(30 * 24 * time.Hour / time.Millisecond)
+	offset := (uint64(hash[0])<<24 | uint64(hash[1])<<16 | uint64(hash[2])<<8 | uint64(hash[3])) % window
+	base := now.UTC().Truncate(24 * time.Hour).Add(-time.Duration(offset) * time.Millisecond)
+	current := uint64(base.UnixMilli())<<12 | 1
 	inverted := ^current & 0xFFFFFFFFFFFF
 	return hex.EncodeToString([]byte{byte(inverted >> 40), byte(inverted >> 32), byte(inverted >> 24), byte(inverted >> 16), byte(inverted >> 8), byte(inverted)})
 }

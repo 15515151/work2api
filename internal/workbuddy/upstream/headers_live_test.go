@@ -74,6 +74,9 @@ func runLiveConversationHeaders(t *testing.T, site string, probeClients bool) {
 	if site == siterouting.Domestic && os.Getenv("WORK2API_LIVE_CN_TOOLS") == "1" {
 		modes = []string{"harness-tool-compatible"}
 	}
+	if os.Getenv("WORK2API_LIVE_PROFILE_VERSIONS") == "1" {
+		modes = []string{"version-previous", "version-current"}
+	}
 	for _, mode := range modes {
 		requestBody := body
 		if strings.HasPrefix(mode, "harness-") {
@@ -111,6 +114,20 @@ func runLiveConversationHeaders(t *testing.T, site string, probeClients bool) {
 		}
 		if mode == "legacy" {
 			delete(headers, "X-Conversation-ID")
+		}
+		if mode == "version-previous" {
+			product, _ := siterouting.ProfileProduct(mgr.Profile())
+			if product == "cli" {
+				headers["User-Agent"] = "CLI/2.149.0 CodeBuddy/2.149.0"
+				headers["X-IDE-Version"] = "2.149.0"
+			} else {
+				name := "WorkBuddy"
+				if site == siterouting.International {
+					name = "WorkBuddy AI"
+				}
+				headers["User-Agent"] = "WorkBuddy/5.5.2 " + name + "/5.5.2 CLI/2.137.1"
+				headers["X-IDE-Version"] = "5.5.2"
+			}
 		}
 		start := time.Now()
 		var usage map[string]any

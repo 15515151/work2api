@@ -9,17 +9,35 @@ package profiles
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 
 	"work2api/internal/workbuddy/siterouting"
 )
 
+// ApplyBillingIdentity follows the upstream non-chat request family. Account
+// identities are stable across refreshes; a request identifier is never reused.
+// Missing account identity must not collapse unrelated credentials together.
+func ApplyBillingIdentity(headers map[string]string) {
+	uid := headers["X-User-Id"]
+	if uid == "" {
+		return
+	}
+	for _, field := range []struct{ salt, header string }{{"machine", "X-Machine-ID"}, {"session", "X-Session-ID"}} {
+		sum := sha256.Sum256([]byte(field.salt + ":" + uid))
+		h := hex.EncodeToString(sum[:16])
+		h = h[:12] + "4" + h[13:16] + "a" + h[17:]
+		headers[field.header] = h[:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:]
+	}
+	headers["X-Request-ID"] = newRequestID()
+}
+
 // Pinned client versions (from verified official releases; no local desktop
 // config or machine id is read).
 const (
-	cliVersion         = "2.149.0"
-	workbuddyVersion   = "5.5.2"
-	workbuddyCLIVerion = "2.137.1"
+	cliVersion         = "2.168.2"
+	workbuddyVersion   = "5.8.3"
+	workbuddyCLIVerion = "2.161.0"
 	cliUserAgent       = "CLI/" + cliVersion + " CodeBuddy/" + cliVersion
 )
 

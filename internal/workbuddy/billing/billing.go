@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"work2api/internal/workbuddy/httpclient"
+	"work2api/internal/workbuddy/profiles"
 )
 
 // Credential is what billing needs from a credential manager.
@@ -78,6 +79,7 @@ func billingHeaders(ctx context.Context, mgr Credential) (map[string]string, err
 		out[k] = v
 	}
 	out["User-Agent"] = browserUA
+	profiles.ApplyBillingIdentity(out)
 	return out, nil
 }
 
