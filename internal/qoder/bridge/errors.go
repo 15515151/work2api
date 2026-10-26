@@ -21,9 +21,10 @@ import (
 
 // 错误类型（透传给客户端的 error.type 字段）
 const (
-	ErrTypeContentPolicy = "content_policy_rejected"
-	ErrTypeTransient     = "upstream_transient_error"
-	ErrTypeUpstream      = "upstream_error"
+	ErrTypeContentPolicy  = "content_policy_rejected"
+	ErrTypeTransient      = "upstream_transient_error"
+	ErrTypeUpstream       = "upstream_error"
+	ErrTypeWorkspaceQuota = "workspace_quota"
 )
 
 // TransientMaxRetries 同账号瞬时故障额外重试次数（退避时长见 RetryBackoff）。
@@ -97,7 +98,7 @@ func IsContentPolicy(detail string) bool {
 //   - 其余 4xx 带 provider_error（"Error in upstream response"）→ 瞬时
 //   - 401/403/429：凭证/频控各有专门路径，不属瞬时重试类
 func IsTransientUpstream(code int, detail string) bool {
-	if resourceFailure(detail, 0) != "" {
+	if resourceFailureForStatus(code, detail) != "" {
 		return false
 	}
 	if code == 401 || code == 403 || code == 429 {
@@ -171,9 +172,12 @@ func (e *UpstreamError) Unwrap() error { return e.cause }
 // 返回 (message, errType)。与 hub friendly_upstream_error 逐句对齐。
 func FriendlyUpstreamError(code int, detail string) (string, string) {
 	detail = strings.TrimSpace(detail)
-	if kind := resourceFailure(detail, 0); kind != "" {
+	if kind := resourceFailureForStatus(code, detail); kind != "" {
 		if kind == "upstream_queued" {
 			return "上游模型正在排队，请稍后重试或选择其他模型", kind
+		}
+		if kind == ErrTypeWorkspaceQuota {
+			return "上游工作区分配额度已用尽，请检查工作区配额或稍后重试", kind
 		}
 		return "上游模型资源或权益受限，请核实账号套餐及模型可用性", kind
 	}
@@ -208,7 +212,7 @@ func NewStreamBusinessError(detail string) *UpstreamError {
 	if kind := resourceFailure(detail, 0); kind != "" {
 		msg, _ := FriendlyUpstreamError(0, detail)
 		status := 403
-		if kind == "upstream_queued" {
+		if kind == "upstream_queued" || kind == ErrTypeWorkspaceQuota {
 			status = 429
 		}
 		return &UpstreamError{Status: status, Detail: detail, ErrType: kind, Message: msg}
@@ -220,40 +224,71 @@ func NewStreamBusinessError(detail string) *UpstreamError {
 	return &UpstreamError{Status: 0, Detail: detail, ErrType: ErrTypeUpstream, Message: detail}
 }
 
-// Decode only bounded structured envelopes; prose cannot establish entitlement
-// or queue state. This observation does not introduce automatic waiting.
+// Preserve explicit authentication/payment failures even if their body also
+// carries resource metadata. Queue and workspace signals cannot repair them.
+func resourceFailureForStatus(status int, detail string) string {
+	if status == 401 || status == 402 {
+		return ""
+	}
+	return resourceFailure(detail, 0)
+}
+
+// Decode only bounded error envelopes. Parent RESOURCE_LIMIT tags and the
+// actionable queue ticket may live on different levels (CPA queue_retry.go).
+// Inspect children before deciding; code 10605 alone does not prove a queue.
+// This classifier does not introduce automatic waiting or additional calls.
 func resourceFailure(detail string, depth int) string {
-	if depth > 4 || len(detail) > 65536 {
+	if len(detail) > 65536 {
 		return ""
 	}
-	var m map[string]json.RawMessage
-	if json.Unmarshal([]byte(detail), &m) != nil {
-		return ""
-	}
-	var sub string
-	_ = json.Unmarshal(m["subCode"], &sub)
-	if sub == "RESOURCE_LIMIT" {
-		var queued bool
-		var wait int
-		_ = json.Unmarshal(m["isQueued"], &queued)
+	resource, queued, workspace := false, false, false
+	nodes := 64
+	var walk func(string, int)
+	walk = func(text string, level int) {
+		if level > 4 || nodes <= 0 || len(text) > 65536 {
+			return
+		}
+		text = strings.TrimSpace(text)
+		if !strings.HasPrefix(text, "{") {
+			return
+		}
+		nodes--
+		var m map[string]json.RawMessage
+		if json.Unmarshal([]byte(text), &m) != nil {
+			return
+		}
+		var sub string
+		_ = json.Unmarshal(m["subCode"], &sub)
+		resource = resource || strings.EqualFold(strings.TrimSpace(sub), "RESOURCE_LIMIT")
+		var q bool
+		var wait float64
+		_ = json.Unmarshal(m["isQueued"], &q)
 		_ = json.Unmarshal(m["retryAfterSeconds"], &wait)
-		if queued || wait > 0 {
-			return "upstream_queued"
+		queued = queued || q || wait > 0
+		for _, key := range []string{"error", "message", "body", "data", "details"} {
+			raw := m[key]
+			if len(raw) == 0 {
+				continue
+			}
+			var child string
+			if json.Unmarshal(raw, &child) != nil {
+				child = string(raw)
+			}
+			if key == "message" && strings.EqualFold(strings.TrimSpace(child), "Workspace allocated quota exceeded") {
+				workspace = true
+			}
+			walk(child, level+1)
 		}
-		return "resource_limit"
 	}
-	for _, key := range []string{"error", "message", "body", "data"} {
-		raw := m[key]
-		if len(raw) == 0 {
-			continue
-		}
-		var text string
-		if json.Unmarshal(raw, &text) != nil {
-			text = string(raw)
-		}
-		if kind := resourceFailure(text, depth+1); kind != "" {
-			return kind
-		}
+	walk(detail, depth)
+	if resource && queued {
+		return "upstream_queued"
+	}
+	if workspace {
+		return ErrTypeWorkspaceQuota
+	}
+	if resource {
+		return "resource_limit"
 	}
 	return ""
 }
@@ -297,7 +332,7 @@ func ErrorStatus(err error) int {
 			return 400
 		case ErrTypeTransient:
 			return 502
-		case "upstream_queued":
+		case "upstream_queued", ErrTypeWorkspaceQuota:
 			return 429
 		case "resource_limit":
 			return 403

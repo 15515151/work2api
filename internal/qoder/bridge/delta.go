@@ -68,6 +68,16 @@ func ExtractDelta(dataLine string) Delta {
 		logger.Debug("[delta] unmarshal inner failed: %v", err)
 		return Delta{}
 	}
+	// Classify the original object before rendering prose. Rendering first loses
+	// nested queue/details fields and numeric business codes (CPA queue shapes).
+	if code := businessCode(innerJSON["code"]); code != "" && code != "0" {
+		err := NewStreamBusinessError(inner)
+		if err.ErrType == ErrTypeUpstream {
+			err.Message = fmt.Sprintf("upstream error code=%s: %s", code, describeUpstreamError(innerJSON))
+		}
+		logger.Error("[delta] %v", err)
+		return Delta{Err: err}
+	}
 	// 先捕获顶层 usage（上游可能在最后一个 chunk 中与 choices 一起返回），
 	// 不提前 return：同帧若还带 choices 内容，合并进同一个 Delta，避免内容丢失
 	var usageIn, usageOut int
@@ -100,21 +110,24 @@ func ExtractDelta(dataLine string) Delta {
 				InputTokens: usageIn, OutputTokens: usageOut, HasInputTokens: hasIn, HasOutputTokens: hasOut, Usage: usage, FinishReason: finish}
 		}
 	}
-	// 上游业务错误：{"code":"115","message":"..."}
-	// 流内业务错误（HTTP 200 帧内）：非内容审核不做瞬时重试指引，
-	// 内容审核单独映射为 content_policy_rejected。
-	// 注意：业务错误检查仍先于 usage-only 返回，错误帧不因带 usage 被误判为正常帧。
-	if code, ok := innerJSON["code"].(string); ok && code != "" && code != "0" {
-		err := NewStreamBusinessError(fmt.Sprintf("upstream error code=%s: %s", code, describeUpstreamError(innerJSON)))
-		logger.Error("[delta] %v", err)
-		return Delta{Err: err}
-	}
 	// choices 与业务 code 均未命中且 usage > 0：维持返回 usage-only Delta（行为同修复前）
 	if usage != nil {
 		return Delta{InputTokens: usageIn, OutputTokens: usageOut, HasInputTokens: hasIn, HasOutputTokens: hasOut, Usage: usage}
 	}
 	logger.Debug("[delta] no valid choices found, inner=%s", inner)
 	return Delta{}
+}
+
+// Codes are numeric or string scalars; objects and booleans are not codes.
+func businessCode(value any) string {
+	switch v := value.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case float64:
+		return strconv.FormatFloat(v, 'f', -1, 64)
+	default:
+		return ""
+	}
 }
 
 func truncate(s string, max int) string {

@@ -37,7 +37,7 @@ func canFailover(err error) bool {
 	}
 	var upstream *bridge.UpstreamError
 	if errors.As(err, &upstream) {
-		if upstream.ErrType == "upstream_queued" || upstream.ErrType == "resource_limit" {
+		if upstream.ErrType == "upstream_queued" || upstream.ErrType == "resource_limit" || upstream.ErrType == bridge.ErrTypeWorkspaceQuota {
 			return false
 		}
 		if bridge.IsContentPolicy(upstream.Detail) {
